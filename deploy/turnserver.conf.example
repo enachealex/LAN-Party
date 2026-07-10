@@ -1,0 +1,29 @@
+# Minimal coturn config for WebRTC TURN (relays voice/video when peers can't connect directly).
+# Install: apt-get install coturn ; enable in /etc/default/coturn (TURNSERVER_ENABLED=1) ;
+# put this at /etc/turnserver.conf (edit the placeholders) ; systemctl restart coturn.
+
+listening-port=3478
+tls-listening-port=5349
+
+# Your server's PUBLIC IPv4. If behind NAT, also set external-ip=PUBLIC/PRIVATE.
+external-ip=YOUR_PUBLIC_IP
+
+realm=thejumpvault.com
+server-name=discordmusic.thejumpvault.com
+
+# Simple long-term credential (must match TURN_USERNAME / TURN_CREDENTIAL in the app env).
+lt-cred-mech
+user=lanparty:CHANGE_ME_STRONG_SECRET
+
+# Reuse the domain's Let's Encrypt cert for turns:// (TLS TURN — best for restrictive networks).
+cert=/etc/letsencrypt/live/discordmusic.thejumpvault.com/fullchain.pem
+pkey=/etc/letsencrypt/live/discordmusic.thejumpvault.com/privkey.pem
+
+min-port=49152
+max-port=65535
+no-cli
+# Lock down relay to avoid abuse:
+no-multicast-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255

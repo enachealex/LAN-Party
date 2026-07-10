@@ -1,0 +1,1548 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+const PORT = process.env.PORT || 3000;
+// Deployment config (all optional — defaults keep the local dev setup working):
+//  DATA_DIR       persistent dir for the SQLite db + uploads/gifs/sounds (mount a volume here)
+//  CLIENT_DIST    path to the built client (client/dist) to serve; enables single-origin hosting
+//  CLIENT_ORIGIN  comma-separated allowed origins for CORS/Socket.IO ('*' = any, the default)
+//  STUN_URLS / TURN_URLS / TURN_USERNAME / TURN_CREDENTIAL  WebRTC ICE servers sent to clients
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const CLIENT_DIST = process.env.CLIENT_DIST || path.join(__dirname, '..', 'client', 'dist');
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
+const corsOrigin = CLIENT_ORIGIN === '*' ? '*' : CLIENT_ORIGIN.split(',').map((s) => s.trim());
+const MAX_UPLOAD_SIZE = 100 * 1024 * 1024;
+const FILE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // uploads are deleted 7 days after upload
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // sweep hourly
+const SOUND_NAME_MAX = 12; // keep soundboard names short enough to fit a tile
+
+function isStrongPassword(pw) {
+  if (typeof pw !== 'string') return false;
+  // at least 8 chars, 1 lower, 1 upper, 1 digit, 1 special char
+  return /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/.test(pw);
+}
+
+async function main() {
+  const app = express();
+  app.set('trust proxy', 1); // we sit behind an HTTPS reverse proxy in production
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const uploadDir = path.join(DATA_DIR, 'uploads');
+  fs.mkdirSync(uploadDir, { recursive: true });
+  // GIF library files live outside /uploads so they are NOT swept by the 7-day cleanup.
+  const gifsDir = path.join(DATA_DIR, 'gifs');
+  fs.mkdirSync(gifsDir, { recursive: true });
+  // Soundboard clips are also persistent (outside /uploads).
+  const soundsDir = path.join(DATA_DIR, 'sounds');
+  fs.mkdirSync(soundsDir, { recursive: true });
+
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, uploadDir),
+      filename: (_req, file, cb) => {
+        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
+      },
+    }),
+    limits: { fileSize: MAX_UPLOAD_SIZE },
+  });
+
+  // Separate storage for the persistent GIF library (not subject to upload expiry).
+  const gifUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, gifsDir),
+      filename: (_req, file, cb) => {
+        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
+      },
+    }),
+    limits: { fileSize: MAX_UPLOAD_SIZE },
+  });
+
+  // Persistent storage for soundboard clips.
+  const soundUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, soundsDir),
+      filename: (_req, file, cb) => {
+        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
+      },
+    }),
+    limits: { fileSize: MAX_UPLOAD_SIZE },
+  });
+
+  // Uploaded files are named `<timestamp>-<rand>-<name>`; derive the upload time from the name.
+  function uploadTimestampFromName(filename) {
+    const match = /^(\d+)-/.exec(filename);
+    return match ? Number(match[1]) : null;
+  }
+
+  // Delete uploads older than FILE_TTL_MS. The chat note for expired files is rendered
+  // client-side from the same embedded timestamp, so no DB update is needed here.
+  async function cleanupExpiredUploads() {
+    let files;
+    try {
+      files = await fs.promises.readdir(uploadDir);
+    } catch (err) {
+      return;
+    }
+    const now = Date.now();
+    for (const name of files) {
+      const full = path.join(uploadDir, name);
+      try {
+        let ts = uploadTimestampFromName(name);
+        if (ts == null) ts = (await fs.promises.stat(full)).mtimeMs; // fall back to mtime
+        if (now - ts > FILE_TTL_MS) {
+          await fs.promises.unlink(full);
+          console.log('Removed expired upload', name);
+        }
+      } catch (err) {
+        /* skip files we can't stat/remove */
+      }
+    }
+  }
+
+  app.use(cors({ origin: corsOrigin }));
+  // WebRTC ICE config (STUN + optional TURN from env) — served to clients so TURN creds aren't
+  // baked into the public JS bundle and can be rotated without a rebuild.
+  app.get('/webrtc/ice', (_req, res) => {
+    const iceServers = [{ urls: (process.env.STUN_URLS || 'stun:stun.l.google.com:19302').split(',').map((s) => s.trim()) }];
+    if (process.env.TURN_URLS) {
+      iceServers.push({ urls: process.env.TURN_URLS.split(',').map((s) => s.trim()), username: process.env.TURN_USERNAME || '', credential: process.env.TURN_CREDENTIAL || '' });
+    }
+    res.json({ iceServers });
+  });
+  app.use('/uploads', express.static(uploadDir));
+  // redirect:false so a bare `GET /gifs` isn't turned into a directory redirect,
+  // letting it fall through to the GIF-list API route below.
+  app.use('/gifs', express.static(gifsDir, { redirect: false }));
+  app.use('/sounds', express.static(soundsDir, { redirect: false }));
+  // Serve the built client (single-origin hosting). Enabled when CLIENT_DIST exists.
+  const serveClient = fs.existsSync(path.join(CLIENT_DIST, 'index.html'));
+  if (serveClient) app.use(express.static(CLIENT_DIST));
+  // parse json with error handling for invalid JSON
+  app.use(express.json());
+  app.use((err, req, res, next) => {
+    if (err && err.type === 'entity.parse.failed') {
+      console.warn('Invalid JSON received for', req.method, req.url);
+      return res.status(400).json({ error: 'Invalid JSON' });
+    }
+    next(err);
+  });
+  const server = http.createServer(app);
+  const io = new Server(server, { cors: { origin: corsOrigin } });
+
+  const db = await open({ filename: path.join(DATA_DIR, 'data.sqlite'), driver: sqlite3.Database });
+  // Create tables
+  await db.exec(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    email TEXT UNIQUE,
+    password_hash TEXT,
+    settings TEXT
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS servers (
+    id TEXT PRIMARY KEY,
+    name TEXT
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS channels (
+    id TEXT PRIMARY KEY,
+    server_id TEXT,
+    name TEXT,
+    type TEXT
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id TEXT,
+    channel_id TEXT,
+    author TEXT,
+    text TEXT,
+    ts INTEGER
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS revoked_tokens (
+    token TEXT PRIMARY KEY,
+    expires_at INTEGER
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS friend_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_user_id INTEGER NOT NULL,
+    to_user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL,
+    UNIQUE(from_user_id, to_user_id)
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS friendships (
+    user_id INTEGER NOT NULL,
+    friend_user_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, friend_user_id)
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS direct_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER NOT NULL,
+    recipient_id INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    read_at INTEGER
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS server_emojis (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_by TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE(server_id, name)
+  )`);
+  await db.exec(`CREATE TABLE IF NOT EXISTS apps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    url TEXT,
+    icon_url TEXT,
+    created_by TEXT,
+    created_at INTEGER NOT NULL
+  )`);
+  // Shared GIF library: any user can add, everyone can use in any channel/DM.
+  await db.exec(`CREATE TABLE IF NOT EXISTS gifs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    type TEXT,
+    created_by TEXT,
+    created_at INTEGER NOT NULL
+  )`);
+  // Shared soundboard: any user can add a clip, everyone can trigger it.
+  await db.exec(`CREATE TABLE IF NOT EXISTS sounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    emoji TEXT,
+    color TEXT,
+    url TEXT NOT NULL,
+    type TEXT,
+    created_by TEXT,
+    created_at INTEGER NOT NULL
+  )`);
+  try {
+    await db.run(`ALTER TABLE messages ADD COLUMN attachment_json TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
+  try {
+    await db.run(`ALTER TABLE direct_messages ADD COLUMN attachment_json TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
+  try {
+    await db.run(`ALTER TABLE users ADD COLUMN presence_status TEXT DEFAULT 'offline'`);
+  } catch (err) {
+    /* column already exists */
+  }
+  // Persisted reactions, stored as JSON { "👍": ["alice","bob"], ... } per message.
+  try {
+    await db.run(`ALTER TABLE messages ADD COLUMN reactions_json TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
+  try {
+    await db.run(`ALTER TABLE direct_messages ADD COLUMN reactions_json TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
+
+  // Seed demo server and channels if missing
+  const demo = await db.get('SELECT id FROM servers WHERE id = ?', 'demo');
+  if (!demo) {
+    await db.run('INSERT INTO servers (id, name) VALUES (?, ?)', 'demo', 'LAN Party');
+    await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', 'general', 'demo', 'general', 'text');
+    await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', 'voice1', 'demo', 'Voice 1', 'voice');
+  }
+
+  const clients = {}; // socketId -> { name, username, serverId }
+  const collabSessions = {}; // sessionId (image url) -> { imageUrl, segments: [] } for shared image editing
+  const liveStreams = {}; // socketId -> { name, serverId, channelId, camera, screen } for Watch/Discover
+  const mockEmails = [];
+
+  // The list of people currently "live" (sharing their screen) for the Watch/Discover panel.
+  // Camera-on is NOT a discoverable stream — only Go Live (screen share) is.
+  function discoverList() {
+    const out = [];
+    for (const [id, s] of Object.entries(liveStreams)) {
+      if (!s || !s.screen) continue;
+      const size = (io.sockets.adapter.rooms.get(`voice:${s.serverId}:${s.channelId}`) || new Set()).size;
+      out.push({ id, name: s.name, serverId: s.serverId, channelId: s.channelId, camera: !!s.camera, screen: !!s.screen, viewers: size });
+    }
+    return out;
+  }
+  function broadcastDiscover() { io.emit('discover:update', discoverList()); }
+
+  // --- Activities: one shared activity per voice room, synced to everyone in it ---
+  const activities = {}; // room -> { type, state, by }
+  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt'];
+  function activityInit(type) {
+    if (type === 'watch') return { videoId: null, playing: false, time: 0, ts: Date.now() };
+    if (type === 'whiteboard') return { strokes: [] };
+    if (type === 'poll') return { question: '', options: [], closed: false };
+    if (type === 'ttt') return { board: Array(9).fill(''), turn: 'X', players: {}, winner: null };
+    return {};
+  }
+  function tttWinner(b) {
+    const L = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+    for (const [a, c, d] of L) if (b[a] && b[a] === b[c] && b[a] === b[d]) return b[a];
+    return b.every((x) => x) ? 'draw' : null;
+  }
+  function applyActivityEvent(act, ev, user) {
+    const s = act.state;
+    if (act.type === 'watch') {
+      if (ev.kind === 'load' && typeof ev.videoId === 'string') { s.videoId = ev.videoId.slice(0, 20); s.playing = true; s.time = 0; s.ts = Date.now(); }
+      else if (ev.kind === 'play') { s.playing = true; s.time = Number(ev.time) || 0; s.ts = Date.now(); }
+      else if (ev.kind === 'pause') { s.playing = false; s.time = Number(ev.time) || 0; s.ts = Date.now(); }
+      else if (ev.kind === 'seek') { s.time = Number(ev.time) || 0; s.ts = Date.now(); }
+    } else if (act.type === 'whiteboard') {
+      if (ev.kind === 'stroke' && ev.seg && typeof ev.seg === 'object') { s.strokes.push(ev.seg); if (s.strokes.length > 20000) s.strokes.splice(0, s.strokes.length - 20000); }
+      else if (ev.kind === 'clear') s.strokes = [];
+    } else if (act.type === 'poll') {
+      if (ev.kind === 'create') { s.question = String(ev.question || '').slice(0, 140); s.options = (Array.isArray(ev.options) ? ev.options : []).slice(0, 6).map((t) => ({ text: String(t).slice(0, 60), votes: [] })); s.closed = false; }
+      else if (ev.kind === 'vote' && !s.closed && s.options[ev.index]) { s.options.forEach((o) => { o.votes = o.votes.filter((u) => u !== user); }); s.options[ev.index].votes.push(user); }
+      else if (ev.kind === 'close') s.closed = true;
+    } else if (act.type === 'ttt') {
+      if (ev.kind === 'join') { if (!s.players.X) s.players.X = user; else if (!s.players.O && s.players.X !== user) s.players.O = user; }
+      else if (ev.kind === 'move' && s.winner == null) {
+        const mark = s.players.X === user ? 'X' : (s.players.O === user ? 'O' : null);
+        if (mark && mark === s.turn && ev.i >= 0 && ev.i < 9 && !s.board[ev.i]) { s.board[ev.i] = mark; s.turn = mark === 'X' ? 'O' : 'X'; s.winner = tttWinner(s.board); }
+      } else if (ev.kind === 'reset') { s.board = Array(9).fill(''); s.turn = 'X'; s.winner = null; }
+    }
+  }
+
+  function parseAttachment(value) {
+    if (!value) return null;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  function normalizeAttachment(value) {
+    if (!value || typeof value !== 'object') return null;
+    const url = typeof value.url === 'string' ? value.url : '';
+    const name = typeof value.name === 'string' ? value.name : 'Attachment';
+    // Allow ephemeral uploads and persistent GIF-library files.
+    if (!url || !(url.startsWith('/uploads/') || url.startsWith('/gifs/'))) return null;
+    return {
+      url,
+      name,
+      size: Number(value.size) || 0,
+      type: typeof value.type === 'string' ? value.type : 'application/octet-stream',
+    };
+  }
+
+  // Raw stored reactions: { emoji: [username, ...] }.
+  function parseReactions(value) {
+    if (!value) return {};
+    try {
+      const obj = JSON.parse(value);
+      return obj && typeof obj === 'object' ? obj : {};
+    } catch {
+      return {};
+    }
+  }
+
+  // Format raw reactions for a given viewer: { emoji: { count, mine } }, dropping empties.
+  function formatReactions(raw, forUsername) {
+    const out = {};
+    for (const [emoji, users] of Object.entries(raw || {})) {
+      const list = Array.isArray(users) ? users : [];
+      if (list.length === 0) continue;
+      out[emoji] = { count: list.length, mine: forUsername ? list.includes(forUsername) : false };
+    }
+    return out;
+  }
+
+  function mapMessageRow(row, forUsername) {
+    return {
+      id: row.id,
+      author: row.author,
+      text: row.text || '',
+      ts: row.ts,
+      attachment: parseAttachment(row.attachment_json),
+      reactions: formatReactions(parseReactions(row.reactions_json), forUsername),
+    };
+  }
+
+  // Toggle a user's reaction on a message row (table = 'messages' | 'direct_messages').
+  // Returns the raw reactions object after toggling.
+  async function toggleReaction(table, id, username, emoji) {
+    const idCol = 'id';
+    const row = await db.get(`SELECT reactions_json FROM ${table} WHERE ${idCol} = ?`, id);
+    if (!row) return null;
+    const raw = parseReactions(row.reactions_json);
+    const list = Array.isArray(raw[emoji]) ? raw[emoji] : [];
+    const idx = list.indexOf(username);
+    if (idx >= 0) list.splice(idx, 1);
+    else list.push(username);
+    if (list.length === 0) delete raw[emoji];
+    else raw[emoji] = list;
+    await db.run(`UPDATE ${table} SET reactions_json = ? WHERE ${idCol} = ?`, JSON.stringify(raw), id);
+    return raw;
+  }
+
+  // Return deduped members for a server: prefer username when available, keep latest connection per key
+  function getMembersForServer(serverId) {
+    const raw = Object.keys(clients).filter(id => clients[id].serverId === serverId).map(id => ({ id, name: clients[id].name, username: clients[id].username }));
+    const map = new Map();
+    for (const m of raw) {
+      const key = m.username || m.name || m.id;
+      // overwrite to prefer the latest occurrence (most recent connection)
+      map.set(key, m);
+    }
+    return Array.from(map.values());
+  }
+
+  const VALID_PRESENCE = ['available', 'busy', 'away', 'offline'];
+
+  function normalizePresence(status) {
+    return VALID_PRESENCE.includes(status) ? status : 'offline';
+  }
+
+  async function getUserByUsername(username) {
+    return db.get(
+      `SELECT id, username, COALESCE(presence_status, 'offline') AS presence_status
+       FROM users WHERE username = ?`,
+      username
+    );
+  }
+
+  async function getFriendUsernames(userId) {
+    const rows = await db.all(
+      `SELECT u.username FROM friendships f
+       JOIN users u ON u.id = f.friend_user_id
+       WHERE f.user_id = ?`,
+      userId
+    );
+    return rows.map((r) => r.username);
+  }
+
+  async function setUserPresenceByUsername(username, status) {
+    const normalized = normalizePresence(status);
+    await db.run('UPDATE users SET presence_status = ? WHERE username = ?', normalized, username);
+    return normalized;
+  }
+
+  async function broadcastPresenceToFriends(username, status) {
+    const me = await getUserByUsername(username);
+    if (!me) return;
+    const friends = await getFriendUsernames(me.id);
+    const payload = { username, status: normalizePresence(status) };
+    for (const friendUsername of friends) {
+      io.to(`user:${friendUsername}`).emit('friend:presence-updated', payload);
+    }
+  }
+
+  async function getPendingCountForUserId(userId) {
+    const row = await db.get(
+      'SELECT COUNT(*) AS count FROM friend_requests WHERE to_user_id = ? AND status = ?',
+      userId,
+      'pending'
+    );
+    return row?.count || 0;
+  }
+
+  async function emitPendingUpdate(username) {
+    const user = await getUserByUsername(username);
+    if (!user) return;
+    const pendingCount = await getPendingCountForUserId(user.id);
+    io.to(`user:${username}`).emit('friend:pending-updated', { pendingCount });
+  }
+
+  async function emitFriendsListUpdate(username) {
+    io.to(`user:${username}`).emit('friend:list-updated', {});
+  }
+
+  async function getDmUnreadSummary(userId) {
+    const rows = await db.all(
+      `SELECT u.id AS peerId, u.username AS peerUsername, COUNT(dm.id) AS unreadCount
+       FROM direct_messages dm
+       JOIN users u ON u.id = dm.sender_id
+       WHERE dm.recipient_id = ? AND dm.read_at IS NULL
+       GROUP BY u.id, u.username`,
+      userId
+    );
+    const totalUnread = rows.reduce((sum, r) => sum + r.unreadCount, 0);
+    return { totalUnread, byPeer: rows };
+  }
+
+  async function emitDmUnreadUpdate(username) {
+    const me = await getUserByUsername(username);
+    if (!me) return;
+    const summary = await getDmUnreadSummary(me.id);
+    io.to(`user:${username}`).emit('dm:unread-updated', {
+      totalUnread: summary.totalUnread,
+      byPeer: summary.byPeer.map((r) => ({
+        peerId: String(r.peerId),
+        peerUsername: r.peerUsername,
+        unreadCount: r.unreadCount,
+      })),
+    });
+  }
+
+  async function areFriends(userIdA, userIdB) {
+    const row = await db.get(
+      'SELECT 1 FROM friendships WHERE user_id = ? AND friend_user_id = ?',
+      userIdA,
+      userIdB
+    );
+    return !!row;
+  }
+
+  async function hasPendingRequestBetween(userIdA, userIdB) {
+    const row = await db.get(
+      `SELECT id FROM friend_requests
+       WHERE status = 'pending'
+         AND ((from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?))`,
+      userIdA,
+      userIdB,
+      userIdB,
+      userIdA
+    );
+    return !!row;
+  }
+
+  const AVATAR_COLORS = ['#5865f2', '#3ba55c', '#faa61a', '#eb459e', '#ed4245', '#747f8d'];
+
+  function avatarColorForUsername(username) {
+    let hash = 0;
+    for (let i = 0; i < username.length; i++) hash = (hash + username.charCodeAt(i)) % AVATAR_COLORS.length;
+    return AVATAR_COLORS[hash];
+  }
+
+  function authMiddleware(req, res, next) {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      // check if token has been revoked
+      db.get('SELECT token FROM revoked_tokens WHERE token = ?', token).then(row => {
+        if (row) return res.status(401).json({ error: 'Token revoked' });
+        req.user = payload;
+        next();
+      }).catch(err => {
+        console.error('Failed to check revoked tokens', err);
+        return res.status(500).json({ error: 'Server error' });
+      });
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+  }
+
+  app.post('/auth/register', async (req, res) => {
+    const { username, email, password, passwordConfirm } = req.body || {};
+    if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
+    if (password !== passwordConfirm) return res.status(400).json({ error: 'Passwords do not match' });
+    if (!isStrongPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters and include 1 uppercase letter, 1 lowercase letter, 1 number, and 1 special character.' });
+    // basic email format check
+    if (!/\S+@\S+\.\S+/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+    // ensure username and email are unique with specific feedback
+    const byUsername = await db.get('SELECT id FROM users WHERE username = ?', username);
+    if (byUsername) return res.status(409).json({ error: 'Username already exists', field: 'username' });
+    const byEmail = await db.get('SELECT id FROM users WHERE email = ?', email);
+    if (byEmail) return res.status(409).json({ error: 'Email already exists', field: 'email' });
+    const defaultSettings = {
+      railColor: '#7a0d0d', sidebarColor: '#0f1418', panelColor: '#111417', headerColor: '#7a0d0d', accentStart: '#2bc3ff', accentEnd: '#0b86ff', fontColor: '#edf6ff', leftTileColor: '#1f2933'
+    };
+    const hash = bcrypt.hashSync(password, 10);
+    await db.run('INSERT INTO users (username, email, password_hash, settings) VALUES (?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings));
+    mockEmails.push({ to: email, subject: 'Welcome to LAN Party', body: `Welcome ${username}!` });
+    console.log('Mock welcome email queued for', email);
+    return res.json({ success: true });
+  });
+
+  app.post('/auth/check-availability', async (req, res) => {
+    const { username, email } = req.body || {};
+    if (!username && !email) return res.status(400).json({ error: 'Missing username or email' });
+    if (username) {
+      const byUsername = await db.get('SELECT id FROM users WHERE username = ?', username);
+      if (byUsername) return res.json({ username: false });
+    }
+    if (email) {
+      const byEmail = await db.get('SELECT id FROM users WHERE email = ?', email);
+      if (byEmail) return res.json({ email: false });
+    }
+    return res.json({ username: username ? true : undefined, email: email ? true : undefined });
+  });
+
+  app.post('/auth/login', async (req, res) => {
+    const { username, password, remember } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+    const user = await db.get('SELECT * FROM users WHERE username = ?', username);
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = bcrypt.compareSync(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const settings = user.settings ? JSON.parse(user.settings) : {};
+    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: remember ? '90d' : '7d' });
+    return res.json({ success: true, token, user: { username: user.username, email: user.email, settings } });
+  });
+
+  app.get('/auth/me', authMiddleware, async (req, res) => {
+    const username = req.user.username;
+    const user = await db.get('SELECT username, email, settings FROM users WHERE username = ?', username);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    return res.json({ success: true, user: { username: user.username, email: user.email, settings: JSON.parse(user.settings || '{}') } });
+  });
+
+  app.post('/auth/forgot', async (req, res) => {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Missing email' });
+    const user = await db.get('SELECT * FROM users WHERE email = ?', email);
+    if (!user) return res.status(404).json({ error: 'Email not found' });
+    const token = Math.random().toString(36).slice(2, 10);
+    mockEmails.push({ to: email, subject: 'Password Reset', body: `Use this mock token to reset: ${token}` });
+    console.log('Mock password reset email queued for', email);
+    return res.json({ success: true, message: 'Reset email sent (mock)' });
+  });
+
+  // Logout: revoke the presented token so it cannot be used again
+  app.post('/auth/logout', authMiddleware, async (req, res) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.split(' ')[1];
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+    // try to read expiry from token payload
+    let exp = Date.now();
+    try {
+      const payload = jwt.decode(token) || {};
+      exp = payload.exp ? payload.exp * 1000 : Date.now();
+    } catch (e) { /* ignore */ }
+    try {
+      await db.run('INSERT OR REPLACE INTO revoked_tokens (token, expires_at) VALUES (?, ?)', token, exp);
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Failed to revoke token', err);
+      return res.status(500).json({ error: 'Failed to revoke token' });
+    }
+  });
+
+  app.get('/mock-emails', (req, res) => res.json({ emails: mockEmails }));
+
+  app.get('/user/settings', authMiddleware, async (req, res) => {
+    const username = req.user.username;
+    const user = await db.get('SELECT settings FROM users WHERE username = ?', username);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    return res.json({ settings: JSON.parse(user.settings || '{}') });
+  });
+
+  app.post('/user/settings', authMiddleware, async (req, res) => {
+    const username = req.user.username;
+    const settings = req.body.settings || {};
+    const user = await db.get('SELECT id FROM users WHERE username = ?', username);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(settings), username);
+    return res.json({ success: true, settings });
+  });
+
+  // --- Servers & channels ---
+  const newId = (prefix) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+  // Servers are public within this LAN-party instance: everyone sees and can enter all of them.
+  app.get('/servers', authMiddleware, async (_req, res) => {
+    const rows = await db.all('SELECT id, name FROM servers ORDER BY rowid ASC');
+    return res.json({ servers: rows });
+  });
+
+  // Create a server (with a default text + voice channel) and tell every client to refresh rails.
+  app.post('/servers', authMiddleware, async (req, res) => {
+    const name = String((req.body || {}).name || '').trim().slice(0, 40);
+    if (!name) return res.status(400).json({ error: 'Server name required' });
+    const id = newId('srv');
+    await db.run('INSERT INTO servers (id, name) VALUES (?, ?)', id, name);
+    await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', newId('ch'), id, 'general', 'text');
+    await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', newId('ch'), id, 'Voice 1', 'voice');
+    io.emit('servers:updated');
+    return res.json({ server: { id, name } });
+  });
+
+  // Add a channel to a server; push the updated server state to everyone currently in it.
+  app.post('/servers/:serverId/channels', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    const name = String((req.body || {}).name || '').trim().slice(0, 30);
+    const type = (req.body || {}).type === 'voice' ? 'voice' : 'text';
+    if (!name) return res.status(400).json({ error: 'Channel name required' });
+    const chId = newId('ch');
+    await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', chId, serverId, name, type);
+    const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
+    io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
+    return res.json({ channel: { id: chId, name, type } });
+  });
+
+  // --- Server custom emojis ---
+  function slugifyEmojiName(raw) {
+    const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
+      .replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+    return base || 'emoji';
+  }
+
+  // List custom emojis for a server.
+  app.get('/servers/:serverId/emojis', authMiddleware, async (req, res) => {
+    const rows = await db.all(
+      'SELECT name, url, created_by FROM server_emojis WHERE server_id = ? ORDER BY created_at ASC',
+      req.params.serverId
+    );
+    return res.json({ emojis: rows });
+  });
+
+  // Add a custom emoji to a server (url comes from a prior /files/upload).
+  app.post('/servers/:serverId/emojis', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    const { url } = req.body || {};
+    if (typeof url !== 'string' || !url.startsWith('/uploads/')) {
+      return res.status(400).json({ error: 'Invalid emoji url' });
+    }
+    const server = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
+    if (!server) return res.status(404).json({ error: 'Server not found' });
+    // Ensure a unique name within the server.
+    let base = slugifyEmojiName(req.body?.name);
+    let name = base;
+    let n = 1;
+    while (await db.get('SELECT id FROM server_emojis WHERE server_id = ? AND name = ?', serverId, name)) {
+      name = `${base}_${n++}`;
+    }
+    await db.run(
+      'INSERT INTO server_emojis (server_id, name, url, created_by, created_at) VALUES (?, ?, ?, ?, ?)',
+      serverId, name, url, req.user.username, Date.now()
+    );
+    const emojis = await db.all('SELECT name, url, created_by FROM server_emojis WHERE server_id = ? ORDER BY created_at ASC', serverId);
+    return res.json({ success: true, name, emojis });
+  });
+
+  // Remove a custom emoji from a server.
+  app.delete('/servers/:serverId/emojis/:name', authMiddleware, async (req, res) => {
+    const { serverId, name } = req.params;
+    await db.run('DELETE FROM server_emojis WHERE server_id = ? AND name = ?', serverId, name);
+    const emojis = await db.all('SELECT name, url, created_by FROM server_emojis WHERE server_id = ? ORDER BY created_at ASC', serverId);
+    return res.json({ success: true, emojis });
+  });
+
+  // --- Public app directory ---
+  // List all public apps (newest first).
+  app.get('/apps', authMiddleware, async (req, res) => {
+    const rows = await db.all('SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt FROM apps ORDER BY created_at DESC');
+    return res.json({ apps: rows });
+  });
+
+  // Publish a new app to the public directory.
+  app.post('/apps', authMiddleware, async (req, res) => {
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (!name) return res.status(400).json({ error: 'App name is required' });
+    const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 500) : '';
+    const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const iconUrl = typeof req.body?.iconUrl === 'string' && req.body.iconUrl.startsWith('/uploads/') ? req.body.iconUrl : '';
+    await db.run(
+      'INSERT INTO apps (name, description, url, icon_url, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      name.slice(0, 80), description, url, iconUrl, req.user.username, Date.now()
+    );
+    const apps = await db.all('SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt FROM apps ORDER BY created_at DESC');
+    return res.json({ success: true, apps });
+  });
+
+  // --- Shared GIF library ---
+  // List all GIFs (newest first).
+  app.get('/gifs', authMiddleware, async (req, res) => {
+    const gifs = await db.all('SELECT id, name, url, type, created_by AS createdBy, created_at AS createdAt FROM gifs ORDER BY created_at DESC');
+    return res.json({ gifs });
+  });
+
+  // Add a GIF to the shared library (multipart upload -> persistent /gifs storage).
+  app.post('/gifs', authMiddleware, (req, res) => {
+    gifUpload.single('file')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is larger than 100 MB' });
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      if (!req.file) return res.status(400).json({ error: 'Missing file' });
+      const type = req.file.mimetype || 'image/gif';
+      if (!type.startsWith('image/')) {
+        fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(400).json({ error: 'Only image files can be added to the GIF library' });
+      }
+      const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const name = (rawName || req.file.originalname || 'GIF').slice(0, 80);
+      const url = `/gifs/${req.file.filename}`;
+      await db.run(
+        'INSERT INTO gifs (name, url, type, created_by, created_at) VALUES (?, ?, ?, ?, ?)',
+        name, url, type, req.user.username, Date.now()
+      );
+      const gifs = await db.all('SELECT id, name, url, type, created_by AS createdBy, created_at AS createdAt FROM gifs ORDER BY created_at DESC');
+      return res.json({ success: true, gifs });
+    });
+  });
+
+  // Remove a GIF from the library (and delete its file).
+  app.delete('/gifs/:id', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid gif id' });
+    const gif = await db.get('SELECT url FROM gifs WHERE id = ?', id);
+    if (gif && typeof gif.url === 'string' && gif.url.startsWith('/gifs/')) {
+      fs.promises.unlink(path.join(gifsDir, path.basename(gif.url))).catch(() => {});
+    }
+    await db.run('DELETE FROM gifs WHERE id = ?', id);
+    const gifs = await db.all('SELECT id, name, url, type, created_by AS createdBy, created_at AS createdAt FROM gifs ORDER BY created_at DESC');
+    return res.json({ success: true, gifs });
+  });
+
+  // --- Shared soundboard ---
+  const SOUND_COLORS = ['#ff6b6b', '#f7b731', '#20bf6b', '#2bcbba', '#45aaf2', '#4b7bec', '#a55eea', '#fd79a8', '#e17055', '#00b894'];
+  function soundColorForName(raw) {
+    const s = String(raw || 'sound');
+    let hash = 0;
+    for (let i = 0; i < s.length; i++) hash = (hash + s.charCodeAt(i)) % SOUND_COLORS.length;
+    return SOUND_COLORS[hash];
+  }
+
+  // List all soundboard clips (newest first).
+  app.get('/sounds', authMiddleware, async (req, res) => {
+    const sounds = await db.all('SELECT id, name, emoji, color, url, type, created_by AS createdBy, created_at AS createdAt FROM sounds ORDER BY created_at DESC');
+    return res.json({ sounds });
+  });
+
+  // Add a soundboard clip (multipart upload -> persistent /sounds storage).
+  app.post('/sounds', authMiddleware, (req, res) => {
+    soundUpload.single('file')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is larger than 100 MB' });
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      if (!req.file) return res.status(400).json({ error: 'Missing file' });
+      const type = req.file.mimetype || 'audio/mpeg';
+      // Accept by mimetype, or by extension (some clients send application/octet-stream for audio).
+      const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'oga', 'm4a', 'aac', 'flac', 'weba', 'opus'];
+      const ext = (req.file.originalname.split('.').pop() || '').toLowerCase();
+      if (!type.startsWith('audio/') && !AUDIO_EXTS.includes(ext)) {
+        fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(400).json({ error: 'Only audio files can be added to the soundboard' });
+      }
+      const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const name = (rawName || req.file.originalname.replace(/\.[^.]+$/, '') || 'Sound').slice(0, SOUND_NAME_MAX);
+      const emoji = typeof req.body?.emoji === 'string' && req.body.emoji.trim() ? req.body.emoji.trim().slice(0, 8) : '🔊';
+      const color = typeof req.body?.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(req.body.color) ? req.body.color : soundColorForName(name);
+      const url = `/sounds/${req.file.filename}`;
+      await db.run(
+        'INSERT INTO sounds (name, emoji, color, url, type, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        name, emoji, color, url, type, req.user.username, Date.now()
+      );
+      const sounds = await db.all('SELECT id, name, emoji, color, url, type, created_by AS createdBy, created_at AS createdAt FROM sounds ORDER BY created_at DESC');
+      return res.json({ success: true, sounds });
+    });
+  });
+
+  // Rename a soundboard clip.
+  app.patch('/sounds/:id', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid sound id' });
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, SOUND_NAME_MAX) : '';
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+    const existing = await db.get('SELECT id FROM sounds WHERE id = ?', id);
+    if (!existing) return res.status(404).json({ error: 'Sound not found' });
+    await db.run('UPDATE sounds SET name = ? WHERE id = ?', name, id);
+    const sounds = await db.all('SELECT id, name, emoji, color, url, type, created_by AS createdBy, created_at AS createdAt FROM sounds ORDER BY created_at DESC');
+    return res.json({ success: true, sounds });
+  });
+
+  // Remove a soundboard clip (and delete its file).
+  app.delete('/sounds/:id', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid sound id' });
+    const sound = await db.get('SELECT url FROM sounds WHERE id = ?', id);
+    if (sound && typeof sound.url === 'string' && sound.url.startsWith('/sounds/')) {
+      fs.promises.unlink(path.join(soundsDir, path.basename(sound.url))).catch(() => {});
+    }
+    await db.run('DELETE FROM sounds WHERE id = ?', id);
+    const sounds = await db.all('SELECT id, name, emoji, color, url, type, created_by AS createdBy, created_at AS createdAt FROM sounds ORDER BY created_at DESC');
+    return res.json({ success: true, sounds });
+  });
+
+  // --- Giphy proxy ---
+  // The Giphy API key comes from the GIPHY_API_KEY env var, or a `server/giphy.key` file.
+  // The key stays server-side; clients only see the proxied results.
+  function getGiphyKey() {
+    if (process.env.GIPHY_API_KEY && process.env.GIPHY_API_KEY.trim()) return process.env.GIPHY_API_KEY.trim();
+    try { return fs.readFileSync(path.join(__dirname, 'giphy.key'), 'utf8').trim(); } catch { return ''; }
+  }
+
+  app.get('/giphy/status', authMiddleware, (req, res) => res.json({ configured: !!getGiphyKey() }));
+
+  // Trending + search return Giphy's raw { data, pagination, meta } so the client SDK <Grid>
+  // (fed via this proxy) can render + paginate. offset/limit drive infinite scroll.
+  async function proxyGiphy(res, endpoint, params) {
+    const key = getGiphyKey();
+    if (!key) return res.status(503).json({ error: 'Giphy is not configured', configured: false });
+    const qs = new URLSearchParams({ api_key: key, rating: 'pg-13', ...params }).toString();
+    try {
+      const r = await fetch(`https://api.giphy.com/v1/gifs/${endpoint}?${qs}`);
+      const data = await r.json();
+      if (!r.ok) return res.status(502).json({ error: data?.meta?.msg || 'Giphy error' });
+      return res.json({ data: data.data || [], pagination: data.pagination || {}, meta: data.meta || {} });
+    } catch (err) {
+      return res.status(502).json({ error: 'Giphy request failed' });
+    }
+  }
+
+  app.get('/giphy/trending', authMiddleware, async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    return proxyGiphy(res, 'trending', { limit, offset });
+  });
+
+  app.get('/giphy/search', authMiddleware, async (req, res) => {
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.json({ data: [], pagination: { total_count: 0, count: 0, offset: 0 } });
+    const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    return proxyGiphy(res, 'search', { q, limit, offset, lang: 'en' });
+  });
+
+  app.post('/user/presence', authMiddleware, async (req, res) => {
+    const status = normalizePresence(req.body?.status);
+    const username = req.user.username;
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    await setUserPresenceByUsername(username, status);
+    await broadcastPresenceToFriends(username, status);
+    return res.json({ success: true, status });
+  });
+
+  app.get('/friends/check-user', authMiddleware, async (req, res) => {
+    const target = (req.query.username || '').trim();
+    if (!target) return res.status(400).json({ error: 'Missing username' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    if (target.toLowerCase() === me.username.toLowerCase()) {
+      return res.json({ exists: false, self: true });
+    }
+    const user = await getUserByUsername(target);
+    return res.json({ exists: !!user, self: false });
+  });
+
+  app.get('/friends', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const rows = await db.all(
+      `SELECT u.id, u.username, COALESCE(u.presence_status, 'offline') AS presence_status
+       FROM friendships f
+       JOIN users u ON u.id = f.friend_user_id
+       WHERE f.user_id = ?
+       ORDER BY u.username ASC`,
+      me.id
+    );
+    const friends = rows.map((r) => ({
+      id: String(r.id),
+      name: r.username,
+      status: normalizePresence(r.presence_status),
+      avatar: avatarColorForUsername(r.username),
+    }));
+    return res.json({ friends });
+  });
+
+  app.get('/friends/requests/incoming', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const rows = await db.all(
+      `SELECT fr.id, u.username AS fromUsername, fr.created_at AS createdAt
+       FROM friend_requests fr
+       JOIN users u ON u.id = fr.from_user_id
+       WHERE fr.to_user_id = ? AND fr.status = 'pending'
+       ORDER BY fr.created_at DESC`,
+      me.id
+    );
+    return res.json({
+      requests: rows.map((r) => ({
+        id: r.id,
+        fromUsername: r.fromUsername,
+        createdAt: r.createdAt,
+        avatar: avatarColorForUsername(r.fromUsername),
+      })),
+    });
+  });
+
+  app.get('/friends/requests/outgoing', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const rows = await db.all(
+      `SELECT fr.id, u.username AS toUsername, fr.created_at AS createdAt
+       FROM friend_requests fr
+       JOIN users u ON u.id = fr.to_user_id
+       WHERE fr.from_user_id = ? AND fr.status = 'pending'
+       ORDER BY fr.created_at DESC`,
+      me.id
+    );
+    return res.json({
+      requests: rows.map((r) => ({
+        id: r.id,
+        toUsername: r.toUsername,
+        createdAt: r.createdAt,
+        avatar: avatarColorForUsername(r.toUsername),
+      })),
+    });
+  });
+
+  app.post('/friends/requests/:id/cancel', authMiddleware, async (req, res) => {
+    const requestId = parseInt(req.params.id, 10);
+    if (!requestId) return res.status(400).json({ error: 'Invalid request id' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const fr = await db.get('SELECT * FROM friend_requests WHERE id = ?', requestId);
+    if (!fr || fr.from_user_id !== me.id) return res.status(404).json({ error: 'Request not found' });
+    if (fr.status !== 'pending') return res.status(400).json({ error: 'Request is not pending' });
+    await db.run('UPDATE friend_requests SET status = ? WHERE id = ?', 'cancelled', requestId);
+    const target = await db.get('SELECT username FROM users WHERE id = ?', fr.to_user_id);
+    if (target) await emitPendingUpdate(target.username);
+    return res.json({ success: true });
+  });
+
+  app.get('/friends/requests/pending-count', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const count = await getPendingCountForUserId(me.id);
+    return res.json({ count });
+  });
+
+  app.post('/friends/request', authMiddleware, async (req, res) => {
+    const targetUsername = (req.body?.username || '').trim();
+    if (!targetUsername) return res.status(400).json({ error: 'Missing username' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const target = await getUserByUsername(targetUsername);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.id === me.id) return res.status(400).json({ error: 'You cannot add yourself' });
+    if (await areFriends(me.id, target.id)) {
+      return res.status(409).json({ error: 'Already friends' });
+    }
+    if (await hasPendingRequestBetween(me.id, target.id)) {
+      return res.status(409).json({ error: 'Friend request already pending' });
+    }
+    const createdAt = Date.now();
+    await db.run(
+      'INSERT INTO friend_requests (from_user_id, to_user_id, status, created_at) VALUES (?, ?, ?, ?)',
+      me.id,
+      target.id,
+      'pending',
+      createdAt
+    );
+    await emitPendingUpdate(target.username);
+    return res.json({ success: true });
+  });
+
+  app.post('/friends/requests/:id/accept', authMiddleware, async (req, res) => {
+    const requestId = parseInt(req.params.id, 10);
+    if (!requestId) return res.status(400).json({ error: 'Invalid request id' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const fr = await db.get(
+      `SELECT fr.*, u_from.username AS fromUsername, u_to.username AS toUsername
+       FROM friend_requests fr
+       JOIN users u_from ON u_from.id = fr.from_user_id
+       JOIN users u_to ON u_to.id = fr.to_user_id
+       WHERE fr.id = ?`,
+      requestId
+    );
+    if (!fr || fr.to_user_id !== me.id) return res.status(404).json({ error: 'Request not found' });
+    if (fr.status !== 'pending') return res.status(400).json({ error: 'Request is not pending' });
+    const now = Date.now();
+    await db.run('UPDATE friend_requests SET status = ? WHERE id = ?', 'accepted', requestId);
+    await db.run(
+      'INSERT OR IGNORE INTO friendships (user_id, friend_user_id, created_at) VALUES (?, ?, ?)',
+      me.id,
+      fr.from_user_id,
+      now
+    );
+    await db.run(
+      'INSERT OR IGNORE INTO friendships (user_id, friend_user_id, created_at) VALUES (?, ?, ?)',
+      fr.from_user_id,
+      me.id,
+      now
+    );
+    await emitPendingUpdate(me.username);
+    await emitFriendsListUpdate(me.username);
+    await emitFriendsListUpdate(fr.fromUsername);
+    return res.json({ success: true });
+  });
+
+  app.post('/friends/requests/:id/decline', authMiddleware, async (req, res) => {
+    const requestId = parseInt(req.params.id, 10);
+    if (!requestId) return res.status(400).json({ error: 'Invalid request id' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const fr = await db.get('SELECT * FROM friend_requests WHERE id = ?', requestId);
+    if (!fr || fr.to_user_id !== me.id) return res.status(404).json({ error: 'Request not found' });
+    if (fr.status !== 'pending') return res.status(400).json({ error: 'Request is not pending' });
+    await db.run('UPDATE friend_requests SET status = ? WHERE id = ?', 'declined', requestId);
+    await emitPendingUpdate(me.username);
+    return res.json({ success: true });
+  });
+
+  app.get('/messages/conversations', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const friends = await db.all(
+      `SELECT u.id, u.username, COALESCE(u.presence_status, 'offline') AS presence_status
+       FROM friendships f
+       JOIN users u ON u.id = f.friend_user_id
+       WHERE f.user_id = ?
+       ORDER BY u.username ASC`,
+      me.id
+    );
+    const summary = await getDmUnreadSummary(me.id);
+    const unreadMap = new Map(summary.byPeer.map((r) => [String(r.peerId), r.unreadCount]));
+    const conversations = [];
+    for (const f of friends) {
+      const last = await db.get(
+        `SELECT dm.body, dm.attachment_json AS attachmentJson, dm.created_at AS createdAt, s.username AS senderUsername
+         FROM direct_messages dm
+         JOIN users s ON s.id = dm.sender_id
+         WHERE (dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)
+         ORDER BY dm.created_at DESC LIMIT 1`,
+        me.id,
+        f.id,
+        f.id,
+        me.id
+      );
+      conversations.push({
+        id: String(f.id),
+        name: f.username,
+        peerUsername: f.username,
+        unreadCount: unreadMap.get(String(f.id)) || 0,
+        avatar: avatarColorForUsername(f.username),
+        status: normalizePresence(f.presence_status),
+        lastMessage: last
+          ? { text: last.body || (last.attachmentJson ? 'Sent an attachment' : ''), author: last.senderUsername, createdAt: last.createdAt }
+          : null,
+      });
+    }
+    return res.json({ conversations, totalUnread: summary.totalUnread });
+  });
+
+  app.get('/messages/with/:username', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const peer = await getUserByUsername(req.params.username);
+    if (!peer) return res.status(404).json({ error: 'User not found' });
+    if (!(await areFriends(me.id, peer.id))) {
+      return res.status(403).json({ error: 'You can only message friends' });
+    }
+    const markRead = req.query.markRead === '1' || req.query.markRead === 'true';
+    if (markRead) {
+      const now = Date.now();
+      await db.run(
+        'UPDATE direct_messages SET read_at = ? WHERE recipient_id = ? AND sender_id = ? AND read_at IS NULL',
+        now,
+        me.id,
+        peer.id
+      );
+      await emitDmUnreadUpdate(me.username);
+    }
+    const rows = await db.all(
+      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, s.username AS author
+       FROM direct_messages dm
+       JOIN users s ON s.id = dm.sender_id
+       WHERE (dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)
+       ORDER BY dm.created_at ASC`,
+      me.id,
+      peer.id,
+      peer.id,
+      me.id
+    );
+    const summary = await getDmUnreadSummary(me.id);
+    return res.json({
+      messages: rows.map((r) => mapMessageRow(r, me.username)),
+      totalUnread: summary.totalUnread,
+    });
+  });
+
+  app.post('/messages/read', authMiddleware, async (req, res) => {
+    const withUsername = (req.body?.withUsername || req.body?.username || '').trim();
+    if (!withUsername) return res.status(400).json({ error: 'Missing username' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const peer = await getUserByUsername(withUsername);
+    if (!peer) return res.status(404).json({ error: 'User not found' });
+    const now = Date.now();
+    await db.run(
+      'UPDATE direct_messages SET read_at = ? WHERE recipient_id = ? AND sender_id = ? AND read_at IS NULL',
+      now,
+      me.id,
+      peer.id
+    );
+    await emitDmUnreadUpdate(me.username);
+    const summary = await getDmUnreadSummary(me.id);
+    return res.json({ success: true, totalUnread: summary.totalUnread });
+  });
+
+  app.post('/messages/send', authMiddleware, async (req, res) => {
+    const toUsername = (req.body?.toUsername || req.body?.username || '').trim();
+    const body = (req.body?.text || req.body?.body || '').trim();
+    const attachment = normalizeAttachment(req.body?.attachment);
+    if (!toUsername || (!body && !attachment)) return res.status(400).json({ error: 'Missing username or message' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const peer = await getUserByUsername(toUsername);
+    if (!peer) return res.status(404).json({ error: 'User not found' });
+    if (!(await areFriends(me.id, peer.id))) {
+      return res.status(403).json({ error: 'You can only message friends' });
+    }
+    const createdAt = Date.now();
+    const insertResult = await db.run(
+      'INSERT INTO direct_messages (sender_id, recipient_id, body, created_at, read_at, attachment_json) VALUES (?, ?, ?, ?, NULL, ?)',
+      me.id,
+      peer.id,
+      body,
+      createdAt,
+      attachment ? JSON.stringify(attachment) : null
+    );
+    const row = await db.get(
+      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, s.username AS author
+       FROM direct_messages dm
+       JOIN users s ON s.id = dm.sender_id
+       WHERE dm.id = ?`,
+      insertResult.lastID
+    );
+    const msg = mapMessageRow(row);
+    io.to(`user:${peer.username}`).emit('dm:message', {
+      fromUsername: me.username,
+      fromUserId: String(me.id),
+      message: msg,
+    });
+    await emitDmUnreadUpdate(peer.username);
+    await emitDmUnreadUpdate(me.username);
+    return res.json({ success: true, message: msg });
+  });
+
+  // Delete a direct message — only the sender may delete it. Notify both participants.
+  app.delete('/messages/:id', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid message id' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const dm = await db.get('SELECT sender_id, recipient_id FROM direct_messages WHERE id = ?', id);
+    if (!dm) return res.status(404).json({ error: 'Message not found' });
+    if (dm.sender_id !== me.id) return res.status(403).json({ error: 'You can only delete your own messages' });
+    await db.run('DELETE FROM direct_messages WHERE id = ?', id);
+    const recipient = await db.get('SELECT username FROM users WHERE id = ?', dm.recipient_id);
+    io.to(`user:${me.username}`).emit('dm:message-deleted', { id });
+    if (recipient) io.to(`user:${recipient.username}`).emit('dm:message-deleted', { id });
+    await emitDmUnreadUpdate(me.username);
+    if (recipient) await emitDmUnreadUpdate(recipient.username);
+    return res.json({ success: true });
+  });
+
+  app.post('/files/upload', authMiddleware, (req, res) => {
+    upload.single('file')(req, res, (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(413).json({ error: 'File is larger than 100 MB' });
+        }
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      if (!req.file) return res.status(400).json({ error: 'Missing file' });
+      return res.json({
+        success: true,
+        attachment: {
+          url: `/uploads/${req.file.filename}`,
+          name: req.file.originalname,
+          size: req.file.size,
+          type: req.file.mimetype || 'application/octet-stream',
+        },
+      });
+    });
+  });
+
+  // Sync endpoint: return servers, channels, and messages
+  app.get('/user/sync', authMiddleware, async (req, res) => {
+    // for demo return full demo server
+    const rows = await db.all('SELECT * FROM servers');
+    const result = {};
+    for (const s of rows) {
+      const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', s.id);
+      const messagesByChannel = {};
+      for (const ch of channels) {
+        const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
+        messagesByChannel[ch.id] = msgs.map((m) => mapMessageRow(m, req.user.username));
+      }
+      result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
+    }
+    return res.json({ servers: result });
+  });
+
+  // Socket.IO handlers
+  io.on('connection', (socket) => {
+    console.log('socket connected', socket.id);
+    // try to read token from handshake
+    const token = socket.handshake.auth && socket.handshake.auth.token;
+    let socketUser = null;
+    if (token) {
+      try { socketUser = jwt.verify(token, JWT_SECRET).username; } catch (e) { socketUser = null }
+    }
+    if (socketUser) {
+      socket.join(`user:${socketUser}`);
+      setUserPresenceByUsername(socketUser, 'available')
+        .then((status) => broadcastPresenceToFriends(socketUser, status))
+        .catch((err) => console.warn('presence on connect failed', err));
+    }
+
+    socket.on('join', async ({ serverId = 'demo', name = 'Anonymous' } = {}) => {
+      const serverRow = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
+      if (!serverRow) return; // unknown server id (e.g. stale client state) — ignore
+      const nick = socketUser || name || 'Anonymous';
+      clients[socket.id] = { name: nick, username: socketUser, serverId };
+      // Switching servers: leave the previous server + text-channel rooms so messages from other
+      // servers/channels never reach this socket. Voice/user/collab rooms are left untouched.
+      for (const room of socket.rooms) {
+        if (room !== socket.id && (room.startsWith('server:') || room.startsWith('channel:'))) socket.leave(room);
+      }
+      socket.join(`server:${serverId}`);
+      const members = getMembersForServer(serverId);
+      const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
+      const serverObj = { id: serverRow.id, name: serverRow.name, channels };
+      io.to(`server:${serverId}`).emit('server:state', { server: serverObj, members });
+
+      // Enter the server's first text channel and send its history.
+      const firstText = channels.find((c) => c.type === 'text');
+      if (firstText) {
+        socket.join(`channel:${serverId}:${firstText.id}`);
+        socket.emit('channel:joined', { serverId, channelId: firstText.id });
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
+        socket.emit('messages:init', { serverId, channelId: firstText.id, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
+      } else {
+        socket.emit('messages:init', { serverId, channelId: null, messages: [] });
+      }
+    });
+
+    socket.on('joinChannel', async ({ serverId = 'demo', channelId = 'general' } = {}) => {
+      // Only join channels that actually belong to the server (no cross-server bleed).
+      const ch = await db.get('SELECT id, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+      if (!ch) return;
+      for (const room of socket.rooms) {
+        if (room !== socket.id && room.startsWith('channel:')) socket.leave(room);
+      }
+      socket.join(`channel:${serverId}:${channelId}`);
+      socket.emit('channel:joined', { serverId, channelId });
+      if (ch.type === 'text') {
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
+        socket.emit('messages:init', { serverId, channelId, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
+      }
+    });
+
+    socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment } = {}) => {
+      // Refuse writes to channels that don't belong to the server (keeps history cleanly scoped).
+      const ch = await db.get('SELECT id FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+      if (!ch) return;
+      const author = clients[socket.id]?.name || 'Anon';
+      const body = (text || '').trim();
+      const fileAttachment = normalizeAttachment(attachment);
+      if (!body && !fileAttachment) return;
+      const ts = Date.now();
+      await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json) VALUES (?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null);
+      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE rowid = last_insert_rowid()');
+      // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
+      io.to(`channel:${serverId}:${channelId}`).emit('message', { ...mapMessageRow(msgRow), serverId, channelId });
+    });
+
+    // Delete a channel message — only the author may delete it. Broadcast removal to the channel.
+    socket.on('message:delete', async ({ id } = {}) => {
+      if (!id) return;
+      const info = clients[socket.id];
+      if (!info) return;
+      const row = await db.get('SELECT author, server_id, channel_id FROM messages WHERE id = ?', id);
+      if (!row || row.author !== info.name) return; // not found or not the author
+      await db.run('DELETE FROM messages WHERE id = ?', id);
+      io.to(`channel:${row.server_id}:${row.channel_id}`).emit('message:deleted', { id });
+    });
+
+    // Toggle a persisted reaction. scope 'channel' (broadcast to channel) or 'dm' (both peers).
+    socket.on('reaction:toggle', async ({ scope = 'channel', messageId, emoji } = {}) => {
+      if (!socketUser || !messageId || typeof emoji !== 'string' || !emoji) return;
+      if (scope === 'dm') {
+        const dm = await db.get('SELECT sender_id, recipient_id FROM direct_messages WHERE id = ?', messageId);
+        if (!dm) return;
+        const me = await getUserByUsername(socketUser);
+        if (!me || (dm.sender_id !== me.id && dm.recipient_id !== me.id)) return; // only participants
+        const raw = await toggleReaction('direct_messages', messageId, socketUser, emoji);
+        if (raw == null) return;
+        const otherId = dm.sender_id === me.id ? dm.recipient_id : dm.sender_id;
+        const other = await db.get('SELECT username FROM users WHERE id = ?', otherId);
+        io.to(`user:${socketUser}`).emit('reaction:updated', { scope: 'dm', messageId, reactions: raw });
+        if (other) io.to(`user:${other.username}`).emit('reaction:updated', { scope: 'dm', messageId, reactions: raw });
+        return;
+      }
+      const row = await db.get('SELECT server_id, channel_id FROM messages WHERE id = ?', messageId);
+      if (!row) return;
+      const raw = await toggleReaction('messages', messageId, socketUser, emoji);
+      if (raw == null) return;
+      io.to(`channel:${row.server_id}:${row.channel_id}`).emit('reaction:updated', { scope: 'channel', messageId, reactions: raw });
+    });
+
+    // Soundboard is voice-only: relay a play trigger to everyone else IN THE VOICE ROOM so all
+    // call participants hear it too.
+    socket.on('soundboard:play', ({ serverId = 'demo', channelId = 'voice1', soundId, url, name, emoji } = {}) => {
+      if (typeof url !== 'string' || !url.startsWith('/sounds/')) return;
+      const by = clients[socket.id]?.name || 'Anon';
+      socket.to(`voice:${serverId}:${channelId}`).emit('soundboard:play', { soundId, url, name, emoji, by });
+    });
+
+    // Stop the currently-playing soundboard clip for others in the voice room.
+    socket.on('soundboard:stop', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      socket.to(`voice:${serverId}:${channelId}`).emit('soundboard:stop');
+    });
+
+    // Tell the voice room whether this peer is currently sharing their screen (so others can
+    // offer a "view full screen" affordance only for screen shares).
+    socket.on('voice:screenshare-state', ({ serverId = 'demo', channelId = 'voice1', sharing } = {}) => {
+      socket.to(`voice:${serverId}:${channelId}`).emit('voice:screenshare-state', { id: socket.id, sharing: !!sharing });
+    });
+
+    // Global stream state for Watch/Discover: is this user currently sending camera and/or screen?
+    socket.on('voice:stream-state', ({ serverId = 'demo', channelId = 'voice1', camera, screen } = {}) => {
+      if (camera || screen) {
+        liveStreams[socket.id] = { name: clients[socket.id]?.name || 'Anon', serverId, channelId, camera: !!camera, screen: !!screen };
+      } else {
+        delete liveStreams[socket.id];
+      }
+      broadcastDiscover();
+    });
+
+    // A client (re)opening the Discover panel asks for the current list.
+    socket.on('discover:list', () => socket.emit('discover:update', discoverList()));
+
+    // Activities: start one for the voice room (everyone in it gets it), relay events, or stop.
+    socket.on('activity:start', ({ serverId = 'demo', channelId = 'voice1', type } = {}) => {
+      if (!ACTIVITY_TYPES.includes(type)) return;
+      const room = `voice:${serverId}:${channelId}`;
+      activities[room] = { type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon' };
+      io.to(room).emit('activity:update', activities[room]);
+    });
+    socket.on('activity:event', ({ serverId = 'demo', channelId = 'voice1', event } = {}) => {
+      const room = `voice:${serverId}:${channelId}`;
+      const act = activities[room];
+      if (!act || !event || typeof event !== 'object') return;
+      applyActivityEvent(act, event, clients[socket.id]?.name || 'Anon');
+      io.to(room).emit('activity:update', act);
+    });
+    socket.on('activity:stop', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      const room = `voice:${serverId}:${channelId}`;
+      delete activities[room];
+      io.to(room).emit('activity:update', null);
+    });
+
+    // --- Collaborative image editing (shared annotation canvas, session keyed by image url) ---
+    // Announce a collaboration so others in the channel can join.
+    socket.on('collab:start', ({ serverId = 'demo', channelId = 'general', sessionId, imageUrl } = {}) => {
+      if (!sessionId) return;
+      if (!collabSessions[sessionId]) collabSessions[sessionId] = { imageUrl, segments: [] };
+      const by = clients[socket.id]?.name || 'Anon';
+      socket.to(`channel:${serverId}:${channelId}`).emit('collab:invite', { sessionId, imageUrl, by });
+    });
+    // Join a session and receive the current canvas state.
+    socket.on('collab:join', ({ sessionId, imageUrl } = {}) => {
+      if (!sessionId) return;
+      socket.join(`collab:${sessionId}`);
+      const sess = collabSessions[sessionId] || (collabSessions[sessionId] = { imageUrl, segments: [] });
+      socket.emit('collab:state', { sessionId, segments: sess.segments });
+    });
+    // A drawn segment: store it and relay to everyone else in the session.
+    socket.on('collab:draw', ({ sessionId, segment } = {}) => {
+      const sess = collabSessions[sessionId];
+      if (!sess || !segment || typeof segment !== 'object') return;
+      sess.segments.push(segment);
+      if (sess.segments.length > 20000) sess.segments.splice(0, sess.segments.length - 20000); // cap memory
+      socket.to(`collab:${sessionId}`).emit('collab:draw', { segment });
+    });
+    socket.on('collab:clear', ({ sessionId } = {}) => {
+      const sess = collabSessions[sessionId];
+      if (!sess) return;
+      sess.segments = [];
+      socket.to(`collab:${sessionId}`).emit('collab:clear');
+    });
+    socket.on('collab:leave', ({ sessionId } = {}) => { if (sessionId) socket.leave(`collab:${sessionId}`); });
+
+    // Voice signaling: simple mesh signaling via server
+    socket.on('voice:join', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      const room = `voice:${serverId}:${channelId}`;
+      socket.join(room);
+      const roomSet = io.sockets.adapter.rooms.get(room) || new Set();
+      const peers = Array.from(roomSet).filter(id => id !== socket.id).map(id => ({ id, name: clients[id]?.name || 'Anon' }));
+      socket.emit('voice:peers', peers);
+      socket.to(room).emit('voice:peer-joined', { id: socket.id, name: clients[socket.id]?.name });
+      socket.emit('activity:update', activities[room] || null); // late-joiners get the current activity
+    });
+
+    socket.on('voice:leave', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      const room = `voice:${serverId}:${channelId}`;
+      socket.leave(room);
+      socket.to(room).emit('voice:peer-left', { id: socket.id });
+      if (liveStreams[socket.id]) { delete liveStreams[socket.id]; broadcastDiscover(); }
+      if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size === 0) delete activities[room];
+    });
+
+    socket.on('voice:signal', ({ to, signal } = {}) => {
+      if (!to) return;
+      io.to(to).emit('voice:signal', { from: socket.id, signal });
+    });
+
+    // NOTE: emit voice:peer-left from 'disconnecting' (not 'disconnect') — Socket.IO clears
+    // socket.rooms before 'disconnect' fires, so iterating rooms there finds nothing and peers
+    // never learn someone left (ghost tiles pile up). 'disconnecting' still has the rooms intact.
+    socket.on('disconnecting', () => {
+      for (const room of socket.rooms) {
+        if (room.startsWith('voice:')) {
+          socket.to(room).emit('voice:peer-left', { id: socket.id });
+          // If this socket is the last one in the room, drop its activity.
+          if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size <= 1) delete activities[room];
+        }
+      }
+      if (liveStreams[socket.id]) { delete liveStreams[socket.id]; broadcastDiscover(); }
+    });
+
+    socket.on('disconnect', () => {
+      const info = clients[socket.id];
+      delete clients[socket.id];
+      if (info) {
+        const serverId = info.serverId;
+        const members = getMembersForServer(serverId);
+        io.to(`server:${serverId}`).emit('server:state', { server: { id: serverId }, members });
+        if (info.username) {
+          setUserPresenceByUsername(info.username, 'offline')
+            .then((status) => broadcastPresenceToFriends(info.username, status))
+            .catch((err) => console.warn('presence on disconnect failed', err));
+        }
+      }
+    });
+  });
+
+  // Sweep expired uploads on startup, then hourly.
+  cleanupExpiredUploads().catch((err) => console.warn('upload cleanup failed', err));
+  setInterval(() => {
+    cleanupExpiredUploads().catch((err) => console.warn('upload cleanup failed', err));
+  }, CLEANUP_INTERVAL_MS).unref();
+
+  // SPA fallback: any non-API GET returns index.html so the client boots (must be LAST, after all
+  // API routes + static mounts). Skipped for API-ish paths so a bad API call still 404s as JSON-ish.
+  if (serveClient) {
+    app.get('*', (req, res, next) => {
+      if (req.method !== 'GET' || req.path.startsWith('/uploads') || req.path.startsWith('/gifs') || req.path.startsWith('/sounds') || req.path.startsWith('/socket.io')) return next();
+      res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+    });
+  }
+
+  server.listen(PORT, () => console.log(`LAN Party server on ${PORT}${serveClient ? ' (serving client)' : ''}`));
+}
+
+main().catch(err => { console.error('Server failed to start', err); process.exit(1) });

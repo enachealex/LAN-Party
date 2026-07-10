@@ -1,0 +1,20 @@
+# Dependencies / build output
+node_modules/
+dist/
+/.vite
+
+# Secrets & environment — never commit these
+.env
+server/giphy.key
+desktop/certs/
+
+# Runtime data (user accounts, uploads, sounds, gifs live on the server's disk)
+server/data.sqlite
+server/data.sqlite-journal
+server/uploads/
+server/gifs/
+server/sounds/
+data/
+
+# Logs
+*.log

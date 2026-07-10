@@ -1,0 +1,24 @@
+# One-command run: `docker compose up -d --build`
+# Put real secrets/TURN creds in a .env file next to this (see DEPLOY.md).
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"   # only expose to localhost; nginx terminates TLS in front
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATA_DIR: /data
+      CLIENT_DIST: /app/client/dist
+      JWT_SECRET: ${JWT_SECRET:?set a long random JWT_SECRET in .env}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-https://discordmusic.thejumpvault.com}
+      STUN_URLS: ${STUN_URLS:-stun:stun.l.google.com:19302}
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_CREDENTIAL: ${TURN_CREDENTIAL:-}
+      GIPHY_API_KEY: ${GIPHY_API_KEY:-}
+    volumes:
+      - appdata:/data
+volumes:
+  appdata:

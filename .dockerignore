@@ -1,0 +1,12 @@
+**/node_modules
+client/dist
+server/data.sqlite
+server/uploads
+server/gifs
+server/sounds
+data
+.git
+.gitignore
+desktop
+**/*.log
+DEPLOY.md

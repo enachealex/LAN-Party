@@ -1,0 +1,31 @@
+{
+  "name": "lan-party-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron desktop wrapper for the LAN Party communication app",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "cross-env ELECTRON_START_URL=http://localhost:5173 electron .",
+    "build": "electron-builder"
+  },
+  "build": {
+    "appId": "com.thejumpvault.lanparty",
+    "productName": "LAN Party",
+    "copyright": "© The Jump Vault (thejumpvault.com)",
+    "files": ["main.js", "preload.js", "package.json"],
+    "extraResources": [{ "from": "../client/dist", "to": "client-dist" }],
+    "win": {
+      "target": "nsis",
+      "publisherName": "The Jump Vault",
+      "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+    },
+    "mac": { "target": "dmg", "category": "public.app-category.social-networking" },
+    "linux": { "target": "AppImage" }
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  }
+}
