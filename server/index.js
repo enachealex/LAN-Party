@@ -736,6 +736,28 @@ async function main() {
     return res.json({ success: true, settings });
   });
 
+  // Public profile of any user (for the click-a-member profile card) — only display-safe fields.
+  app.get('/users/:username/public', authMiddleware, async (req, res) => {
+    const row = await db.get("SELECT username, settings, COALESCE(presence_status,'offline') AS presence_status FROM users WHERE username = ?", req.params.username);
+    if (!row) return res.status(404).json({ error: 'User not found' });
+    let s = {};
+    try { s = JSON.parse(row.settings || '{}') || {}; } catch { s = {}; }
+    const p = s.profile || {};
+    return res.json({
+      username: row.username,
+      status: row.presence_status,
+      profile: {
+        avatarUrl: p.avatarUrl || '', border: p.border || null, overlay: p.overlay || null,
+        nameStyle: p.nameStyle || null, nameFont: p.nameFont || null, tags: Array.isArray(p.tags) ? p.tags : [],
+        statusMessage: p.statusMessage || '', bio: p.bio || '',
+      },
+      gamingProfile: {
+        genres: Array.isArray(s.gamingProfile?.genres) ? s.gamingProfile.genres : [],
+        currentGames: s.gamingProfile?.currentGames || '',
+      },
+    });
+  });
+
   // --- Servers & channels ---
   const newId = (prefix) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 

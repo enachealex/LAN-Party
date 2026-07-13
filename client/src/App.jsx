@@ -806,6 +806,8 @@ export default function App() {
   // Watch/Discover: who is currently streaming (camera/screen) across the app.
   const [discoverStreams, setDiscoverStreams] = useState([])
   const [showDiscover, setShowDiscover] = useState(false)
+  // Public profile card shown when you click a member.
+  const [profileCard, setProfileCard] = useState(null) // { loading?, username, profile, gamingProfile, status }
   // External streaming (Twitch/YouTube/Kik): my announcement + the announce form + in-app viewer.
   const [myExternalStream, setMyExternalStream] = useState(null) // { platform, channel, title, game }
   const [showAnnounceForm, setShowAnnounceForm] = useState(false)
@@ -2262,6 +2264,19 @@ export default function App() {
     stopMicMeter()
     stopPreJoinMic()
     // the camera preview (if on) tears down via the preview effect once showPreJoin/preJoinCamOn clear
+  }
+
+  // Show a member's public profile card (avatar, status, bio, gaming profile).
+  const openMemberProfile = async (username) => {
+    if (!username) return
+    setProfileCard({ loading: true, username })
+    try {
+      const res = await authedFetch(`/users/${encodeURIComponent(username)}/public`)
+      if (!res.ok) throw new Error('not found')
+      setProfileCard(await res.json())
+    } catch (e) {
+      setProfileCard({ username, notFound: true })
+    }
   }
 
   // Watch/Discover: open the panel (and refresh the list) / jump into a stream's voice channel.
@@ -3866,6 +3881,7 @@ export default function App() {
         onLeaveVoice={leaveVoice}
         members={serverState?.members || []}
         socketId={socket?.id}
+        onSelectMember={openMemberProfile}
       />
 
       <div className="main">
@@ -4181,6 +4197,47 @@ export default function App() {
           )}
         </div>
       </div>
+      {/* Public profile card (click a member) */}
+      {profileCard && (
+        <div className="profilecard-overlay" onClick={() => setProfileCard(null)}>
+          <div className="profilecard" onClick={(e) => e.stopPropagation()}>
+            <button type="button" className="discover-close profilecard-close" onClick={() => setProfileCard(null)} aria-label="Close">✕</button>
+            {profileCard.loading ? (
+              <div className="profilecard-loading">Loading…</div>
+            ) : profileCard.notFound ? (
+              <div className="profilecard-loading">Couldn't load @{profileCard.username}.</div>
+            ) : (
+              <>
+                <div className="profilecard-head">
+                  <ProfileAvatar name={profileCard.username} profile={profileCard.profile || {}} size={72} resolveSrc={emojiSrc} />
+                  <div className="profilecard-id">
+                    <span className="profilecard-name" style={nameStyleToCss(profileCard.profile?.nameStyle, profileCard.profile?.nameFont)}>{profileCard.username}</span>
+                    <span className={`profilecard-status dc-status-${profileCard.status || 'offline'}`}>{(profileCard.status || 'offline')[0].toUpperCase() + (profileCard.status || 'offline').slice(1)}</span>
+                    {(profileCard.profile?.tags || []).length > 0 && (
+                      <span className="profile-preview-tags">
+                        {profileCard.profile.tags.map((t) => <span key={`${t.type}-${t.label}`} className={`profile-tag profile-tag-${t.type}`}>{t.label}</span>)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                {profileCard.profile?.statusMessage && <div className="profilecard-statusmsg">{profileCard.profile.statusMessage}</div>}
+                {profileCard.profile?.bio && <div className="profilecard-bio">{profileCard.profile.bio}</div>}
+                {((profileCard.gamingProfile?.genres || []).length > 0 || profileCard.gamingProfile?.currentGames) && (
+                  <div className="profilecard-gaming">
+                    <div className="profilecard-section">🎮 Gaming</div>
+                    {(profileCard.gamingProfile.genres || []).length > 0 && (
+                      <div className="discover-genres">{profileCard.gamingProfile.genres.map((g) => <span key={g} className="discover-genre">{g}</span>)}</div>
+                    )}
+                    {profileCard.gamingProfile.currentGames && (
+                      <div className="profilecard-games"><span className="profilecard-games-label">Playing lately:</span> {profileCard.gamingProfile.currentGames}</div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
       {/* Watch / Discover — who's live right now (in-app screen shares + Twitch/YouTube/Kik) */}
       {showDiscover && (() => {
         const inAppStreams = discoverStreams.filter((s) => s.kind !== 'external')

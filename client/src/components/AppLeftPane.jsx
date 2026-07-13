@@ -183,6 +183,7 @@ export default function AppLeftPane({
   onLeaveVoice,
   members = [],
   socketId,
+  onSelectMember,
 }) {
   const showVoiceOnHome = inVoice && voiceRailTarget === 'home'
   // Right-click context menu for server tiles / channel rows: { x, y, kind, id, name, isDefault }.
@@ -348,9 +349,11 @@ export default function AppLeftPane({
                   </div>
                   <ul className="dc-members-list">
                     {members.map((m) => (
-                      <li key={m.id} className="dc-member-row">
-                        <span className="dc-member-dot" />
-                        <span>{m.name}{m.id === socketId ? ' (you)' : ''}</span>
+                      <li key={m.id}>
+                        <button type="button" className="dc-member-row" onClick={() => m.username && onSelectMember?.(m.username)} title={m.username ? `View ${m.name}'s profile` : undefined}>
+                          <span className="dc-member-dot" />
+                          <span>{m.name}{m.id === socketId ? ' (you)' : ''}</span>
+                        </button>
                       </li>
                     ))}
                   </ul>
