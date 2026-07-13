@@ -247,6 +247,12 @@ async function main() {
   } catch (err) {
     /* column already exists */
   }
+  // Channel privacy: 'public' (everyone in the server) or 'private' (marked with a lock).
+  try {
+    await db.run(`ALTER TABLE channels ADD COLUMN privacy TEXT DEFAULT 'public'`);
+  } catch (err) {
+    /* column already exists */
+  }
   // Persisted reactions, stored as JSON { "👍": ["alice","bob"], ... } per message.
   try {
     await db.run(`ALTER TABLE messages ADD COLUMN reactions_json TEXT`);
@@ -786,19 +792,20 @@ async function main() {
     if (!srv) return res.status(404).json({ error: 'Server not found' });
     const name = String((req.body || {}).name || '').trim().slice(0, 30);
     const type = (req.body || {}).type === 'voice' ? 'voice' : 'text';
+    const privacy = (req.body || {}).privacy === 'private' ? 'private' : 'public';
     if (!name) return res.status(400).json({ error: 'Channel name required' });
     const chId = newId('ch');
-    await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', chId, serverId, name, type);
-    const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
+    await db.run('INSERT INTO channels (id, server_id, name, type, privacy) VALUES (?, ?, ?, ?, ?)', chId, serverId, name, type, privacy);
+    const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
     io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
-    return res.json({ channel: { id: chId, name, type } });
+    return res.json({ channel: { id: chId, name, type, privacy } });
   });
 
   // Rebroadcast a server's full state to everyone currently in it.
   async function pushServerState(serverId) {
     const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
     if (!srv) return;
-    const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
+    const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
     io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
   }
 
@@ -1443,7 +1450,7 @@ async function main() {
     const rows = await db.all('SELECT * FROM servers');
     const result = {};
     for (const s of rows) {
-      const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', s.id);
+      const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
       const messagesByChannel = {};
       for (const ch of channels) {
         const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
@@ -1482,7 +1489,7 @@ async function main() {
       }
       socket.join(`server:${serverId}`);
       const members = getMembersForServer(serverId);
-      const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
+      const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
       const serverObj = { id: serverRow.id, name: serverRow.name, channels };
       io.to(`server:${serverId}`).emit('server:state', { server: serverObj, members });
 

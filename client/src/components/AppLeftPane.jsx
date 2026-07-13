@@ -312,6 +312,7 @@ export default function AppLeftPane({
                   >
                     <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
                     <span>{ch.name}</span>
+                    {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
                   </button>
                 ))}
               </div>
@@ -332,6 +333,7 @@ export default function AppLeftPane({
                       >
                         <span className="dc-channel-icon dc-channel-icon-voice"><ChannelSpeakerIcon /></span>
                         <span>{ch.name}</span>
+                        {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
                       </button>
                       {inThisCall ? (
                         <button type="button" className="dc-voice-join-btn leave" onClick={() => onLeaveVoice?.()} title="Leave voice">Leave</button>

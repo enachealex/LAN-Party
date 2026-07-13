@@ -16,6 +16,7 @@ import EmojiPicker from './components/EmojiPicker'
 import Soundboard from './components/Soundboard'
 import CollabCanvas from './components/CollabCanvas'
 import ActivityPanel, { ACTIVITY_TYPES } from './components/Activities'
+import CreateChannelModal from './components/CreateChannelModal'
 import { COLOR_SCHEMES, matchSchemeId } from './colorSchemes'
 import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
@@ -849,6 +850,9 @@ export default function App() {
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
   const [serversList, setServersList] = useState([])
+  // Create-channel modal (name + type + privacy); channelModalType pre-selects the clicked section.
+  const [showChannelModal, setShowChannelModal] = useState(false)
+  const [channelModalType, setChannelModalType] = useState('text')
   // Mirrors activeChannel so socket callbacks (bound once) never read stale closures.
   // (selectedServerIdRef already exists below and is kept in sync the same way.)
   const activeChannelRef = useRef('general')
@@ -1986,15 +1990,21 @@ export default function App() {
     }
   }
 
-  const createChannel = async (type) => {
+  // The "+" in a channel section opens the create-channel modal, pre-selecting that section's type.
+  const createChannel = (type) => {
+    setChannelModalType(type === 'voice' ? 'voice' : 'text')
+    setShowChannelModal(true)
+  }
+
+  // Submit from the create-channel modal (name + chosen type + privacy).
+  const submitCreateChannel = async ({ name: chName, type, privacy }) => {
     const sid = currentServerId()
-    const chName = (window.prompt(`Name the new ${type === 'voice' ? 'voice' : 'text'} channel:`) || '').trim()
-    if (!chName) return
     const t = token || localStorage.getItem('lanparty_token')
     try {
-      const res = await fetch(`${SERVER_URL}/servers/${encodeURIComponent(sid)}/channels`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: chName, type }) })
+      const res = await fetch(`${SERVER_URL}/servers/${encodeURIComponent(sid)}/channels`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: chName, type, privacy }) })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Could not create channel')
+      setShowChannelModal(false)
       // server:state broadcast updates the sidebar; jump into new text channels right away
       if (type === 'text') joinChannel(data.channel.id)
     } catch (err) {
@@ -4197,6 +4207,14 @@ export default function App() {
           )}
         </div>
       </div>
+      {/* Create-channel modal (name + type + privacy) */}
+      <CreateChannelModal
+        open={showChannelModal}
+        initialType={channelModalType}
+        serverName={serverName}
+        onCreate={submitCreateChannel}
+        onClose={() => setShowChannelModal(false)}
+      />
       {/* Public profile card (click a member) */}
       {profileCard && (
         <div className="profilecard-overlay" onClick={() => setProfileCard(null)}>
