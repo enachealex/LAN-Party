@@ -1455,6 +1455,15 @@ export default function App() {
     patchUserSettings({ messageFlow: flow })
   }
 
+  // ---- Gaming profile (genres + games played lately), edited alongside profile settings ----
+  const editingGaming = (editingSettings && editingSettings.gamingProfile) || { genres: [], currentGames: '' }
+  const updateGamingProfile = (patch) => setEditingSettings((s) => ({ ...(s || {}), gamingProfile: { ...((s && s.gamingProfile) || {}), ...patch, updatedAt: Date.now() } }))
+  const toggleEditGenre = (g) => setEditingSettings((s) => {
+    const cur = (s && s.gamingProfile && s.gamingProfile.genres) || []
+    const genres = cur.includes(g) ? cur.filter((x) => x !== g) : [...cur, g]
+    return { ...(s || {}), gamingProfile: { ...((s && s.gamingProfile) || {}), genres, updatedAt: Date.now() } }
+  })
+
   // ---- Profile customization ----
   const updateProfileDraft = (patch) => setEditingProfile((p) => ({ ...(p || {}), ...patch }))
   const updateProfileBorder = (patch) => setEditingProfile((p) => ({ ...(p || {}), border: { ...(p?.border || {}), ...patch } }))
@@ -1503,11 +1512,15 @@ export default function App() {
   }
   const removeTag = (tag) => setEditingProfile((p) => ({ ...p, tags: (p?.tags || []).filter((t) => !(t.type === tag.type && t.label === tag.label)) }))
 
-  // Commit the edited profile: live state + persisted settings.
+  // Commit the edited profile: live state + persisted settings (including the gaming profile,
+  // which lives in editingSettings). Refresh userSettings so Discover emits use fresh genres.
   const saveProfile = () => {
     const normalized = normalizeProfile(editingProfile)
     setProfile(normalized)
-    patchUserSettings({ profile: normalized })
+    const gaming = editingSettings?.gamingProfile
+    const patch = gaming ? { profile: normalized, gamingProfile: gaming } : { profile: normalized }
+    patchUserSettings(patch)
+    setUserSettings((prev) => ({ ...(prev || {}), ...patch }))
   }
 
   // Apply a preset color scheme: update live CSS vars, local state, and persist (merging so
@@ -2259,7 +2272,7 @@ export default function App() {
   const announceStream = () => {
     const f = announceForm
     if (!f.channel.trim()) { alert('Enter your channel name or stream link first.') ; return }
-    socketRef.current?.emit('stream:announce', { platform: f.platform, channel: f.channel.trim(), title: f.title.trim(), game: f.game.trim() })
+    socketRef.current?.emit('stream:announce', { platform: f.platform, channel: f.channel.trim(), title: f.title.trim(), game: f.game.trim(), genres: userSettings?.gamingProfile?.genres || [] })
     setMyExternalStream({ ...f })
     setShowAnnounceForm(false)
   }
@@ -2527,7 +2540,7 @@ export default function App() {
   // Tell the server whether we're sending camera/screen right now — powers the Watch/Discover list.
   const emitStreamState = (camera, screen, channelId) => {
     const ch = typeof channelId === 'string' ? channelId : (typeof voiceChannelId === 'string' ? voiceChannelId : 'voice1')
-    socketRef.current?.emit('voice:stream-state', { serverId: voiceServerIdRef.current, channelId: ch, camera: !!camera, screen: !!screen })
+    socketRef.current?.emit('voice:stream-state', { serverId: voiceServerIdRef.current, channelId: ch, camera: !!camera, screen: !!screen, genres: userSettings?.gamingProfile?.genres || [] })
   }
 
   // Promote the popup preview to the live call — what you previewed is exactly what goes live,
@@ -4218,6 +4231,7 @@ export default function App() {
                       <div className="discover-info">
                         <div className="discover-name">{s.name || 'Guest'}</div>
                         <div className="discover-meta">{s.channelId === 'voice1' ? 'Voice 1' : s.channelId} · {s.viewers} in channel</div>
+                        {s.genres?.length > 0 && <div className="discover-genres">{s.genres.slice(0, 3).map((g) => <span key={g} className="discover-genre">{g}</span>)}</div>}
                       </div>
                       <button type="button" className="discover-watch" onClick={() => watchStream(s)}>Watch</button>
                     </div>
@@ -4238,6 +4252,7 @@ export default function App() {
                       <div className="discover-info">
                         <div className="discover-name">{s.name || 'Guest'}</div>
                         <div className="discover-meta">{s.title || (s.platform === 'kik' ? `@${s.channel}` : s.channel)}{s.game ? ` · 🎮 ${s.game}` : ''}</div>
+                        {s.genres?.length > 0 && <div className="discover-genres">{s.genres.slice(0, 3).map((g) => <span key={g} className="discover-genre">{g}</span>)}</div>}
                       </div>
                       {s.platform === 'kik' ? (
                         <div className="discover-kik-note">Open Kik and find <strong>@{s.channel}</strong> — Kik streams can't be embedded.</div>
@@ -4735,6 +4750,27 @@ export default function App() {
               >
                 {showProfileEditor ? 'Done' : 'Edit Profile'}
               </button>
+            </div>
+
+            {/* Gaming profile — favorite genres + what you're playing lately */}
+            <div className="gaming-profile-card">
+              <h3 className="profile-settings-section-title">🎮 Gaming Profile</h3>
+              <div className="gaming-sub">Favorite genres</div>
+              <div className="reg-genres">
+                {GAME_GENRES.map((g) => (
+                  <button key={g} type="button" className={`reg-genre${(editingGaming.genres || []).includes(g) ? ' active' : ''}`} onClick={() => toggleEditGenre(g)}>{g}</button>
+                ))}
+              </div>
+              <div className="gaming-sub">Playing right now <span className="reg-optional">(past 2 weeks)</span></div>
+              <input
+                type="text"
+                className="profile-text-input"
+                placeholder="e.g. Valorant, Baldur's Gate 3"
+                maxLength={200}
+                value={editingGaming.currentGames || ''}
+                onChange={(e) => updateGamingProfile({ currentGames: e.target.value })}
+              />
+              <div className="gaming-hint">Shown to others on your live-stream cards in Discover.</div>
             </div>
 
             {showProfileEditor && (

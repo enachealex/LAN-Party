@@ -282,10 +282,10 @@ async function main() {
     for (const [id, s] of Object.entries(liveStreams)) {
       if (!s || !s.screen) continue;
       const size = (io.sockets.adapter.rooms.get(`voice:${s.serverId}:${s.channelId}`) || new Set()).size;
-      out.push({ id, kind: 'screen', name: s.name, serverId: s.serverId, channelId: s.channelId, camera: !!s.camera, screen: !!s.screen, viewers: size });
+      out.push({ id, kind: 'screen', name: s.name, serverId: s.serverId, channelId: s.channelId, camera: !!s.camera, screen: !!s.screen, viewers: size, genres: s.genres || [] });
     }
     for (const [id, s] of Object.entries(externalStreams)) {
-      out.push({ id: `ext-${id}`, kind: 'external', name: s.name, platform: s.platform, channel: s.channel, title: s.title, game: s.game });
+      out.push({ id: `ext-${id}`, kind: 'external', name: s.name, platform: s.platform, channel: s.channel, title: s.title, game: s.game, genres: s.genres || [] });
     }
     return out;
   }
@@ -1560,9 +1560,9 @@ async function main() {
     });
 
     // Global stream state for Watch/Discover: is this user currently sending camera and/or screen?
-    socket.on('voice:stream-state', ({ serverId = 'demo', channelId = 'voice1', camera, screen } = {}) => {
+    socket.on('voice:stream-state', ({ serverId = 'demo', channelId = 'voice1', camera, screen, genres } = {}) => {
       if (camera || screen) {
-        liveStreams[socket.id] = { name: clients[socket.id]?.name || 'Anon', serverId, channelId, camera: !!camera, screen: !!screen };
+        liveStreams[socket.id] = { name: clients[socket.id]?.name || 'Anon', serverId, channelId, camera: !!camera, screen: !!screen, genres: Array.isArray(genres) ? genres.slice(0, 12) : [] };
       } else {
         delete liveStreams[socket.id];
       }
@@ -1573,7 +1573,7 @@ async function main() {
     socket.on('discover:list', () => socket.emit('discover:update', discoverList()));
 
     // "I'm live on Twitch/YouTube/Kik" — announce an external stream so friends can watch in-app.
-    socket.on('stream:announce', ({ platform, channel, title, game } = {}) => {
+    socket.on('stream:announce', ({ platform, channel, title, game, genres } = {}) => {
       if (!EXTERNAL_PLATFORMS.includes(platform)) return;
       const ch = String(channel || '').trim().slice(0, 120);
       if (!ch) return;
@@ -1583,6 +1583,7 @@ async function main() {
         channel: ch,
         title: String(title || '').trim().slice(0, 80),
         game: String(game || '').trim().slice(0, 60),
+        genres: Array.isArray(genres) ? genres.slice(0, 12) : [],
       };
       broadcastDiscover();
     });
