@@ -850,6 +850,83 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .ttt-foot{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:13px}
 .ttt-btn{padding:8px 16px;border:none;border-radius:8px;background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#021022;font-weight:800;cursor:pointer}
 .ttt-note{font-weight:700}
+/* Registration: gaming profile */
+.reg-optional{font-weight:500;color:var(--muted);font-size:11px}
+.reg-genres{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 10px}
+.reg-genre{padding:6px 11px;border-radius:14px;border:1px solid rgba(255,255,255,.16);background:transparent;color:var(--text);font-size:12px;font-weight:700;cursor:pointer;transition:background .1s ease}
+.reg-genre:hover{background:rgba(255,255,255,.08)}
+.reg-genre.active{background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#021022;border-color:transparent}
+/* Discover: external streams (Twitch/YouTube/Kik) */
+.discover-head-actions{display:flex;align-items:center;gap:8px}
+.discover-announce{padding:7px 14px;border:none;border-radius:9px;background:linear-gradient(135deg,#9146ff,#e0574d);color:#fff;font-size:12px;font-weight:800;cursor:pointer}
+.discover-announce:hover{filter:brightness(1.1)}
+.discover-announce.stop{background:#e0574d}
+.discover-section{font-size:11px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);margin:14px 2px 8px}
+.announce-form{display:flex;flex-direction:column;gap:8px;background:#0b1016;border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:12px;margin-bottom:8px}
+.announce-row{display:flex;gap:8px}
+.announce-platform{flex:1;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.14);background:transparent;color:var(--text);font-size:13px;font-weight:800;cursor:pointer}
+.announce-platform.active.twitch{background:#9146ff;border-color:transparent;color:#fff}
+.announce-platform.active.youtube{background:#e0281e;border-color:transparent;color:#fff}
+.announce-platform.active.kik{background:#5dcb44;border-color:transparent;color:#04210b}
+.announce-input{flex:1;min-width:0;padding:9px 11px;background:#05080c;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:var(--text);font-size:13px}
+.announce-input:focus{outline:none;border-color:var(--accent-end)}
+.announce-go{margin:0}
+.discover-thumb.ext-twitch{background:radial-gradient(circle at 50% 40%,#3d2568,#12081f)}
+.discover-thumb.ext-youtube{background:radial-gradient(circle at 50% 40%,#5c1512,#180505)}
+.discover-thumb.ext-kik{background:radial-gradient(circle at 50% 40%,#1d4a15,#061104)}
+.discover-badge.platform.twitch{background:#9146ff}
+.discover-badge.platform.youtube{background:#e0281e}
+.discover-badge.platform.kik{background:#5dcb44;color:#04210b}
+.discover-kik-note{margin:10px 12px 12px;font-size:12px;color:var(--muted);line-height:1.4}
+.extviewer-overlay{position:fixed;inset:0;background:rgba(2,4,8,.92);display:flex;align-items:center;justify-content:center;z-index:450;padding:18px}
+.extviewer-frame{width:min(1200px,96vw);height:min(760px,88vh);display:flex;flex-direction:column;background:#0b0f14;border:1px solid rgba(255,255,255,.1);border-radius:14px;overflow:hidden}
+.extviewer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;flex:none}
+.extviewer-title{font-size:13px;font-weight:800;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.extviewer-embed{flex:1;width:100%;border:none;background:#000}
+/* Sketch & Guess */
+.sketch-lobby{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:22px;text-align:center}
+.sketch-lobby-title{font-size:22px;font-weight:800;color:var(--text)}
+.sketch-lobby-sub{max-width:440px;color:var(--muted);font-size:13px;line-height:1.5}
+.sketch-seats{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.sketch-seat{padding:6px 14px;border-radius:16px;background:rgba(43,195,255,.14);border:1px solid rgba(43,195,255,.4);color:var(--text);font-size:13px;font-weight:700}
+.sketch-seat.empty{background:transparent;border-style:dashed;color:var(--muted)}
+.sketch-lobby-actions{display:flex;gap:10px;align-items:center}
+.sketch-btn{padding:9px 18px;border:none;border-radius:9px;background:rgba(255,255,255,.1);color:var(--text);font-size:13px;font-weight:800;cursor:pointer}
+.sketch-btn:hover:not(:disabled){background:rgba(255,255,255,.18)}
+.sketch-btn:disabled{opacity:.5;cursor:default}
+.sketch-btn.go{background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#021022}
+.sketch-note{color:var(--muted);font-size:13px;font-weight:600}
+.sketch-scoreboard{width:min(360px,100%);display:flex;flex-direction:column;gap:6px}
+.sketch-score-row{display:flex;justify-content:space-between;padding:9px 14px;border-radius:9px;background:#0b1016;border:1px solid rgba(255,255,255,.1);color:var(--text);font-size:14px;font-weight:700}
+.sketch-score-row.winner{border-color:#f0a020;background:rgba(240,160,32,.12)}
+.sketch-game{flex:1;min-height:0;display:flex;flex-direction:column}
+.sketch-topbar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 14px;flex:none}
+.sketch-round{color:var(--muted);font-size:12px;font-weight:700}
+.sketch-word{font-size:17px;font-weight:800;letter-spacing:2px;color:var(--text)}
+.sketch-drawer{color:var(--muted);font-size:12px;font-weight:700}
+.sketch-result{flex:none;text-align:center;padding:4px 12px;color:#8fd14f;font-size:12px;font-weight:700}
+.sketch-main{flex:1;min-height:0;display:flex;gap:10px;padding:0 12px 12px}
+.sketch-canvas-wrap{flex:1.6;min-width:0;display:flex;flex-direction:column;gap:8px}
+.sketch-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:none}
+.sketch-stage{flex:1;min-height:0;margin:0}
+.sketch-side{flex:1;min-width:200px;max-width:300px;display:flex;flex-direction:column;gap:8px}
+.sketch-players{flex:none;display:flex;flex-direction:column;gap:4px}
+.sketch-player{display:flex;justify-content:space-between;padding:6px 10px;border-radius:7px;background:#0b1016;border:1px solid rgba(255,255,255,.08);color:var(--text);font-size:12px;font-weight:700}
+.sketch-player.drawing{border-color:var(--accent-end)}
+.sketch-player.solved{border-color:#3ba55d}
+.sketch-guesses{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px;background:#0b1016;border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:8px}
+.sketch-guess{font-size:12px;color:var(--text);line-height:1.4}
+.sketch-guess.correct{color:#8fd14f;font-weight:700}
+.sketch-guess-bar{display:flex;gap:6px;flex:none}
+.sketch-guess-input{flex:1;min-width:0;padding:8px 10px;background:#0b1016;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:var(--text);font-size:13px}
+.sketch-guess-input:focus{outline:none;border-color:var(--accent-end)}
+/* Right-click menu for servers/channels in the left pane */
+.dc-ctx-menu{position:fixed;min-width:170px;background:#111820;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:5px;box-shadow:0 14px 34px rgba(0,0,0,.55);z-index:2000}
+.dc-ctx-title{font-size:11px;font-weight:800;letter-spacing:.3px;color:var(--muted);padding:5px 9px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.dc-ctx-item{display:block;width:100%;text-align:left;padding:8px 10px;border:none;background:transparent;color:var(--text);border-radius:7px;font-size:13px;font-weight:600;cursor:pointer}
+.dc-ctx-item:hover{background:rgba(255,255,255,.08)}
+.dc-ctx-item.danger{color:#ff8d85}
+.dc-ctx-item.danger:hover{background:rgba(224,87,77,.18)}
 .video-tile{position:relative;min-width:0;min-height:0;background:#232734;border:1px solid rgba(255,255,255,.06);border-radius:12px;overflow:hidden;display:flex;align-items:center;justify-content:center;container-type:size}
 /* contain (not cover) so a whole shared screen fits any tile without cropping the sides */
 .video-tile video{width:100%;height:100%;object-fit:contain;background:#000;display:none}

@@ -61,6 +61,9 @@ function formatReactions(raw, me) {
 }
 const VIEW_STATE_KEY = 'lanparty_view_state'
 
+// Genre chips offered at signup (multi-select).
+const GAME_GENRES = ['FPS / Shooter', 'MOBA', 'RPG', 'Strategy', 'Sports', 'Racing', 'Fighting', 'Party Games', 'Survival / Sandbox', 'Horror', 'MMO', 'Indie']
+
 function formatFileSize(bytes = 0) {
   if (!bytes) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']
@@ -803,6 +806,11 @@ export default function App() {
   // Watch/Discover: who is currently streaming (camera/screen) across the app.
   const [discoverStreams, setDiscoverStreams] = useState([])
   const [showDiscover, setShowDiscover] = useState(false)
+  // External streaming (Twitch/YouTube/Kik): my announcement + the announce form + in-app viewer.
+  const [myExternalStream, setMyExternalStream] = useState(null) // { platform, channel, title, game }
+  const [showAnnounceForm, setShowAnnounceForm] = useState(false)
+  const [announceForm, setAnnounceForm] = useState({ platform: 'twitch', channel: '', title: '', game: '' })
+  const [externalViewer, setExternalViewer] = useState(null) // stream entry being watched in-app
   // Activities: the shared activity for the current voice room (null when none), + the launcher.
   const [activity, setActivity] = useState(null)
   const [showActivityMenu, setShowActivityMenu] = useState(false)
@@ -832,11 +840,13 @@ export default function App() {
   const [showRegPassword, setShowRegPassword] = useState(false)
   const [showRegPasswordConfirm, setShowRegPasswordConfirm] = useState(false)
   const [regEmailError, setRegEmailError] = useState(null)
+  // Gaming profile asked at signup: favorite genres + games played in the past 2 weeks.
+  const [regGenres, setRegGenres] = useState([])
+  const [regCurrentGames, setRegCurrentGames] = useState('')
   const [leftNav, setLeftNav] = useState('friends')
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
   const [serversList, setServersList] = useState([])
-  const serversValidatedRef = useRef(false) // one-shot: validate the restored selection once servers load
   // Mirrors activeChannel so socket callbacks (bound once) never read stale closures.
   // (selectedServerIdRef already exists below and is kept in sync the same way.)
   const activeChannelRef = useRef('general')
@@ -1522,6 +1532,8 @@ export default function App() {
     setRegEmail('')
     setRegPassword('')
     setRegPasswordConfirm('')
+    setRegGenres([])
+    setRegCurrentGames('')
     setAuthError(null)
     setForgotMessage(null)
     setRegUsernameError(null)
@@ -1865,7 +1877,7 @@ export default function App() {
     try {
       const res = await fetch(`${SERVER_URL}/auth/register`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: regUsername, email: regEmail, password: regPassword, passwordConfirm: regPasswordConfirm })
+        body: JSON.stringify({ username: regUsername, email: regEmail, password: regPassword, passwordConfirm: regPasswordConfirm, genres: regGenres, currentGames: regCurrentGames })
       })
       const data = await res.json()
       if (!res.ok) {
@@ -1902,14 +1914,27 @@ export default function App() {
   // Mirror the active channel into a ref for socket callbacks (bound once at socket setup).
   useEffect(() => { activeChannelRef.current = activeChannel }, [activeChannel])
 
-  // Once the real server list arrives, drop a restored selection that no longer exists.
+  // Whenever the server list changes (load, create, delete), bounce home if the server we're
+  // viewing no longer exists (e.g. someone deleted it).
   useEffect(() => {
-    if (serversValidatedRef.current || serversList.length === 0) return
-    serversValidatedRef.current = true
+    if (serversList.length === 0) return
     if (selectedServerId !== 'home' && !serversList.some((sv) => sv.id === selectedServerId)) {
       setSelectedServerId('home')
     }
   }, [serversList, selectedServerId])
+
+  // If the channel we're viewing was deleted (server:state no longer lists it), hop to the
+  // server's first text channel.
+  useEffect(() => {
+    if (selectedServerId === 'home') return
+    const chans = serverState?.server?.channels
+    if (!chans || !chans.length || serverState.server.id !== selectedServerId) return
+    if (!activeChannel || !chans.some((c) => c.id === activeChannel)) {
+      const firstText = chans.find((c) => c.type === 'text')
+      if (firstText) joinChannel(firstText.id)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverState, selectedServerId])
 
   const loadServers = async () => {
     const t = token || localStorage.getItem('lanparty_token')
@@ -1960,6 +1985,38 @@ export default function App() {
     } catch (err) {
       alert(err.message || 'Could not create channel')
     }
+  }
+
+  const authedFetch = (path, opts = {}) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    return fetch(`${SERVER_URL}${path}`, { ...opts, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}`, ...(opts.headers || {}) } })
+  }
+
+  const renameServer = async (serverId, oldName) => {
+    const name2 = (window.prompt('Rename server:', oldName || '') || '').trim()
+    if (!name2 || name2 === oldName) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) })
+    if (!res.ok) alert((await res.json()).error || 'Rename failed')
+  }
+
+  const deleteServer = async (serverId, serverName2) => {
+    if (!window.confirm(`Delete "${serverName2}"? All of its channels and messages will be permanently removed.`)) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' })
+    if (!res.ok) { alert((await res.json()).error || 'Delete failed'); return }
+    if (selectedServerId === serverId) setSelectedServerId('home')
+  }
+
+  const renameChannel = async (channelId, oldName) => {
+    const name2 = (window.prompt('Rename channel:', oldName || '') || '').trim()
+    if (!name2 || name2 === oldName) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/channels/${encodeURIComponent(channelId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) })
+    if (!res.ok) alert((await res.json()).error || 'Rename failed')
+  }
+
+  const deleteChannel = async (channelId, chName) => {
+    if (!window.confirm(`Delete #${chName}? Its messages will be permanently removed.`)) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/channels/${encodeURIComponent(channelId)}`, { method: 'DELETE' })
+    if (!res.ok) alert((await res.json()).error || 'Delete failed')
   }
 
   const joinChannel = (channelId) => {
@@ -2197,6 +2254,47 @@ export default function App() {
   // Watch/Discover: open the panel (and refresh the list) / jump into a stream's voice channel.
   const openDiscover = () => { setShowDiscover(true); socketRef.current?.emit('discover:list') }
   const watchStream = (s) => { setShowDiscover(false); joinVoiceChannel((s && s.channelId) || 'voice1', s && s.serverId) }
+
+  // --- External streams (Twitch / YouTube / Kik) ---
+  const announceStream = () => {
+    const f = announceForm
+    if (!f.channel.trim()) { alert('Enter your channel name or stream link first.') ; return }
+    socketRef.current?.emit('stream:announce', { platform: f.platform, channel: f.channel.trim(), title: f.title.trim(), game: f.game.trim() })
+    setMyExternalStream({ ...f })
+    setShowAnnounceForm(false)
+  }
+  const unannounceStream = () => {
+    socketRef.current?.emit('stream:unannounce')
+    setMyExternalStream(null)
+  }
+
+  // Extract a YouTube video id from a URL or bare id ('' if it looks like a channel id instead).
+  const parseYouTube = (input) => {
+    const s = String(input || '').trim()
+    if (/^UC[\w-]{20,}$/.test(s)) return { channelId: s }
+    if (/^[\w-]{11}$/.test(s)) return { videoId: s }
+    const m = s.match(/(?:youtu\.be\/|[?&]v=|\/live\/|embed\/|shorts\/)([\w-]{11})/)
+    if (m) return { videoId: m[1] }
+    const c = s.match(/youtube\.com\/channel\/(UC[\w-]{20,})/)
+    if (c) return { channelId: c[1] }
+    return {}
+  }
+
+  // Build the in-app embed URL for an external stream (null = not embeddable, e.g. Kik).
+  const externalEmbedUrl = (s) => {
+    if (!s) return null
+    if (s.platform === 'twitch') {
+      const ch = String(s.channel).trim().replace(/^.*twitch\.tv\//i, '').replace(/[/?#].*$/, '')
+      return `https://player.twitch.tv/?channel=${encodeURIComponent(ch)}&parent=${encodeURIComponent(window.location.hostname)}&autoplay=true`
+    }
+    if (s.platform === 'youtube') {
+      const yt = parseYouTube(s.channel)
+      if (yt.videoId) return `https://www.youtube.com/embed/${yt.videoId}?autoplay=1`
+      if (yt.channelId) return `https://www.youtube.com/embed/live_stream?channel=${yt.channelId}&autoplay=1`
+      return null
+    }
+    return null // Kik has no public embed — announce-only
+  }
 
   // Activities: start one for the room, relay an event, or end it (all scoped to the voice channel).
   const startActivity = (type) => { setShowActivityMenu(false); socketRef.current?.emit('activity:start', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', type }) }
@@ -3743,6 +3841,10 @@ export default function App() {
         serverId={selectedServerId}
         onCreateServer={createServer}
         onCreateChannel={createChannel}
+        onRenameServer={renameServer}
+        onDeleteServer={deleteServer}
+        onRenameChannel={renameChannel}
+        onDeleteChannel={deleteChannel}
         activeChannel={activeChannel}
         onJoinChannel={joinChannel}
         voiceChannelId={voiceChannelId}
@@ -4066,34 +4168,103 @@ export default function App() {
           )}
         </div>
       </div>
-      {/* Watch / Discover — who's live right now */}
-      {showDiscover && (
+      {/* Watch / Discover — who's live right now (in-app screen shares + Twitch/YouTube/Kik) */}
+      {showDiscover && (() => {
+        const inAppStreams = discoverStreams.filter((s) => s.kind !== 'external')
+        const externalStreamsList = discoverStreams.filter((s) => s.kind === 'external')
+        const PLATFORM_META = { twitch: { label: 'Twitch', cls: 'twitch' }, youtube: { label: 'YouTube', cls: 'youtube' }, kik: { label: 'Kik', cls: 'kik' } }
+        return (
         <div className="discover-overlay" onClick={() => setShowDiscover(false)}>
           <div className="discover-modal" role="dialog" aria-label="Discover live streams" onClick={(e) => e.stopPropagation()}>
             <div className="discover-head">
               <div className="discover-title">📡 Live now</div>
-              <button type="button" className="discover-close" onClick={() => setShowDiscover(false)} aria-label="Close">✕</button>
-            </div>
-            {discoverStreams.length === 0 ? (
-              <div className="discover-empty">No one is live right now. When someone hits <strong>Go Live</strong> in a voice channel to share their screen, they'll show up here.</div>
-            ) : (
-              <div className="discover-grid">
-                {discoverStreams.map((s) => (
-                  <div key={s.id} className="discover-card">
-                    <div className="discover-thumb">
-                      <span className="discover-thumb-avatar">{(s.name || '?').trim().slice(0, 1).toUpperCase()}</span>
-                      <div className="discover-badges">
-                        <span className="discover-badge live">🔴 LIVE</span>
-                      </div>
-                    </div>
-                    <div className="discover-info">
-                      <div className="discover-name">{s.name || 'Guest'}</div>
-                      <div className="discover-meta">{s.channelId === 'voice1' ? 'Voice 1' : s.channelId} · {s.viewers} in channel</div>
-                    </div>
-                    <button type="button" className="discover-watch" onClick={() => watchStream(s)}>Watch</button>
-                  </div>
-                ))}
+              <div className="discover-head-actions">
+                {myExternalStream ? (
+                  <button type="button" className="discover-announce stop" onClick={unannounceStream}>⏹ Stop announcing</button>
+                ) : (
+                  <button type="button" className="discover-announce" onClick={() => setShowAnnounceForm((v) => !v)}>📣 I'm live elsewhere</button>
+                )}
+                <button type="button" className="discover-close" onClick={() => setShowDiscover(false)} aria-label="Close">✕</button>
               </div>
+            </div>
+            {showAnnounceForm && !myExternalStream && (
+              <div className="announce-form">
+                <div className="announce-row">
+                  {['twitch', 'youtube', 'kik'].map((p) => (
+                    <button key={p} type="button" className={`announce-platform ${p}${announceForm.platform === p ? ' active' : ''}`} onClick={() => setAnnounceForm((f) => ({ ...f, platform: p }))}>{PLATFORM_META[p].label}</button>
+                  ))}
+                </div>
+                <input className="announce-input" placeholder={announceForm.platform === 'twitch' ? 'Your Twitch channel name' : announceForm.platform === 'youtube' ? 'YouTube live URL or channel link' : 'Your Kik username'} value={announceForm.channel} onChange={(e) => setAnnounceForm((f) => ({ ...f, channel: e.target.value }))} />
+                <div className="announce-row">
+                  <input className="announce-input" placeholder="Stream title (optional)" value={announceForm.title} onChange={(e) => setAnnounceForm((f) => ({ ...f, title: e.target.value }))} />
+                  <input className="announce-input" placeholder="Game (optional)" value={announceForm.game} onChange={(e) => setAnnounceForm((f) => ({ ...f, game: e.target.value }))} />
+                </div>
+                <button type="button" className="discover-watch announce-go" onClick={announceStream}>🔴 Announce my stream</button>
+              </div>
+            )}
+            {discoverStreams.length === 0 && !showAnnounceForm && (
+              <div className="discover-empty">No one is live right now. Hit <strong>Go Live</strong> in a voice channel to share your screen, or <strong>📣 I'm live elsewhere</strong> to announce your Twitch/YouTube/Kik stream.</div>
+            )}
+            {inAppStreams.length > 0 && (
+              <>
+                <div className="discover-section">🖥️ Screen shares in this app</div>
+                <div className="discover-grid">
+                  {inAppStreams.map((s) => (
+                    <div key={s.id} className="discover-card">
+                      <div className="discover-thumb">
+                        <span className="discover-thumb-avatar">{(s.name || '?').trim().slice(0, 1).toUpperCase()}</span>
+                        <div className="discover-badges"><span className="discover-badge live">🔴 LIVE</span></div>
+                      </div>
+                      <div className="discover-info">
+                        <div className="discover-name">{s.name || 'Guest'}</div>
+                        <div className="discover-meta">{s.channelId === 'voice1' ? 'Voice 1' : s.channelId} · {s.viewers} in channel</div>
+                      </div>
+                      <button type="button" className="discover-watch" onClick={() => watchStream(s)}>Watch</button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {externalStreamsList.length > 0 && (
+              <>
+                <div className="discover-section">🌐 Live on Twitch · YouTube · Kik</div>
+                <div className="discover-grid">
+                  {externalStreamsList.map((s) => (
+                    <div key={s.id} className="discover-card">
+                      <div className={`discover-thumb ext-${s.platform}`}>
+                        <span className="discover-thumb-avatar">{(s.name || '?').trim().slice(0, 1).toUpperCase()}</span>
+                        <div className="discover-badges"><span className={`discover-badge platform ${s.platform}`}>{PLATFORM_META[s.platform]?.label || s.platform} · LIVE</span></div>
+                      </div>
+                      <div className="discover-info">
+                        <div className="discover-name">{s.name || 'Guest'}</div>
+                        <div className="discover-meta">{s.title || (s.platform === 'kik' ? `@${s.channel}` : s.channel)}{s.game ? ` · 🎮 ${s.game}` : ''}</div>
+                      </div>
+                      {s.platform === 'kik' ? (
+                        <div className="discover-kik-note">Open Kik and find <strong>@{s.channel}</strong> — Kik streams can't be embedded.</div>
+                      ) : (
+                        <button type="button" className="discover-watch" onClick={() => { setShowDiscover(false); setExternalViewer(s) }}>Watch here</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+        )
+      })()}
+      {/* In-app viewer for an external Twitch/YouTube stream */}
+      {externalViewer && (
+        <div className="extviewer-overlay" onClick={() => setExternalViewer(null)}>
+          <div className="extviewer-frame" onClick={(e) => e.stopPropagation()}>
+            <div className="extviewer-head">
+              <span className="extviewer-title">🔴 {externalViewer.name} — {externalViewer.title || externalViewer.channel}{externalViewer.game ? ` · 🎮 ${externalViewer.game}` : ''}</span>
+              <button type="button" className="discover-close" onClick={() => setExternalViewer(null)} aria-label="Close viewer">✕</button>
+            </div>
+            {externalEmbedUrl(externalViewer) ? (
+              <iframe className="extviewer-embed" src={externalEmbedUrl(externalViewer)} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen title="Live stream" />
+            ) : (
+              <div className="discover-empty">This stream can't be embedded — check the link the streamer shared.</div>
             )}
           </div>
         </div>
@@ -4464,6 +4635,30 @@ export default function App() {
                 {regPasswordConfirm && regPassword !== regPasswordConfirm && (
                   <div className="field-error-message" role="alert">Passwords do not match</div>
                 )}
+
+                <label style={{ marginTop: 12 }}>🎮 What do you love playing? <span className="reg-optional">(pick any)</span></label>
+                <div className="reg-genres">
+                  {GAME_GENRES.map((g) => (
+                    <button
+                      key={g}
+                      type="button"
+                      className={`reg-genre${regGenres.includes(g) ? ' active' : ''}`}
+                      onClick={() => setRegGenres((prev) => prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g])}
+                    >
+                      {g}
+                    </button>
+                  ))}
+                </div>
+                <label>What are you playing right now? <span className="reg-optional">(past 2 weeks)</span></label>
+                <input
+                  className="half-field"
+                  type="text"
+                  placeholder="e.g. Valorant, Baldur's Gate 3"
+                  maxLength={200}
+                  value={regCurrentGames}
+                  onChange={(e) => setRegCurrentGames(e.target.value)}
+                />
+
                 <div style={{display:'flex',justifyContent:'flex-end',marginTop:10}}>
                   <button type="submit" className="connect-btn" disabled={!canCreate} aria-disabled={!canCreate}>{authLoading ? 'Creating...' : 'Create Account'}</button>
                 </div>

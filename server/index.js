@@ -270,16 +270,22 @@ async function main() {
   const clients = {}; // socketId -> { name, username, serverId }
   const collabSessions = {}; // sessionId (image url) -> { imageUrl, segments: [] } for shared image editing
   const liveStreams = {}; // socketId -> { name, serverId, channelId, camera, screen } for Watch/Discover
+  const externalStreams = {}; // socketId -> { name, platform, channel, title, game } — "I'm live on Twitch/YouTube/Kik"
+  const EXTERNAL_PLATFORMS = ['twitch', 'youtube', 'kik'];
   const mockEmails = [];
 
-  // The list of people currently "live" (sharing their screen) for the Watch/Discover panel.
+  // The list of people currently "live" for the Watch/Discover panel: in-app screen shares
+  // (kind:'screen') plus external Twitch/YouTube/Kik streams (kind:'external').
   // Camera-on is NOT a discoverable stream — only Go Live (screen share) is.
   function discoverList() {
     const out = [];
     for (const [id, s] of Object.entries(liveStreams)) {
       if (!s || !s.screen) continue;
       const size = (io.sockets.adapter.rooms.get(`voice:${s.serverId}:${s.channelId}`) || new Set()).size;
-      out.push({ id, name: s.name, serverId: s.serverId, channelId: s.channelId, camera: !!s.camera, screen: !!s.screen, viewers: size });
+      out.push({ id, kind: 'screen', name: s.name, serverId: s.serverId, channelId: s.channelId, camera: !!s.camera, screen: !!s.screen, viewers: size });
+    }
+    for (const [id, s] of Object.entries(externalStreams)) {
+      out.push({ id: `ext-${id}`, kind: 'external', name: s.name, platform: s.platform, channel: s.channel, title: s.title, game: s.game });
     }
     return out;
   }
@@ -287,13 +293,32 @@ async function main() {
 
   // --- Activities: one shared activity per voice room, synced to everyone in it ---
   const activities = {}; // room -> { type, state, by }
-  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt'];
+  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch'];
+  const SKETCH_WORDS = ['pizza', 'dragon', 'controller', 'headset', 'wizard', 'castle', 'laptop', 'zombie', 'racecar', 'treasure', 'ninja', 'robot', 'campfire', 'spaceship', 'sword', 'shield', 'potion', 'dungeon', 'goblin', 'keyboard', 'trophy', 'boss fight', 'power up', 'game over', 'rage quit', 'speedrun', 'loot box', 'health bar', 'respawn', 'lan party', 'energy drink', 'mechanical keyboard', 'graphics card', 'blue screen', 'lag spike', 'victory royale', 'minecart', 'creeper', 'portal', 'joystick', 'arcade', 'pixel', 'avatar', 'guild', 'quest', 'checkpoint', 'combo', 'headshot', 'stealth', 'sniper', 'race track', 'finish line', 'monster truck', 'alien', 'meteor', 'volcano', 'pirate ship', 'skeleton', 'campaign', 'final boss'];
   function activityInit(type) {
     if (type === 'watch') return { videoId: null, playing: false, time: 0, ts: Date.now() };
     if (type === 'whiteboard') return { strokes: [] };
     if (type === 'poll') return { question: '', options: [], closed: false };
     if (type === 'ttt') return { board: Array(9).fill(''), turn: 'X', players: {}, winner: null };
+    if (type === 'sketch') return { phase: 'lobby', players: [], turnIdx: 0, totalTurns: 0, word: null, wordMask: '', strokes: [], guesses: [], solvedBy: [], lastResult: null };
     return {};
+  }
+
+  // --- Sketch & Guess helpers ---
+  const sketchNorm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  function sketchDrawer(s) { return s.players.length ? s.players[s.turnIdx % s.players.length].name : null; }
+  function sketchNewTurn(s) {
+    if (s.turnIdx >= s.totalTurns) { s.phase = 'end'; s.word = null; s.wordMask = ''; return; }
+    s.word = SKETCH_WORDS[Math.floor(Math.random() * SKETCH_WORDS.length)];
+    s.wordMask = s.word.replace(/[a-z0-9]/gi, '_');
+    s.strokes = [];
+    s.guesses = [];
+    s.solvedBy = [];
+  }
+  function sketchAdvance(s, resultMsg) {
+    s.lastResult = resultMsg;
+    s.turnIdx += 1;
+    sketchNewTurn(s);
   }
   function tttWinner(b) {
     const L = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
@@ -320,7 +345,63 @@ async function main() {
         const mark = s.players.X === user ? 'X' : (s.players.O === user ? 'O' : null);
         if (mark && mark === s.turn && ev.i >= 0 && ev.i < 9 && !s.board[ev.i]) { s.board[ev.i] = mark; s.turn = mark === 'X' ? 'O' : 'X'; s.winner = tttWinner(s.board); }
       } else if (ev.kind === 'reset') { s.board = Array(9).fill(''); s.turn = 'X'; s.winner = null; }
+    } else if (act.type === 'sketch') {
+      const drawer = sketchDrawer(s);
+      if (ev.kind === 'join' && s.phase === 'lobby' && s.players.length < 8 && !s.players.some((p) => p.name === user)) {
+        s.players.push({ name: user, score: 0 });
+      } else if (ev.kind === 'start' && s.phase === 'lobby' && s.players.length >= 2) {
+        s.phase = 'play';
+        s.turnIdx = 0;
+        s.totalTurns = s.players.length * 2; // everyone draws twice
+        s.lastResult = null;
+        sketchNewTurn(s);
+      } else if (ev.kind === 'stroke' && s.phase === 'play' && user === drawer && ev.seg && typeof ev.seg === 'object') {
+        s.strokes.push(ev.seg);
+        if (s.strokes.length > 20000) s.strokes.splice(0, s.strokes.length - 20000);
+      } else if (ev.kind === 'clear' && s.phase === 'play' && user === drawer) {
+        s.strokes = [];
+      } else if (ev.kind === 'guess' && s.phase === 'play' && user !== drawer && !s.solvedBy.includes(user)) {
+        const text = String(ev.text || '').slice(0, 60).trim();
+        if (!text) return;
+        if (sketchNorm(text) === sketchNorm(s.word)) {
+          s.solvedBy.push(user);
+          const guesser = s.players.find((p) => p.name === user);
+          const dp = s.players.find((p) => p.name === drawer);
+          if (guesser) guesser.score += 100;
+          if (dp) dp.score += 25;
+          s.guesses.push({ by: user, text: null, correct: true }); // never leak the word
+          const nonDrawers = s.players.filter((p) => p.name !== drawer).map((p) => p.name);
+          if (nonDrawers.every((n) => s.solvedBy.includes(n))) {
+            sketchAdvance(s, `Everyone guessed it! The word was "${s.word}".`);
+          }
+        } else {
+          s.guesses.push({ by: user, text, correct: false });
+          if (s.guesses.length > 200) s.guesses.splice(0, s.guesses.length - 200);
+        }
+      } else if (ev.kind === 'skip' && s.phase === 'play' && user === drawer) {
+        sketchAdvance(s, `${drawer} skipped — the word was "${s.word}".`);
+      } else if (ev.kind === 'reset' && s.phase === 'end') {
+        s.players.forEach((p) => { p.score = 0 });
+        s.phase = 'lobby';
+        s.turnIdx = 0;
+        s.word = null; s.wordMask = ''; s.strokes = []; s.guesses = []; s.solvedBy = []; s.lastResult = null;
+      }
     }
+  }
+
+  // What a given socket is allowed to see of an activity: in Sketch & Guess the secret word only
+  // goes to the current drawer — everyone else gets a redacted copy (mask only).
+  function activityViewFor(act, socketId) {
+    if (!act || act.type !== 'sketch') return act;
+    const s = act.state;
+    if (s.phase !== 'play' || !s.word) return act;
+    if (clients[socketId]?.name === sketchDrawer(s)) return act;
+    return { ...act, state: { ...s, word: null } };
+  }
+  function broadcastActivity(room, act) {
+    if (!act) { io.to(room).emit('activity:update', null); return; }
+    const ids = io.sockets.adapter.rooms.get(room) || new Set();
+    for (const id of ids) io.to(id).emit('activity:update', activityViewFor(act, id));
   }
 
   function parseAttachment(value) {
@@ -546,7 +627,7 @@ async function main() {
   }
 
   app.post('/auth/register', async (req, res) => {
-    const { username, email, password, passwordConfirm } = req.body || {};
+    const { username, email, password, passwordConfirm, genres, currentGames } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
     if (password !== passwordConfirm) return res.status(400).json({ error: 'Passwords do not match' });
     if (!isStrongPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters and include 1 uppercase letter, 1 lowercase letter, 1 number, and 1 special character.' });
@@ -558,7 +639,13 @@ async function main() {
     const byEmail = await db.get('SELECT id FROM users WHERE email = ?', email);
     if (byEmail) return res.status(409).json({ error: 'Email already exists', field: 'email' });
     const defaultSettings = {
-      railColor: '#7a0d0d', sidebarColor: '#0f1418', panelColor: '#111417', headerColor: '#7a0d0d', accentStart: '#2bc3ff', accentEnd: '#0b86ff', fontColor: '#edf6ff', leftTileColor: '#1f2933'
+      railColor: '#7a0d0d', sidebarColor: '#0f1418', panelColor: '#111417', headerColor: '#7a0d0d', accentStart: '#2bc3ff', accentEnd: '#0b86ff', fontColor: '#edf6ff', leftTileColor: '#1f2933',
+      // Gaming profile collected at signup: favorite genres + what they're playing lately.
+      gamingProfile: {
+        genres: (Array.isArray(genres) ? genres : []).slice(0, 12).map((g) => String(g).slice(0, 30)),
+        currentGames: String(currentGames || '').trim().slice(0, 200),
+        updatedAt: Date.now(),
+      },
     };
     const hash = bcrypt.hashSync(password, 10);
     await db.run('INSERT INTO users (username, email, password_hash, settings) VALUES (?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings));
@@ -683,6 +770,69 @@ async function main() {
     const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
     io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
     return res.json({ channel: { id: chId, name, type } });
+  });
+
+  // Rebroadcast a server's full state to everyone currently in it.
+  async function pushServerState(serverId) {
+    const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
+    if (!srv) return;
+    const channels = await db.all('SELECT id, name, type FROM channels WHERE server_id = ?', serverId);
+    io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
+  }
+
+  // Rename a server.
+  app.patch('/servers/:serverId', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    const name = String((req.body || {}).name || '').trim().slice(0, 40);
+    if (!name) return res.status(400).json({ error: 'Server name required' });
+    await db.run('UPDATE servers SET name = ? WHERE id = ?', name, serverId);
+    io.emit('servers:updated');
+    await pushServerState(serverId);
+    return res.json({ server: { id: serverId, name } });
+  });
+
+  // Delete a server (and all of its channels/messages/emojis). The default server is protected —
+  // it backs the Home view and must always exist.
+  app.delete('/servers/:serverId', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    if (serverId === 'demo') return res.status(400).json({ error: 'The default server cannot be deleted' });
+    const srv = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    await db.run('DELETE FROM messages WHERE server_id = ?', serverId);
+    await db.run('DELETE FROM channels WHERE server_id = ?', serverId);
+    await db.run('DELETE FROM server_emojis WHERE server_id = ?', serverId);
+    await db.run('DELETE FROM servers WHERE id = ?', serverId);
+    io.emit('servers:updated'); // clients viewing it bounce home via their server-list validation
+    return res.json({ success: true });
+  });
+
+  // Rename a channel.
+  app.patch('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
+    const { serverId, channelId } = req.params;
+    const ch = await db.get('SELECT id FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+    if (!ch) return res.status(404).json({ error: 'Channel not found' });
+    const name = String((req.body || {}).name || '').trim().slice(0, 30);
+    if (!name) return res.status(400).json({ error: 'Channel name required' });
+    await db.run('UPDATE channels SET name = ? WHERE id = ?', name, channelId);
+    await pushServerState(serverId);
+    return res.json({ channel: { id: channelId, name } });
+  });
+
+  // Delete a channel (+ its messages). A server always keeps at least one text channel.
+  app.delete('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
+    const { serverId, channelId } = req.params;
+    const ch = await db.get('SELECT id, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+    if (!ch) return res.status(404).json({ error: 'Channel not found' });
+    if (ch.type === 'text') {
+      const textCount = await db.get("SELECT COUNT(*) AS n FROM channels WHERE server_id = ? AND type = 'text'", serverId);
+      if ((textCount?.n || 0) <= 1) return res.status(400).json({ error: 'A server needs at least one text channel' });
+    }
+    await db.run('DELETE FROM messages WHERE server_id = ? AND channel_id = ?', serverId, channelId);
+    await db.run('DELETE FROM channels WHERE id = ?', channelId);
+    await pushServerState(serverId);
+    return res.json({ success: true });
   });
 
   // --- Server custom emojis ---
@@ -1422,19 +1572,37 @@ async function main() {
     // A client (re)opening the Discover panel asks for the current list.
     socket.on('discover:list', () => socket.emit('discover:update', discoverList()));
 
+    // "I'm live on Twitch/YouTube/Kik" — announce an external stream so friends can watch in-app.
+    socket.on('stream:announce', ({ platform, channel, title, game } = {}) => {
+      if (!EXTERNAL_PLATFORMS.includes(platform)) return;
+      const ch = String(channel || '').trim().slice(0, 120);
+      if (!ch) return;
+      externalStreams[socket.id] = {
+        name: clients[socket.id]?.name || 'Anon',
+        platform,
+        channel: ch,
+        title: String(title || '').trim().slice(0, 80),
+        game: String(game || '').trim().slice(0, 60),
+      };
+      broadcastDiscover();
+    });
+    socket.on('stream:unannounce', () => {
+      if (externalStreams[socket.id]) { delete externalStreams[socket.id]; broadcastDiscover(); }
+    });
+
     // Activities: start one for the voice room (everyone in it gets it), relay events, or stop.
     socket.on('activity:start', ({ serverId = 'demo', channelId = 'voice1', type } = {}) => {
       if (!ACTIVITY_TYPES.includes(type)) return;
       const room = `voice:${serverId}:${channelId}`;
       activities[room] = { type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon' };
-      io.to(room).emit('activity:update', activities[room]);
+      broadcastActivity(room, activities[room]);
     });
     socket.on('activity:event', ({ serverId = 'demo', channelId = 'voice1', event } = {}) => {
       const room = `voice:${serverId}:${channelId}`;
       const act = activities[room];
       if (!act || !event || typeof event !== 'object') return;
       applyActivityEvent(act, event, clients[socket.id]?.name || 'Anon');
-      io.to(room).emit('activity:update', act);
+      broadcastActivity(room, act);
     });
     socket.on('activity:stop', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
       const room = `voice:${serverId}:${channelId}`;
@@ -1481,7 +1649,7 @@ async function main() {
       const peers = Array.from(roomSet).filter(id => id !== socket.id).map(id => ({ id, name: clients[id]?.name || 'Anon' }));
       socket.emit('voice:peers', peers);
       socket.to(room).emit('voice:peer-joined', { id: socket.id, name: clients[socket.id]?.name });
-      socket.emit('activity:update', activities[room] || null); // late-joiners get the current activity
+      socket.emit('activity:update', activityViewFor(activities[room], socket.id) || null); // late-joiners get the current activity (word redacted)
     });
 
     socket.on('voice:leave', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
@@ -1508,7 +1676,11 @@ async function main() {
           if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size <= 1) delete activities[room];
         }
       }
-      if (liveStreams[socket.id]) { delete liveStreams[socket.id]; broadcastDiscover(); }
+      if (liveStreams[socket.id] || externalStreams[socket.id]) {
+        delete liveStreams[socket.id];
+        delete externalStreams[socket.id];
+        broadcastDiscover();
+      }
     });
 
     socket.on('disconnect', () => {

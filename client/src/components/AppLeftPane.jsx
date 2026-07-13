@@ -1,4 +1,5 @@
 import React, { useRef, useState, useCallback, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import HomeLeftPanel from './HomeLeftPanel'
 import ProfileAvatar from './ProfileAvatar'
 import { nameStyleToCss } from '../profileData'
@@ -76,6 +77,7 @@ function RailIcon({
   title,
   active,
   onClick,
+  onContextMenu,
   badge,
   className = '',
   home = false,
@@ -92,7 +94,7 @@ function RailIcon({
       onMouseLeave={voiceActive ? onVoiceTileLeave : undefined}
     >
       {active && <span className="dc-rail-pill" aria-hidden="true" />}
-      <button type="button" className={`dc-rail-item ${className}`} title={title} onClick={onClick}>
+      <button type="button" className={`dc-rail-item ${className}`} title={title} onClick={onClick} onContextMenu={onContextMenu}>
         {children}
         {voiceActive && <VoiceTileScrim />}
       </button>
@@ -169,6 +171,10 @@ export default function AppLeftPane({
   serverId = null,
   onCreateServer,
   onCreateChannel,
+  onRenameServer,
+  onDeleteServer,
+  onRenameChannel,
+  onDeleteChannel,
   activeChannel,
   onJoinChannel,
   voiceChannelId = null,
@@ -179,6 +185,21 @@ export default function AppLeftPane({
   socketId,
 }) {
   const showVoiceOnHome = inVoice && voiceRailTarget === 'home'
+  // Right-click context menu for server tiles / channel rows: { x, y, kind, id, name, isDefault }.
+  const [ctxMenu, setCtxMenu] = useState(null)
+  const ctxMenuRef = useRef(null)
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = (e) => { if (!ctxMenuRef.current || !ctxMenuRef.current.contains(e.target)) setCtxMenu(null) }
+    const onKey = (e) => { if (e.key === 'Escape') setCtxMenu(null) }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', onKey) }
+  }, [ctxMenu])
+  const openCtxMenu = (e, item) => {
+    e.preventDefault()
+    setCtxMenu({ x: Math.min(e.clientX, window.innerWidth - 180), y: Math.min(e.clientY, window.innerHeight - 110), ...item })
+  }
   const dcLeftRef = useRef(null)
   const voiceTileRef = useRef(null)
   const [voiceControlsHover, setVoiceControlsHover] = useState(false)
@@ -241,6 +262,7 @@ export default function AppLeftPane({
             active={selectedServerId === s.id}
             voiceActive={inVoice && voiceRailTarget === s.id}
             onClick={() => onSelectServer?.(s.id)}
+            onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo' })}
             {...voiceTileProps}
           >
             <span className="dc-server-icon" style={{ background: SERVER_COLORS[i % SERVER_COLORS.length] }}>
@@ -285,6 +307,7 @@ export default function AppLeftPane({
                     type="button"
                     className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''}`}
                     onClick={() => onJoinChannel?.(ch.id)}
+                    onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name })}
                   >
                     <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
                     <span>{ch.name}</span>
@@ -304,6 +327,7 @@ export default function AppLeftPane({
                         type="button"
                         className="dc-channel-item"
                         onClick={() => onJoinChannel?.(ch.id)}
+                        onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name })}
                       >
                         <span className="dc-channel-icon dc-channel-icon-voice"><ChannelSpeakerIcon /></span>
                         <span>{ch.name}</span>
@@ -416,6 +440,22 @@ export default function AppLeftPane({
             onToggleDeafen={onToggleDeafen}
           />
         </div>
+      )}
+
+      {/* Right-click menu for servers / channels (portaled above everything). */}
+      {ctxMenu && createPortal(
+        <div ref={ctxMenuRef} className="dc-ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }} role="menu">
+          <div className="dc-ctx-title">{ctxMenu.kind === 'server' ? ctxMenu.name : `#${ctxMenu.name}`}</div>
+          <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); (ctxMenu.kind === 'server' ? onRenameServer : onRenameChannel)?.(ctxMenu.id, ctxMenu.name) }}>
+            ✏️ Rename
+          </button>
+          {!(ctxMenu.kind === 'server' && ctxMenu.isDefault) && (
+            <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); (ctxMenu.kind === 'server' ? onDeleteServer : onDeleteChannel)?.(ctxMenu.id, ctxMenu.name) }}>
+              🗑️ Delete
+            </button>
+          )}
+        </div>,
+        document.body
       )}
     </aside>
   )
