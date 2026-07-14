@@ -160,6 +160,14 @@ async function main() {
     name TEXT,
     type TEXT
   )`);
+  // Server membership + roles: owner | admin | member. The default 'demo' server is public (every
+  // user is an implicit member) — user-created servers are members-only.
+  await db.exec(`CREATE TABLE IF NOT EXISTS server_members (
+    server_id TEXT,
+    username TEXT,
+    role TEXT DEFAULT 'member',
+    PRIMARY KEY (server_id, username)
+  )`);
   await db.exec(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id TEXT,
@@ -247,9 +255,15 @@ async function main() {
   } catch (err) {
     /* column already exists */
   }
-  // Channel privacy: 'public' (everyone in the server) or 'private' (marked with a lock).
+  // Channel privacy: 'public' (everyone in the server) or 'private' (owner/admins only).
   try {
     await db.run(`ALTER TABLE channels ADD COLUMN privacy TEXT DEFAULT 'public'`);
+  } catch (err) {
+    /* column already exists */
+  }
+  // Server owner (creator). NULL for the public 'demo' server.
+  try {
+    await db.run(`ALTER TABLE servers ADD COLUMN owner TEXT`);
   } catch (err) {
     /* column already exists */
   }
@@ -766,54 +780,114 @@ async function main() {
 
   // --- Servers & channels ---
   const newId = (prefix) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const DEMO_ID = 'demo';
 
-  // Servers are public within this LAN-party instance: everyone sees and can enter all of them.
-  app.get('/servers', authMiddleware, async (_req, res) => {
-    const rows = await db.all('SELECT id, name FROM servers ORDER BY rowid ASC');
-    return res.json({ servers: rows });
+  // --- Membership & roles ---
+  const isStaffRole = (role) => role === 'owner' || role === 'admin';
+  const roleRank = (role) => (role === 'owner' ? 0 : role === 'admin' ? 1 : 2);
+  async function roleOf(serverId, username) {
+    if (!username) return null;
+    if (serverId === DEMO_ID) return 'member'; // everyone belongs to the public commons
+    const row = await db.get('SELECT role FROM server_members WHERE server_id = ? AND username = ?', serverId, username);
+    return row ? row.role : null;
+  }
+  async function isMember(serverId, username) { return (await roleOf(serverId, username)) != null; }
+  // demo: anyone can create public channels (open commons). Otherwise owner/admins only.
+  async function canManageChannels(serverId, username) {
+    if (serverId === DEMO_ID) return true;
+    return isStaffRole(await roleOf(serverId, username));
+  }
+  // Full member roster with roles + online flag. demo has no rows → show connected users.
+  async function serverRoster(serverId) {
+    const onlineUsers = new Set(Object.values(clients).filter((c) => c.serverId === serverId && c.username).map((c) => c.username));
+    let roster;
+    if (serverId === DEMO_ID) {
+      const seen = new Map();
+      for (const c of Object.values(clients)) {
+        if (c.serverId !== serverId) continue;
+        const key = c.username || c.name;
+        if (!seen.has(key)) seen.set(key, { username: c.username || null, name: c.name, role: 'member', online: true });
+      }
+      roster = Array.from(seen.values());
+    } else {
+      const rows = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
+      roster = rows.map((r) => ({ username: r.username, name: r.username, role: r.role, online: onlineUsers.has(r.username) }));
+    }
+    roster.sort((a, b) => roleRank(a.role) - roleRank(b.role) || (b.online - a.online) || String(a.name).localeCompare(String(b.name)));
+    return roster;
+  }
+  // Channels visible to a given role: staff see everything, members/guests only public channels.
+  const visibleChannels = (channels, role) => (isStaffRole(role) ? channels : channels.filter((c) => c.privacy !== 'private'));
+
+  // Broadcast a server's state to everyone in its room, filtered per-socket (private channels are
+  // only sent to owner/admins; each socket also learns its own role).
+  async function broadcastServerState(serverId) {
+    const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
+    if (!srv) return;
+    const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
+    const roster = await serverRoster(serverId);
+    const room = io.sockets.adapter.rooms.get(`server:${serverId}`) || new Set();
+    for (const sid of room) {
+      const role = await roleOf(serverId, clients[sid]?.username);
+      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, channels: visibleChannels(allChannels, role) }, members: roster, myRole: role });
+    }
+  }
+
+  // The rail shows the public 'demo' server plus every server the user is a member of (with role).
+  app.get('/servers', authMiddleware, async (req, res) => {
+    const me = req.user.username;
+    const demo = await db.get('SELECT id, name, owner FROM servers WHERE id = ?', DEMO_ID);
+    const mine = await db.all(
+      'SELECT s.id, s.name, s.owner, m.role FROM server_members m JOIN servers s ON s.id = m.server_id WHERE m.username = ? ORDER BY s.rowid ASC',
+      me
+    );
+    const out = [];
+    if (demo) out.push({ id: demo.id, name: demo.name, owner: demo.owner || null, role: 'member' });
+    for (const s of mine) out.push({ id: s.id, name: s.name, owner: s.owner || null, role: s.role });
+    return res.json({ servers: out });
   });
 
-  // Create a server (with a default text + voice channel) and tell every client to refresh rails.
+  // Create a server: the creator becomes its owner + first member.
   app.post('/servers', authMiddleware, async (req, res) => {
+    const me = req.user.username;
     const name = String((req.body || {}).name || '').trim().slice(0, 40);
     if (!name) return res.status(400).json({ error: 'Server name required' });
     const id = newId('srv');
-    await db.run('INSERT INTO servers (id, name) VALUES (?, ?)', id, name);
+    await db.run('INSERT INTO servers (id, name, owner) VALUES (?, ?, ?)', id, name, me);
     await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', newId('ch'), id, 'general', 'text');
     await db.run('INSERT INTO channels (id, server_id, name, type) VALUES (?, ?, ?, ?)', newId('ch'), id, 'Voice 1', 'voice');
-    io.emit('servers:updated');
-    return res.json({ server: { id, name } });
+    await db.run('INSERT INTO server_members (server_id, username, role) VALUES (?, ?, ?)', id, me, 'owner');
+    io.to(`user:${me}`).emit('servers:updated'); // only the owner has it so far
+    return res.json({ server: { id, name, owner: me, role: 'owner' } });
   });
 
-  // Add a channel to a server; push the updated server state to everyone currently in it.
+  // Add a channel (owner/admin only for private servers; anyone for the demo commons).
   app.post('/servers/:serverId/channels', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
     const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (!(await canManageChannels(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can create channels' });
     const name = String((req.body || {}).name || '').trim().slice(0, 30);
     const type = (req.body || {}).type === 'voice' ? 'voice' : 'text';
-    const privacy = (req.body || {}).privacy === 'private' ? 'private' : 'public';
+    // The public commons can't have private channels (nobody would ever see them — no admins).
+    const privacy = (serverId !== DEMO_ID && (req.body || {}).privacy === 'private') ? 'private' : 'public';
     if (!name) return res.status(400).json({ error: 'Channel name required' });
     const chId = newId('ch');
     await db.run('INSERT INTO channels (id, server_id, name, type, privacy) VALUES (?, ?, ?, ?, ?)', chId, serverId, name, type, privacy);
-    const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
-    io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
+    await broadcastServerState(serverId);
     return res.json({ channel: { id: chId, name, type, privacy } });
   });
 
-  // Rebroadcast a server's full state to everyone currently in it.
-  async function pushServerState(serverId) {
-    const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
-    if (!srv) return;
-    const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
-    io.to(`server:${serverId}`).emit('server:state', { server: { id: srv.id, name: srv.name, channels }, members: getMembersForServer(serverId) });
-  }
+  // Rebroadcast a server's state (role-filtered per socket).
+  async function pushServerState(serverId) { await broadcastServerState(serverId); }
 
-  // Rename a server.
+  // Rename a server (owner/admin; the public commons can't be renamed).
   app.patch('/servers/:serverId', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: "The public server can't be renamed" });
     const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can rename it' });
     const name = String((req.body || {}).name || '').trim().slice(0, 40);
     if (!name) return res.status(400).json({ error: 'Server name required' });
     await db.run('UPDATE servers SET name = ? WHERE id = ?', name, serverId);
@@ -822,26 +896,29 @@ async function main() {
     return res.json({ server: { id: serverId, name } });
   });
 
-  // Delete a server (and all of its channels/messages/emojis). The default server is protected —
-  // it backs the Home view and must always exist.
+  // Delete a server (owner only; the default commons is protected).
   app.delete('/servers/:serverId', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
-    if (serverId === 'demo') return res.status(400).json({ error: 'The default server cannot be deleted' });
-    const srv = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
+    if (serverId === DEMO_ID) return res.status(400).json({ error: 'The default server cannot be deleted' });
+    const srv = await db.get('SELECT id, owner FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (srv.owner !== req.user.username) return res.status(403).json({ error: 'Only the owner can delete this server' });
+    const members = await db.all('SELECT username FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM messages WHERE server_id = ?', serverId);
     await db.run('DELETE FROM channels WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_emojis WHERE server_id = ?', serverId);
+    await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
-    io.emit('servers:updated'); // clients viewing it bounce home via their server-list validation
+    for (const m of members) io.to(`user:${m.username}`).emit('servers:updated'); // drop it from every member's rail
     return res.json({ success: true });
   });
 
-  // Rename a channel.
+  // Rename a channel (owner/admin).
   app.patch('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
     const ch = await db.get('SELECT id FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
     if (!ch) return res.status(404).json({ error: 'Channel not found' });
+    if (!(await canManageChannels(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can rename channels' });
     const name = String((req.body || {}).name || '').trim().slice(0, 30);
     if (!name) return res.status(400).json({ error: 'Channel name required' });
     await db.run('UPDATE channels SET name = ? WHERE id = ?', name, channelId);
@@ -849,11 +926,12 @@ async function main() {
     return res.json({ channel: { id: channelId, name } });
   });
 
-  // Delete a channel (+ its messages). A server always keeps at least one text channel.
+  // Delete a channel (owner/admin). A server always keeps at least one text channel.
   app.delete('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
     const ch = await db.get('SELECT id, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
     if (!ch) return res.status(404).json({ error: 'Channel not found' });
+    if (!(await canManageChannels(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can delete channels' });
     if (ch.type === 'text') {
       const textCount = await db.get("SELECT COUNT(*) AS n FROM channels WHERE server_id = ? AND type = 'text'", serverId);
       if ((textCount?.n || 0) <= 1) return res.status(400).json({ error: 'A server needs at least one text channel' });
@@ -861,6 +939,77 @@ async function main() {
     await db.run('DELETE FROM messages WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channels WHERE id = ?', channelId);
     await pushServerState(serverId);
+    return res.json({ success: true });
+  });
+
+  // --- Membership management: invite, kick, roles, leave ---
+  // Invite a user by username (owner/admin) → they become a member; their rail refreshes.
+  app.post('/servers/:serverId/invite', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: 'Everyone is already in the public server' });
+    const srv = await db.get('SELECT id, name FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can invite' });
+    const target = String((req.body || {}).username || '').trim();
+    if (!target) return res.status(400).json({ error: 'Username required' });
+    const user = await db.get('SELECT username FROM users WHERE username = ?', target);
+    if (!user) return res.status(404).json({ error: `No user named "${target}"` });
+    if (await isMember(serverId, target)) return res.status(400).json({ error: `${target} is already a member` });
+    await db.run('INSERT INTO server_members (server_id, username, role) VALUES (?, ?, ?)', serverId, target, 'member');
+    io.to(`user:${target}`).emit('servers:updated');
+    io.to(`user:${target}`).emit('server:invited', { serverId, name: srv.name, by: req.user.username });
+    await broadcastServerState(serverId);
+    return res.json({ success: true });
+  });
+
+  // Kick a member (owner/admin). Can't kick the owner; admins can't kick other admins.
+  app.delete('/servers/:serverId/members/:username', authMiddleware, async (req, res) => {
+    const { serverId, username: target } = req.params;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: "You can't kick from the public server" });
+    const srv = await db.get('SELECT id, owner FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    const myRole = await roleOf(serverId, req.user.username);
+    if (!isStaffRole(myRole)) return res.status(403).json({ error: 'Only server admins can remove members' });
+    if (target === srv.owner) return res.status(400).json({ error: "The owner can't be removed" });
+    const targetRole = await roleOf(serverId, target);
+    if (!targetRole) return res.status(404).json({ error: 'Not a member' });
+    if (myRole === 'admin' && targetRole === 'admin') return res.status(403).json({ error: "Admins can't remove other admins" });
+    await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, target);
+    io.to(`user:${target}`).emit('servers:updated');
+    io.to(`user:${target}`).emit('server:removed', { serverId });
+    await broadcastServerState(serverId);
+    return res.json({ success: true });
+  });
+
+  // Change a member's role: owner promotes/demotes between admin and member.
+  app.patch('/servers/:serverId/members/:username', authMiddleware, async (req, res) => {
+    const { serverId, username: target } = req.params;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: 'No roles in the public server' });
+    const srv = await db.get('SELECT id, owner FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (srv.owner !== req.user.username) return res.status(403).json({ error: 'Only the owner can change roles' });
+    if (target === srv.owner) return res.status(400).json({ error: "The owner's role can't change" });
+    const role = (req.body || {}).role === 'admin' ? 'admin' : 'member';
+    if (!(await isMember(serverId, target))) return res.status(404).json({ error: 'Not a member' });
+    await db.run('UPDATE server_members SET role = ? WHERE server_id = ? AND username = ?', role, serverId, target);
+    io.to(`user:${target}`).emit('servers:updated');
+    await broadcastServerState(serverId);
+    return res.json({ success: true, role });
+  });
+
+  // Leave a server (any non-owner member). The owner must delete the server instead.
+  app.post('/servers/:serverId/leave', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    const me = req.user.username;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: "You can't leave the public server" });
+    const srv = await db.get('SELECT id, owner FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (srv.owner === me) return res.status(400).json({ error: 'Owners must delete the server instead of leaving' });
+    if (!(await isMember(serverId, me))) return res.status(400).json({ error: 'Not a member' });
+    await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, me);
+    io.to(`user:${me}`).emit('servers:updated');
+    io.to(`user:${me}`).emit('server:removed', { serverId });
+    await broadcastServerState(serverId);
     return res.json({ success: true });
   });
 
@@ -1480,6 +1629,9 @@ async function main() {
     socket.on('join', async ({ serverId = 'demo', name = 'Anonymous' } = {}) => {
       const serverRow = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
       if (!serverRow) return; // unknown server id (e.g. stale client state) — ignore
+      // Membership gate: only the public commons is open to everyone; others require membership.
+      const myRole = await roleOf(serverId, socketUser);
+      if (!myRole) { socket.emit('server:denied', { serverId }); return; }
       const nick = socketUser || name || 'Anonymous';
       clients[socket.id] = { name: nick, username: socketUser, serverId };
       // Switching servers: leave the previous server + text-channel rooms so messages from other
@@ -1488,13 +1640,11 @@ async function main() {
         if (room !== socket.id && (room.startsWith('server:') || room.startsWith('channel:'))) socket.leave(room);
       }
       socket.join(`server:${serverId}`);
-      const members = getMembersForServer(serverId);
-      const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
-      const serverObj = { id: serverRow.id, name: serverRow.name, channels };
-      io.to(`server:${serverId}`).emit('server:state', { server: serverObj, members });
+      const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
+      await broadcastServerState(serverId); // role-filtered state to everyone (incl. this newcomer)
 
-      // Enter the server's first text channel and send its history.
-      const firstText = channels.find((c) => c.type === 'text');
+      // Enter the first text channel this user can actually see, and send its history.
+      const firstText = visibleChannels(allChannels, myRole).find((c) => c.type === 'text');
       if (firstText) {
         socket.join(`channel:${serverId}:${firstText.id}`);
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
@@ -1506,9 +1656,12 @@ async function main() {
     });
 
     socket.on('joinChannel', async ({ serverId = 'demo', channelId = 'general' } = {}) => {
-      // Only join channels that actually belong to the server (no cross-server bleed).
-      const ch = await db.get('SELECT id, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+      // Only join channels that belong to the server AND that this user is allowed to see.
+      const ch = await db.get("SELECT id, type, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       if (!ch) return;
+      const myRole = await roleOf(serverId, socketUser);
+      if (!myRole) return; // not a member
+      if (ch.privacy === 'private' && !isStaffRole(myRole)) return; // private = owner/admins only
       for (const room of socket.rooms) {
         if (room !== socket.id && room.startsWith('channel:')) socket.leave(room);
       }
@@ -1521,9 +1674,11 @@ async function main() {
     });
 
     socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment } = {}) => {
-      // Refuse writes to channels that don't belong to the server (keeps history cleanly scoped).
-      const ch = await db.get('SELECT id FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+      // Refuse writes to channels the user can't see (belongs to server + private-access check).
+      const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       if (!ch) return;
+      const myRole = await roleOf(serverId, socketUser);
+      if (!myRole || (ch.privacy === 'private' && !isStaffRole(myRole))) return;
       const author = clients[socket.id]?.name || 'Anon';
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);

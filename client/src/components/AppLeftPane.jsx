@@ -184,7 +184,15 @@ export default function AppLeftPane({
   members = [],
   socketId,
   onSelectMember,
+  myRole = 'member',
+  serverOwner = null,
+  currentUsername = null,
+  onInviteServer,
+  onLeaveServer,
+  onKickMember,
+  onSetMemberRole,
 }) {
+  const isStaff = myRole === 'owner' || myRole === 'admin'
   const showVoiceOnHome = inVoice && voiceRailTarget === 'home'
   // Right-click context menu for server tiles / channel rows: { x, y, kind, id, name, isDefault }.
   const [ctxMenu, setCtxMenu] = useState(null)
@@ -263,7 +271,7 @@ export default function AppLeftPane({
             active={selectedServerId === s.id}
             voiceActive={inVoice && voiceRailTarget === s.id}
             onClick={() => onSelectServer?.(s.id)}
-            onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo' })}
+            onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null })}
             {...voiceTileProps}
           >
             <span className="dc-server-icon" style={{ background: SERVER_COLORS[i % SERVER_COLORS.length] }}>
@@ -348,16 +356,33 @@ export default function AppLeftPane({
                 <div className="dc-members-section">
                   <div className="dc-channel-section-label">
                     <span>Members — {members.length}</span>
+                    {isStaff && serverId !== 'demo' && (
+                      <button type="button" className="dc-dm-add" aria-label="Invite people" title="Invite people" onClick={() => onInviteServer?.(serverId)}>+</button>
+                    )}
                   </div>
                   <ul className="dc-members-list">
-                    {members.map((m) => (
-                      <li key={m.id}>
-                        <button type="button" className="dc-member-row" onClick={() => m.username && onSelectMember?.(m.username)} title={m.username ? `View ${m.name}'s profile` : undefined}>
-                          <span className="dc-member-dot" />
-                          <span>{m.name}{m.id === socketId ? ' (you)' : ''}</span>
-                        </button>
-                      </li>
-                    ))}
+                    {members.map((m) => {
+                      const isMe = (m.username && m.username === currentUsername) || m.id === socketId
+                      const role = m.role || (m.username === serverOwner ? 'owner' : 'member')
+                      const online = m.online !== false
+                      const canManage = serverId !== 'demo' && isStaff && !isMe && m.username && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
+                      return (
+                        <li key={m.username || m.id}>
+                          <button
+                            type="button"
+                            className="dc-member-row"
+                            onClick={() => m.username && onSelectMember?.(m.username)}
+                            onContextMenu={canManage ? (e) => openCtxMenu(e, { kind: 'member', id: m.username, name: m.name, username: m.username, role }) : undefined}
+                            title={m.username ? `View ${m.name}'s profile${canManage ? ' — right-click to manage' : ''}` : undefined}
+                          >
+                            <span className={`dc-member-dot ${online ? 'online' : 'offline'}`} />
+                            <span className="dc-member-name">{m.name}{isMe ? ' (you)' : ''}</span>
+                            {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
+                            {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
+                          </button>
+                        </li>
+                      )
+                    })}
                   </ul>
                 </div>
               )}
@@ -447,17 +472,57 @@ export default function AppLeftPane({
         </div>
       )}
 
-      {/* Right-click menu for servers / channels (portaled above everything). */}
+      {/* Right-click menu for servers / channels / members (portaled above everything). */}
       {ctxMenu && createPortal(
         <div ref={ctxMenuRef} className="dc-ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }} role="menu">
-          <div className="dc-ctx-title">{ctxMenu.kind === 'server' ? ctxMenu.name : `#${ctxMenu.name}`}</div>
-          <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); (ctxMenu.kind === 'server' ? onRenameServer : onRenameChannel)?.(ctxMenu.id, ctxMenu.name) }}>
-            ✏️ Rename
-          </button>
-          {!(ctxMenu.kind === 'server' && ctxMenu.isDefault) && (
-            <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); (ctxMenu.kind === 'server' ? onDeleteServer : onDeleteChannel)?.(ctxMenu.id, ctxMenu.name) }}>
-              🗑️ Delete
-            </button>
+          {ctxMenu.kind === 'server' && (() => {
+            const role = ctxMenu.role || 'member'
+            const staff = role === 'owner' || role === 'admin'
+            const isDemo = ctxMenu.isDefault
+            const items = []
+            if (staff && !isDemo) {
+              items.push(
+                <button key="rename" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameServer?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename server</button>,
+                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id) }}>➕ Invite people</button>
+              )
+            }
+            if (role !== 'owner' && !isDemo) {
+              items.push(
+                <button key="leave" type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onLeaveServer?.(ctxMenu.id, ctxMenu.name) }}>🚪 Leave server</button>
+              )
+            }
+            if (role === 'owner' && !isDemo) {
+              items.push(
+                <button key="delete" type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onDeleteServer?.(ctxMenu.id, ctxMenu.name) }}>🗑️ Delete server</button>
+              )
+            }
+            return (
+              <>
+                <div className="dc-ctx-title">{ctxMenu.name}{role !== 'member' ? ` · ${role}` : ''}</div>
+                {items.length ? items : <div className="dc-ctx-empty">No actions available</div>}
+              </>
+            )
+          })()}
+
+          {ctxMenu.kind === 'channel' && (
+            <>
+              <div className="dc-ctx-title">#{ctxMenu.name}</div>
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameChannel?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename</button>
+              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onDeleteChannel?.(ctxMenu.id, ctxMenu.name) }}>🗑️ Delete</button>
+            </>
+          )}
+
+          {ctxMenu.kind === 'member' && (
+            <>
+              <div className="dc-ctx-title">{ctxMenu.name}{ctxMenu.role !== 'member' ? ` · ${ctxMenu.role}` : ''}</div>
+              {myRole === 'owner' && ctxMenu.role === 'member' && (
+                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'admin') }}>🛡️ Make admin</button>
+              )}
+              {myRole === 'owner' && ctxMenu.role === 'admin' && (
+                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'member') }}>⬇️ Remove admin</button>
+              )}
+              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onKickMember?.(ctxMenu.username) }}>🚫 Remove from server</button>
+            </>
           )}
         </div>,
         document.body

@@ -809,6 +809,7 @@ export default function App() {
   const [showDiscover, setShowDiscover] = useState(false)
   // Public profile card shown when you click a member.
   const [profileCard, setProfileCard] = useState(null) // { loading?, username, profile, gamingProfile, status }
+  const [toast, setToast] = useState(null) // brief bottom notice (invites, role changes)
   // External streaming (Twitch/YouTube/Kik): my announcement + the announce form + in-app viewer.
   const [myExternalStream, setMyExternalStream] = useState(null) // { platform, channel, title, game }
   const [showAnnounceForm, setShowAnnounceForm] = useState(false)
@@ -1733,7 +1734,17 @@ export default function App() {
         }
       }
       const members = Array.from(map.values())
-      setServerState({ server: data.server, members })
+      setServerState({ server: data.server, members, myRole: data.myRole || 'member' })
+    })
+    // Membership events: added to / removed from / kicked out of a server.
+    s.on('server:invited', ({ name: srvName } = {}) => { loadServers(); if (srvName) setToast(`You were added to ${srvName}`) })
+    s.on('server:removed', ({ serverId } = {}) => {
+      loadServers()
+      if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
+    })
+    s.on('server:denied', ({ serverId } = {}) => {
+      if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
+      loadServers()
     })
     // messages:init is `{ serverId, channelId, messages }` (older array shape still accepted).
     s.on('messages:init', (payload) => {
@@ -2043,6 +2054,36 @@ export default function App() {
     const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/channels/${encodeURIComponent(channelId)}`, { method: 'DELETE' })
     if (!res.ok) alert((await res.json()).error || 'Delete failed')
   }
+
+  // ---- Membership management (invite / leave / kick / roles) ----
+  const inviteToServer = async (serverId) => {
+    const uname = (window.prompt('Invite a user to this server by username:') || '').trim()
+    if (!uname) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/invite`, { method: 'POST', body: JSON.stringify({ username: uname }) })
+    if (res.ok) setToast(`Invited ${uname}`)
+    else alert((await res.json()).error || 'Invite failed')
+  }
+  const leaveServer = async (serverId, serverName2) => {
+    if (!window.confirm(`Leave "${serverName2}"? You'll need a new invite to rejoin.`)) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/leave`, { method: 'POST' })
+    if (!res.ok) { alert((await res.json()).error || 'Could not leave'); return }
+    if (selectedServerId === serverId) setSelectedServerId('home')
+  }
+  const kickMember = async (username) => {
+    if (!window.confirm(`Remove ${username} from this server?`)) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/members/${encodeURIComponent(username)}`, { method: 'DELETE' })
+    if (!res.ok) alert((await res.json()).error || 'Could not remove member')
+  }
+  const setMemberRole = async (username, role) => {
+    const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/members/${encodeURIComponent(username)}`, { method: 'PATCH', body: JSON.stringify({ role }) })
+    if (res.ok) setToast(`${username} is now ${role === 'admin' ? 'an admin' : 'a member'}`)
+    else alert((await res.json()).error || 'Could not change role')
+  }
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 3200)
+    return () => clearTimeout(t)
+  }, [toast])
 
   const joinChannel = (channelId) => {
     if (!socket) return
@@ -3892,6 +3933,13 @@ export default function App() {
         members={serverState?.members || []}
         socketId={socket?.id}
         onSelectMember={openMemberProfile}
+        myRole={serverState?.myRole || 'member'}
+        serverOwner={serverState?.server?.owner || null}
+        currentUsername={name}
+        onInviteServer={inviteToServer}
+        onLeaveServer={leaveServer}
+        onKickMember={kickMember}
+        onSetMemberRole={setMemberRole}
       />
 
       <div className="main">
@@ -4256,6 +4304,7 @@ export default function App() {
           </div>
         </div>
       )}
+      {toast && <div className="app-toast" role="status">{toast}</div>}
       {/* Watch / Discover — who's live right now (in-app screen shares + Twitch/YouTube/Kik) */}
       {showDiscover && (() => {
         const inAppStreams = discoverStreams.filter((s) => s.kind !== 'external')

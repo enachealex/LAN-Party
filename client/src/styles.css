@@ -879,6 +879,13 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 /* Member row is now a clickable button → opens the public profile card */
 .dc-member-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;border:none;color:inherit;font:inherit;padding:5px 8px;border-radius:7px;cursor:pointer}
 .dc-member-row:hover{background:rgba(255,255,255,.06)}
+.dc-member-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dc-member-dot.offline{background:#5c6470}
+.dc-member-role{margin-left:auto;font-size:12px;line-height:1;flex-shrink:0}
+.dc-ctx-empty{padding:8px 12px;color:var(--muted);font-size:12px}
+/* Brief bottom-center toast for invites / role changes */
+.app-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#111a24;color:#e6edf5;border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:10px 16px;font-size:14px;box-shadow:0 12px 34px rgba(0,0,0,.5);z-index:600;animation:app-toast-in .18s ease}
+@keyframes app-toast-in{from{opacity:0;transform:translate(-50%,8px)}to{opacity:1;transform:translate(-50%,0)}}
 /* Public profile card */
 .profilecard-overlay{position:fixed;inset:0;background:rgba(4,8,12,.72);display:flex;align-items:center;justify-content:center;z-index:460;padding:20px}
 .profilecard{position:relative;width:min(380px,94vw);background:#0f1620;border:1px solid rgba(255,255,255,.12);border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.6);padding:20px}
