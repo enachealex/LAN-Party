@@ -6,6 +6,7 @@ dist/
 # Secrets & environment — never commit these
 .env
 server/giphy.key
+server/youtube.key
 desktop/certs/
 
 # Runtime data (user accounts, uploads, sounds, gifs live on the server's disk)

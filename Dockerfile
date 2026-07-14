@@ -12,11 +12,14 @@ RUN npm run build
 FROM node:20-bookworm-slim
 WORKDIR /app/server
 # Build tools are needed to compile sqlite3's native binding, then removed to keep the image lean.
+# python3 stays: the standalone yt-dlp binary (Music activity audio extraction) runs on it.
 COPY server/package*.json ./
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
+  && apt-get install -y --no-install-recommends python3 make g++ ca-certificates curl \
   && npm ci --omit=dev \
-  && apt-get purge -y python3 make g++ \
+  && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+  && chmod a+rx /usr/local/bin/yt-dlp \
+  && apt-get purge -y make g++ curl \
   && apt-get autoremove -y \
   && rm -rf /var/lib/apt/lists/*
 COPY server/ ./

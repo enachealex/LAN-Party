@@ -321,7 +321,7 @@ async function main() {
 
   // --- Activities: one shared activity per voice room, synced to everyone in it ---
   const activities = {}; // room -> { type, state, by }
-  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch'];
+  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music'];
   const SKETCH_WORDS = ['pizza', 'dragon', 'controller', 'headset', 'wizard', 'castle', 'laptop', 'zombie', 'racecar', 'treasure', 'ninja', 'robot', 'campfire', 'spaceship', 'sword', 'shield', 'potion', 'dungeon', 'goblin', 'keyboard', 'trophy', 'boss fight', 'power up', 'game over', 'rage quit', 'speedrun', 'loot box', 'health bar', 'respawn', 'lan party', 'energy drink', 'mechanical keyboard', 'graphics card', 'blue screen', 'lag spike', 'victory royale', 'minecart', 'creeper', 'portal', 'joystick', 'arcade', 'pixel', 'avatar', 'guild', 'quest', 'checkpoint', 'combo', 'headshot', 'stealth', 'sniper', 'race track', 'finish line', 'monster truck', 'alien', 'meteor', 'volcano', 'pirate ship', 'skeleton', 'campaign', 'final boss'];
   function activityInit(type) {
     if (type === 'watch') return { videoId: null, playing: false, time: 0, ts: Date.now() };
@@ -329,6 +329,8 @@ async function main() {
     if (type === 'poll') return { question: '', options: [], closed: false };
     if (type === 'ttt') return { board: Array(9).fill(''), turn: 'X', players: {}, winner: null };
     if (type === 'sketch') return { phase: 'lobby', players: [], turnIdx: 0, totalTurns: 0, word: null, wordMask: '', strokes: [], guesses: [], solvedBy: [], lastResult: null };
+    // music: shared queue + synced playback (pos anchored to server time ts, like 'watch').
+    if (type === 'music') return { queue: [], index: -1, playing: false, pos: 0, ts: Date.now(), history: [] };
     return {};
   }
 
@@ -414,6 +416,61 @@ async function main() {
         s.turnIdx = 0;
         s.word = null; s.wordMask = ''; s.strokes = []; s.guesses = []; s.solvedBy = []; s.lastResult = null;
       }
+    } else if (act.type === 'music') {
+      const now = Date.now();
+      const validTrack = (t) => t && typeof t.id === 'string' && /^[a-zA-Z0-9_-]{6,20}$/.test(t.id);
+      const cleanTrack = (t) => ({
+        id: t.id,
+        title: String(t.title || '').slice(0, 120),
+        artist: String(t.artist || '').slice(0, 80),
+        thumbnail: String(t.thumbnail || '').slice(0, 300),
+        addedBy: user,
+      });
+      const pushHistory = (t) => { if (!t) return; s.history.unshift({ id: t.id, title: t.title, artist: t.artist, thumbnail: t.thumbnail, playedAt: now }); if (s.history.length > 100) s.history.length = 100; };
+      const startAt = (i) => {
+        if (i >= 0 && i < s.queue.length) { s.index = i; s.pos = 0; s.ts = now; s.playing = true; }
+        else { s.index = -1; s.pos = 0; s.ts = now; s.playing = false; }
+      };
+      if (ev.kind === 'add' && validTrack(ev.track) && s.queue.length < 200) {
+        s.queue.push(cleanTrack(ev.track));
+        if (s.index === -1) startAt(s.queue.length - 1); // nothing playing → start what was just added
+      } else if (ev.kind === 'playNow' && validTrack(ev.track)) {
+        pushHistory(s.queue[s.index]);
+        s.queue.splice(s.index + 1, 0, cleanTrack(ev.track));
+        startAt(s.index + 1);
+      } else if (ev.kind === 'jump' && Number.isInteger(ev.i) && ev.i >= 0 && ev.i < s.queue.length) {
+        pushHistory(s.queue[s.index]);
+        startAt(ev.i);
+      } else if (ev.kind === 'remove' && Number.isInteger(ev.i) && ev.i >= 0 && ev.i < s.queue.length) {
+        const removingCurrent = ev.i === s.index;
+        s.queue.splice(ev.i, 1);
+        if (ev.i < s.index) s.index -= 1;
+        else if (removingCurrent) startAt(s.index < s.queue.length ? s.index : -1);
+      } else if (ev.kind === 'clear') {
+        // Clear upcoming + played; keep only what's on right now.
+        const current = s.queue[s.index];
+        s.queue = current ? [current] : [];
+        s.index = current ? 0 : -1;
+        if (!current) { s.playing = false; s.pos = 0; s.ts = now; }
+      } else if (ev.kind === 'shuffle' && s.queue.length > s.index + 2) {
+        // Shuffle only the not-yet-played tail so history/current stay put.
+        const tail = s.queue.splice(s.index + 1);
+        for (let i = tail.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [tail[i], tail[j]] = [tail[j], tail[i]]; }
+        s.queue.push(...tail);
+      } else if (ev.kind === 'skip' || ev.kind === 'next') {
+        // 'next' comes from every client's audio 'ended' event — the fromId guard makes sure
+        // only the first one advances the queue (the rest see a changed track and no-op).
+        if (ev.kind === 'next' && (!s.queue[s.index] || s.queue[s.index].id !== ev.fromId)) return;
+        pushHistory(s.queue[s.index]);
+        startAt(s.index + 1 < s.queue.length ? s.index + 1 : -1);
+      } else if (ev.kind === 'play') {
+        if (s.index !== -1) { s.playing = true; s.pos = Number(ev.pos) || 0; s.ts = now; }
+      } else if (ev.kind === 'pause') {
+        s.playing = false; s.pos = Number(ev.pos) || 0; s.ts = now;
+      } else if (ev.kind === 'seek') {
+        s.pos = Math.max(0, Number(ev.pos) || 0); s.ts = now;
+      }
+      warmMusicQueue(s.queue, s.index); // pre-resolve upcoming audio so skips start instantly
     }
   }
 
@@ -1304,6 +1361,163 @@ async function main() {
     const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     return proxyGiphy(res, 'search', { q, limit, offset, lang: 'en' });
+  });
+
+  // --- Music (YouTube) — ported from DiscordMusicActivity ---
+  // Search uses the YouTube Data API (key from YOUTUBE_API_KEY env or `server/youtube.key`).
+  // Playback: yt-dlp resolves a signed audio-only URL (cached ~55 min) which we proxy as a
+  // Range-capable stream, so every participant plays the same audio via a plain <audio> tag.
+  const { spawn } = require('child_process');
+  function getYoutubeKey() {
+    if (process.env.YOUTUBE_API_KEY && process.env.YOUTUBE_API_KEY.trim()) return process.env.YOUTUBE_API_KEY.trim();
+    try { return fs.readFileSync(path.join(__dirname, 'youtube.key'), 'utf8').trim(); } catch { return ''; }
+  }
+  const decodeHtml = (s) => String(s || '')
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+
+  const AUDIO_URL_TTL_MS = 55 * 60 * 1000; // YouTube signed URLs last ~6h; 55 min is a safe reuse window
+  const audioUrlCache = new Map();          // videoId -> { audioUrl, expiresAt }
+  const inflightAudioResolves = new Map();  // videoId -> Promise (dedupe concurrent yt-dlp runs)
+  const MAX_CONCURRENT_YTDLP = 4;
+  let activeYtdlp = 0;
+  const ytdlpQueue = [];
+  const acquireYtdlp = () => new Promise((resolve) => {
+    if (activeYtdlp < MAX_CONCURRENT_YTDLP) { activeYtdlp++; resolve(); } else ytdlpQueue.push(resolve);
+  });
+  const releaseYtdlp = () => { const next = ytdlpQueue.shift(); if (next) next(); else activeYtdlp--; };
+
+  function resolveAudioUrl(videoId) {
+    const cached = audioUrlCache.get(videoId);
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve({ audioUrl: cached.audioUrl, fromCache: true });
+    if (cached) audioUrlCache.delete(videoId);
+    const inflight = inflightAudioResolves.get(videoId);
+    if (inflight) return inflight;
+    const p = (async () => {
+      await acquireYtdlp();
+      try {
+        const ytdlp = spawn('yt-dlp', [
+          // Highest-bitrate audio-only stream; opus/m4a both play in browsers.
+          '-f', 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio',
+          '-S', 'acodec:opus,abr,asr',
+          '--no-playlist', '--no-warnings', '-g',
+          `https://www.youtube.com/watch?v=${videoId}`,
+        ]);
+        let out = '', errOut = '';
+        ytdlp.stdout.on('data', (c) => { out += c.toString(); });
+        ytdlp.stderr.on('data', (c) => { errOut += c.toString(); });
+        const code = await new Promise((resolve, reject) => { ytdlp.once('error', reject); ytdlp.once('close', resolve); });
+        const audioUrl = out.trim();
+        if (code !== 0 || !audioUrl) { const e = new Error('Failed to get audio URL'); e.details = errOut; throw e; }
+        audioUrlCache.set(videoId, { audioUrl, expiresAt: Date.now() + AUDIO_URL_TTL_MS });
+        if (audioUrlCache.size > 500) {
+          for (const [k, v] of audioUrlCache) if (v.expiresAt <= Date.now()) audioUrlCache.delete(k);
+        }
+        return { audioUrl, fromCache: false };
+      } finally { releaseYtdlp(); }
+    })().finally(() => inflightAudioResolves.delete(videoId));
+    inflightAudioResolves.set(videoId, p);
+    return p;
+  }
+
+  // Best-effort pre-resolve of the next few queued tracks so skips start instantly.
+  function warmMusicQueue(queue, currentIndex, count = 3) {
+    if (!Array.isArray(queue) || !queue.length) return;
+    const idx = Number.isFinite(Number(currentIndex)) ? Number(currentIndex) : -1;
+    const start = Math.max(0, idx + 1);
+    for (const t of queue.slice(start, start + count)) {
+      if (t && t.id) resolveAudioUrl(t.id).catch(() => {});
+    }
+  }
+
+  // Pull a video id out of any common YouTube URL form (watch/shorts/embed/youtu.be/music.).
+  function extractYouTubeId(input) {
+    const text = String(input || '').trim();
+    if (!/youtu\.?be/i.test(text)) return null;
+    let url;
+    try { url = new URL(text.startsWith('http') ? text : `https://${text}`); } catch { return null; }
+    const host = url.hostname.replace(/^www\./, '');
+    let id = null;
+    if (host === 'youtu.be') id = url.pathname.split('/')[1];
+    else if (host.endsWith('youtube.com') || host.endsWith('youtube-nocookie.com')) {
+      id = url.searchParams.get('v');
+      if (!id) { const m = /^\/(?:shorts|embed|live|v)\/([^/?#]+)/.exec(url.pathname); if (m) id = m[1]; }
+    }
+    return id && /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
+  }
+
+  app.get('/music/status', authMiddleware, (req, res) => res.json({ configured: !!getYoutubeKey() }));
+
+  app.get('/music/search', authMiddleware, async (req, res) => {
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.status(400).json({ error: 'Query required' });
+    const key = getYoutubeKey();
+    if (!key) return res.status(503).json({ error: 'Music search is not configured', configured: false });
+    try {
+      // A pasted YouTube URL resolves that exact video instead of searching.
+      const pastedId = extractYouTubeId(q);
+      if (pastedId) {
+        const r = await fetch(`https://www.googleapis.com/youtube/v3/videos?${new URLSearchParams({ part: 'snippet', id: pastedId, key })}`);
+        const data = await r.json();
+        const item = data.items && data.items[0];
+        if (!item) return res.json([]);
+        return res.json([{
+          id: pastedId,
+          title: decodeHtml(item.snippet.title),
+          artist: decodeHtml(item.snippet.channelTitle),
+          thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
+        }]);
+      }
+      const r = await fetch(`https://www.googleapis.com/youtube/v3/search?${new URLSearchParams({
+        part: 'snippet', q, type: 'video', videoCategoryId: '10', maxResults: '10', key,
+      })}`);
+      const data = await r.json();
+      if (!r.ok) return res.status(502).json({ error: data?.error?.message || 'YouTube search failed' });
+      return res.json((data.items || []).map((item) => ({
+        id: item.id.videoId,
+        title: decodeHtml(item.snippet.title),
+        artist: decodeHtml(item.snippet.channelTitle),
+        thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
+      })));
+    } catch (err) {
+      console.error('Music search error:', err.message);
+      return res.status(500).json({ error: 'YouTube search failed' });
+    }
+  });
+
+  // Streaming audio proxy. Auth via ?token= because <audio src> can't send headers.
+  app.get('/music/audio/:videoId', async (req, res) => {
+    try { jwt.verify(String(req.query.token || ''), JWT_SECRET); } catch { return res.status(401).json({ error: 'Unauthorized' }); }
+    const { videoId } = req.params;
+    if (!/^[a-zA-Z0-9_-]{6,20}$/.test(String(videoId || ''))) return res.status(400).json({ error: 'Invalid video id' });
+    if (req.query.fresh === '1') audioUrlCache.delete(videoId); // client retry after a playback error
+    try {
+      const { audioUrl } = await resolveAudioUrl(videoId);
+      const upstream = await fetch(audioUrl, { headers: req.headers.range ? { Range: req.headers.range } : {} });
+      if (!upstream.ok && upstream.status !== 206) {
+        if (upstream.status === 403 || upstream.status === 410) audioUrlCache.delete(videoId); // stale signed URL
+        return res.status(502).json({ error: 'Audio stream failed' });
+      }
+      res.status(upstream.status);
+      for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+        const v = upstream.headers.get(h);
+        if (v) res.setHeader(h, v);
+      }
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      const { Readable } = require('stream');
+      const body = Readable.fromWeb(upstream.body);
+      body.on('error', () => { if (!res.headersSent) res.status(502); res.end(); });
+      req.on('close', () => body.destroy());
+      body.pipe(res);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        console.error('yt-dlp not found — install it for music playback');
+        return res.status(502).json({ error: 'Audio extraction tool not available' });
+      }
+      if (err && err.details) console.error('yt-dlp error:', String(err.details).slice(0, 300));
+      else console.error('Music audio error:', err.message);
+      if (!res.headersSent) res.status(502).json({ error: 'Failed to get audio' });
+    }
   });
 
   app.post('/user/presence', authMiddleware, async (req, res) => {

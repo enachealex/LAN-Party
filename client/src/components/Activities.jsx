@@ -4,12 +4,16 @@ import React, { useEffect, useRef, useState } from 'react'
 // channel and kept in sync by the server — no launch/invite dance. Add a new activity by adding an
 // entry here + a view below + a reducer branch on the server.
 export const ACTIVITY_TYPES = [
+  { id: 'music', label: 'Music', icon: '🎵', hint: 'Queue songs — everyone hears them in sync' },
   { id: 'sketch', label: 'Sketch & Guess', icon: '✏️', hint: 'Draw the word — friends race to guess it' },
   { id: 'watch', label: 'Watch Together', icon: '🎬', hint: 'Watch a YouTube video in sync' },
   { id: 'whiteboard', label: 'Whiteboard', icon: '🎨', hint: 'Draw on a shared canvas' },
   { id: 'poll', label: 'Quick Poll', icon: '📊', hint: 'Ask the group a question' },
   { id: 'ttt', label: 'Tic-Tac-Toe', icon: '⭕', hint: 'Two play, others watch' },
 ]
+
+// Same expression as App.jsx (not imported to avoid a cycle): same-origin in prod, :3000 in dev.
+const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? (import.meta.env.DEV ? 'http://localhost:3000' : '')
 
 // Pull an 11-char YouTube id out of a URL (or accept a bare id).
 function ytId(input) {
@@ -31,11 +35,211 @@ export default function ActivityPanel({ activity, me, onEvent, onClose }) {
         <button type="button" className="activity-close" onClick={onClose} title="End this activity for everyone" aria-label="End activity">✕ End</button>
       </div>
       <div className="activity-body">
+        {type === 'music' && <MusicActivity state={state} onEvent={onEvent} />}
         {type === 'watch' && <WatchTogether state={state} onEvent={onEvent} />}
         {type === 'whiteboard' && <Whiteboard state={state} onEvent={onEvent} />}
         {type === 'poll' && <PollActivity state={state} me={me} onEvent={onEvent} />}
         {type === 'ttt' && <TicTacToe state={state} me={me} onEvent={onEvent} />}
         {type === 'sketch' && <SketchGuess state={state} me={me} onEvent={onEvent} />}
+      </div>
+    </div>
+  )
+}
+
+// ---- Music (shared queue + synced audio, ported from DiscordMusicActivity) ----
+// The server resolves each track to an audio-only stream (/music/audio/:id) that every
+// participant plays in a plain <audio> tag; state.pos + state.ts anchor the shared position.
+const fmtTime = (secs) => {
+  const s = Math.max(0, Math.floor(Number(secs) || 0))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+function MusicActivity({ state, onEvent }) {
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState(null) // null = nothing searched yet
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [configured, setConfigured] = useState(true)
+  const [duration, setDuration] = useState(0)
+  const [progress, setProgress] = useState(0)
+  const [needsGesture, setNeedsGesture] = useState(false)
+  const [volume, setVolume] = useState(() => { const v = parseFloat(localStorage.getItem('lanparty_music_vol')); return Number.isFinite(v) ? v : 0.8 })
+  const audioRef = useRef(null)
+  const curTrackIdRef = useRef(null)
+  const retriedRef = useRef(null) // track id we already retried with ?fresh=1
+  const token = localStorage.getItem('lanparty_token') || ''
+
+  const current = state.index >= 0 ? state.queue[state.index] : null
+  // Where the room's playhead is right now (pos anchored at server-time ts).
+  const sharedPos = () => (state.pos || 0) + (state.playing ? (Date.now() - (state.ts || Date.now())) / 1000 : 0)
+
+  useEffect(() => {
+    fetch(`${SERVER_URL}/music/status`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json()).then((d) => setConfigured(!!d.configured)).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const search = async () => {
+    const q = query.trim()
+    if (!q || searching) return
+    setSearching(true); setSearchError('')
+    try {
+      const r = await fetch(`${SERVER_URL}/music/search?q=${encodeURIComponent(q)}`, { headers: { Authorization: `Bearer ${token}` } })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error || 'Search failed')
+      setResults(data)
+    } catch (e) { setSearchError(e.message); setResults([]) }
+    finally { setSearching(false) }
+  }
+
+  // Keep the local <audio> matched to the shared state (track, position, play/pause).
+  useEffect(() => {
+    const a = audioRef.current
+    if (!a) return
+    if (!current) { a.pause(); a.removeAttribute('src'); curTrackIdRef.current = null; setDuration(0); setProgress(0); return }
+    const tryPlay = () => a.play().then(() => setNeedsGesture(false)).catch(() => setNeedsGesture(true))
+    if (curTrackIdRef.current !== current.id) {
+      curTrackIdRef.current = current.id
+      setDuration(0)
+      a.src = `${SERVER_URL}/music/audio/${current.id}?token=${encodeURIComponent(token)}`
+      a.currentTime = Math.max(0, sharedPos())
+      if (state.playing) tryPlay(); else a.pause()
+      return
+    }
+    const target = sharedPos()
+    if (Math.abs((a.currentTime || 0) - target) > 2.5) a.currentTime = Math.max(0, target)
+    if (state.playing && a.paused) tryPlay()
+    else if (!state.playing && !a.paused) a.pause()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.queue, state.index, state.playing, state.pos, state.ts])
+
+  useEffect(() => { const a = audioRef.current; if (a) a.volume = volume; localStorage.setItem('lanparty_music_vol', String(volume)) }, [volume])
+
+  // Progress readout for the seek bar (local only — no events).
+  useEffect(() => {
+    const t = setInterval(() => { const a = audioRef.current; if (a && !a.paused) setProgress(a.currentTime || 0) }, 500)
+    return () => clearInterval(t)
+  }, [])
+
+  const onEnded = () => { if (current) onEvent({ kind: 'next', fromId: current.id }) }
+  const onAudioError = () => {
+    // A stale signed URL 403s mid-song — retry once with a fresh yt-dlp resolve.
+    const a = audioRef.current
+    if (!a || !current || retriedRef.current === current.id) return
+    retriedRef.current = current.id
+    const pos = a.currentTime || sharedPos()
+    a.src = `${SERVER_URL}/music/audio/${current.id}?token=${encodeURIComponent(token)}&fresh=1`
+    a.currentTime = Math.max(0, pos)
+    if (state.playing) a.play().catch(() => setNeedsGesture(true))
+  }
+  const resumeAudio = () => {
+    const a = audioRef.current
+    if (!a) return
+    a.currentTime = Math.max(0, sharedPos())
+    a.play().then(() => setNeedsGesture(false)).catch(() => {})
+  }
+
+  return (
+    <div className="music-activity">
+      <audio ref={audioRef} onEnded={onEnded} onError={onAudioError} onLoadedMetadata={(e) => setDuration(e.target.duration || 0)} />
+      {!configured && (
+        <div className="music-note">Music search isn't configured — add a YouTube API key (YOUTUBE_API_KEY or server/youtube.key) on the server.</div>
+      )}
+
+      <div className="music-columns">
+        {/* Search */}
+        <div className="music-col">
+          <div className="music-search-row">
+            <input
+              className="music-input"
+              placeholder="Search songs or paste a YouTube link…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') search() }}
+            />
+            <button type="button" className="music-btn" onClick={search} disabled={searching || !query.trim()}>{searching ? '…' : 'Search'}</button>
+          </div>
+          {searchError && <div className="music-note">{searchError}</div>}
+          <div className="music-list">
+            {results && results.length === 0 && !searchError && <div className="music-empty">No results.</div>}
+            {(results || []).map((t) => (
+              <div key={t.id} className="music-row">
+                {t.thumbnail ? <img className="music-thumb" src={t.thumbnail} alt="" /> : <span className="music-thumb music-thumb-empty">🎵</span>}
+                <span className="music-meta"><span className="music-title">{t.title}</span><span className="music-artist">{t.artist}</span></span>
+                <button type="button" className="music-mini" title="Play now" onClick={() => onEvent({ kind: 'playNow', track: t })}>▶</button>
+                <button type="button" className="music-mini" title="Add to queue" onClick={() => onEvent({ kind: 'add', track: t })}>＋</button>
+              </div>
+            ))}
+            {!results && <div className="music-empty">Find something to play — the whole channel hears it together.</div>}
+          </div>
+        </div>
+
+        {/* Now playing + queue */}
+        <div className="music-col">
+          <div className="music-nowplaying">
+            {current ? (
+              <>
+                {current.thumbnail ? <img className="music-thumb music-thumb-lg" src={current.thumbnail} alt="" /> : <span className="music-thumb music-thumb-lg music-thumb-empty">🎵</span>}
+                <span className="music-meta"><span className="music-title">{current.title}</span><span className="music-artist">{current.artist} · added by {current.addedBy}</span></span>
+              </>
+            ) : (
+              <span className="music-empty">Nothing playing yet.</span>
+            )}
+          </div>
+          {needsGesture && current && (
+            <button type="button" className="music-btn music-join-audio" onClick={resumeAudio}>🔊 Tap to hear the music</button>
+          )}
+          <div className="music-controls">
+            <button type="button" className="music-ctl" disabled={!current} title={state.playing ? 'Pause for everyone' : 'Play for everyone'}
+              onClick={() => onEvent({ kind: state.playing ? 'pause' : 'play', pos: audioRef.current?.currentTime || 0 })}>
+              {state.playing ? '⏸' : '▶'}
+            </button>
+            <button type="button" className="music-ctl" disabled={!current} title="Skip" onClick={() => onEvent({ kind: 'skip' })}>⏭</button>
+            <input
+              className="music-seek" type="range" min="0" max={Math.max(1, Math.floor(duration))} step="1"
+              value={Math.min(Math.floor(progress), Math.floor(duration) || 0)}
+              disabled={!current || !duration}
+              onChange={(e) => { const v = Number(e.target.value); setProgress(v); onEvent({ kind: 'seek', pos: v }) }}
+              aria-label="Seek"
+            />
+            <span className="music-time">{fmtTime(progress)} / {fmtTime(duration)}</span>
+            <span className="music-vol" title="Your volume (only affects you)">
+              🔉<input type="range" min="0" max="1" step="0.05" value={volume} onChange={(e) => setVolume(Number(e.target.value))} aria-label="Volume" />
+            </span>
+          </div>
+
+          <div className="music-queue-head">
+            <span>Up next — {Math.max(0, state.queue.length - (state.index + 1))}</span>
+            <span className="music-queue-actions">
+              <button type="button" className="music-mini" title="Shuffle upcoming" onClick={() => onEvent({ kind: 'shuffle' })} disabled={state.queue.length - state.index < 3}>🔀</button>
+              <button type="button" className="music-mini" title="Clear queue" onClick={() => onEvent({ kind: 'clear' })} disabled={!state.queue.length}>🗑</button>
+            </span>
+          </div>
+          <div className="music-list music-queue">
+            {state.queue.map((t, i) => (
+              <div key={`${t.id}-${i}`} className={`music-row${i === state.index ? ' playing' : ''}${i < state.index ? ' played' : ''}`}>
+                <button type="button" className="music-row-main" title={i === state.index ? 'Playing now' : 'Play this'} onClick={() => { if (i !== state.index) onEvent({ kind: 'jump', i }) }}>
+                  {t.thumbnail ? <img className="music-thumb" src={t.thumbnail} alt="" /> : <span className="music-thumb music-thumb-empty">🎵</span>}
+                  <span className="music-meta"><span className="music-title">{i === state.index ? '🔊 ' : ''}{t.title}</span><span className="music-artist">{t.artist} · {t.addedBy}</span></span>
+                </button>
+                <button type="button" className="music-mini" title="Remove" onClick={() => onEvent({ kind: 'remove', i })}>✕</button>
+              </div>
+            ))}
+            {!state.queue.length && <div className="music-empty">Queue is empty.</div>}
+          </div>
+          {state.history.length > 0 && (
+            <details className="music-history">
+              <summary>Played earlier — {state.history.length}</summary>
+              {state.history.slice(0, 20).map((t, i) => (
+                <div key={`${t.id}-h${i}`} className="music-row">
+                  {t.thumbnail ? <img className="music-thumb" src={t.thumbnail} alt="" /> : <span className="music-thumb music-thumb-empty">🎵</span>}
+                  <span className="music-meta"><span className="music-title">{t.title}</span><span className="music-artist">{t.artist}</span></span>
+                  <button type="button" className="music-mini" title="Queue again" onClick={() => onEvent({ kind: 'add', track: t })}>＋</button>
+                </div>
+              ))}
+            </details>
+          )}
+        </div>
       </div>
     </div>
   )

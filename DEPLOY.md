@@ -24,6 +24,7 @@ Point an A/AAAA record for `lanparty.thejumpvault.com` at your VPS's public IP. 
 | `TURN_URLS` | **for reliable calls** | Comma-separated TURN URLs, e.g. `turn:lanparty.thejumpvault.com:3478,turns:lanparty.thejumpvault.com:5349`. |
 | `TURN_USERNAME` / `TURN_CREDENTIAL` | with TURN | TURN credentials. |
 | `GIPHY_API_KEY` | no | Enables the Giphy tab (or drop a `server/giphy.key` file). |
+| `YOUTUBE_API_KEY` | for Music | Enables Music activity search (or drop a `server/youtube.key` file). Playback also needs `yt-dlp` on PATH — the Dockerfile installs it. |
 
 Generate a secret: `openssl rand -hex 32`.
 
