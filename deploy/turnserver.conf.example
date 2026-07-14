@@ -9,15 +9,15 @@ tls-listening-port=5349
 external-ip=YOUR_PUBLIC_IP
 
 realm=thejumpvault.com
-server-name=discordmusic.thejumpvault.com
+server-name=lanparty.thejumpvault.com
 
 # Simple long-term credential (must match TURN_USERNAME / TURN_CREDENTIAL in the app env).
 lt-cred-mech
 user=lanparty:CHANGE_ME_STRONG_SECRET
 
 # Reuse the domain's Let's Encrypt cert for turns:// (TLS TURN — best for restrictive networks).
-cert=/etc/letsencrypt/live/discordmusic.thejumpvault.com/fullchain.pem
-pkey=/etc/letsencrypt/live/discordmusic.thejumpvault.com/privkey.pem
+cert=/etc/letsencrypt/live/lanparty.thejumpvault.com/fullchain.pem
+pkey=/etc/letsencrypt/live/lanparty.thejumpvault.com/privkey.pem
 
 min-port=49152
 max-port=65535

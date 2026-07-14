@@ -1,11 +1,11 @@
-# Reverse proxy for discordmusic.thejumpvault.com → the app on 127.0.0.1:3000.
+# Reverse proxy for lanparty.thejumpvault.com → the app on 127.0.0.1:3000.
 # Put this in /etc/nginx/sites-available/ and symlink into sites-enabled, then run certbot
 # (see DEPLOY.md). Certbot will add the TLS/443 server block and the http→https redirect for you.
 
 server {
     listen 80;
     listen [::]:80;
-    server_name discordmusic.thejumpvault.com;
+    server_name lanparty.thejumpvault.com;
 
     # Uploads are up to 100 MB.
     client_max_body_size 100m;

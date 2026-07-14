@@ -12,7 +12,7 @@ services:
       DATA_DIR: /data
       CLIENT_DIST: /app/client/dist
       JWT_SECRET: ${JWT_SECRET:?set a long random JWT_SECRET in .env}
-      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-https://discordmusic.thejumpvault.com}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-https://lanparty.thejumpvault.com}
       STUN_URLS: ${STUN_URLS:-stun:stun.l.google.com:19302}
       TURN_URLS: ${TURN_URLS:-}
       TURN_USERNAME: ${TURN_USERNAME:-}

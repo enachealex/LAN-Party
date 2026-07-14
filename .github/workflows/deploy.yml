@@ -5,7 +5,7 @@ name: Deploy
 # Dormant until you enable it — in the GitHub repo settings:
 #   1. Settings → Secrets and variables → Actions → **Variables**: add DEPLOY_ENABLED = true
 #   2. **Secrets**: add
-#        VPS_HOST     e.g. discordmusic.thejumpvault.com (or the server IP)
+#        VPS_HOST     e.g. lanparty.thejumpvault.com (or the server IP)
 #        VPS_USER     the SSH user
 #        VPS_SSH_KEY  a private key whose public half is in that user's ~/.ssh/authorized_keys
 #        VPS_PATH     path of the cloned repo on the VPS, e.g. /opt/lan-party
