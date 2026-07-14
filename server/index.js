@@ -176,6 +176,14 @@ async function main() {
     text TEXT,
     ts INTEGER
   )`);
+  // Per-user channel read markers — unread count = messages newer than last_read_ts.
+  await db.exec(`CREATE TABLE IF NOT EXISTS channel_reads (
+    username TEXT,
+    server_id TEXT,
+    channel_id TEXT,
+    last_read_ts INTEGER DEFAULT 0,
+    PRIMARY KEY (username, server_id, channel_id)
+  )`);
   await db.exec(`CREATE TABLE IF NOT EXISTS revoked_tokens (
     token TEXT PRIMARY KEY,
     expires_at INTEGER
@@ -819,6 +827,36 @@ async function main() {
   // Channels visible to a given role: staff see everything, members/guests only public channels.
   const visibleChannels = (channels, role) => (isStaffRole(role) ? channels : channels.filter((c) => c.privacy !== 'private'));
 
+  // --- Unreads ---
+  async function markChannelRead(username, serverId, channelId) {
+    if (!username) return;
+    await db.run(
+      `INSERT INTO channel_reads (username, server_id, channel_id, last_read_ts) VALUES (?, ?, ?, ?)
+       ON CONFLICT(username, server_id, channel_id) DO UPDATE SET last_read_ts = excluded.last_read_ts`,
+      username, serverId, channelId, Date.now()
+    );
+  }
+  // Tell members a channel has a new message so their badges bump live. Private channels only
+  // notify staff. The author is skipped (demo broadcasts include them; clients filter by author).
+  // Carries channel/server names + @mentions so clients can raise desktop notifications.
+  async function emitUnreadBump(serverId, channelId, privacy, author, text) {
+    const srv = await db.get('SELECT name FROM servers WHERE id = ?', serverId);
+    const ch = await db.get('SELECT name FROM channels WHERE id = ?', channelId);
+    const mentions = [...String(text || '').matchAll(/@(\w[\w.-]*)/g)].map((m) => m[1]);
+    const payload = {
+      serverId, channelId, author,
+      serverName: srv?.name, channelName: ch?.name,
+      preview: String(text || '').slice(0, 120), mentions,
+    };
+    if (serverId === DEMO_ID) { io.emit('unread:bump', payload); return; } // public commons: everyone's a member
+    const members = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
+    for (const m of members) {
+      if (m.username === author) continue;
+      if (privacy === 'private' && !isStaffRole(m.role)) continue;
+      io.to(`user:${m.username}`).emit('unread:bump', payload);
+    }
+  }
+
   // Broadcast a server's state to everyone in its room, filtered per-socket (private channels are
   // only sent to owner/admins; each socket also learns its own role).
   async function broadcastServerState(serverId) {
@@ -845,6 +883,35 @@ async function main() {
     if (demo) out.push({ id: demo.id, name: demo.name, owner: demo.owner || null, role: 'member' });
     for (const s of mine) out.push({ id: s.id, name: s.name, owner: s.owner || null, role: s.role });
     return res.json({ servers: out });
+  });
+
+  // Unread message counts per channel, for every server the user belongs to. Only channels the
+  // user can see are included (private channels never leak counts to plain members).
+  app.get('/unreads', authMiddleware, async (req, res) => {
+    const me = req.user.username;
+    const counts = await db.all(
+      `SELECT m.server_id, m.channel_id, COUNT(*) AS n
+       FROM messages m
+       LEFT JOIN channel_reads r ON r.username = ? AND r.server_id = m.server_id AND r.channel_id = m.channel_id
+       WHERE m.ts > COALESCE(r.last_read_ts, 0) AND m.author != ?
+       GROUP BY m.server_id, m.channel_id`,
+      me, me
+    );
+    if (!counts.length) return res.json({ unreads: {} });
+    // Roles for my servers: demo is implicit, others from membership rows.
+    const memberships = await db.all('SELECT server_id, role FROM server_members WHERE username = ?', me);
+    const myRole = new Map([[DEMO_ID, 'member'], ...memberships.map((m) => [m.server_id, m.role])]);
+    const serverIds = [...new Set(counts.map((c) => c.server_id))].filter((id) => myRole.has(id));
+    const unreads = {};
+    for (const sid of serverIds) {
+      const chans = await db.all("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE server_id = ?", sid);
+      const visible = new Set(visibleChannels(chans, myRole.get(sid)).map((c) => c.id));
+      for (const c of counts) {
+        if (c.server_id !== sid || !visible.has(c.channel_id)) continue;
+        (unreads[sid] ||= {})[c.channel_id] = c.n;
+      }
+    }
+    return res.json({ unreads });
   });
 
   // Create a server: the creator becomes its owner + first member.
@@ -1650,6 +1717,7 @@ async function main() {
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
         const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
         socket.emit('messages:init', { serverId, channelId: firstText.id, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
+        await markChannelRead(socketUser, serverId, firstText.id); // history was just shown
       } else {
         socket.emit('messages:init', { serverId, channelId: null, messages: [] });
       }
@@ -1671,6 +1739,17 @@ async function main() {
         const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
         socket.emit('messages:init', { serverId, channelId, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
       }
+      await markChannelRead(socketUser, serverId, channelId);
+    });
+
+    // Client saw new messages in the channel it's viewing — advance its read marker.
+    socket.on('channel:read', async ({ serverId, channelId } = {}) => {
+      if (!socketUser || !serverId || !channelId) return;
+      const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+      if (!ch) return;
+      const myRole = await roleOf(serverId, socketUser);
+      if (!myRole || (ch.privacy === 'private' && !isStaffRole(myRole))) return;
+      await markChannelRead(socketUser, serverId, channelId);
     });
 
     socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment } = {}) => {
@@ -1688,6 +1767,7 @@ async function main() {
       const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE rowid = last_insert_rowid()');
       // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
       io.to(`channel:${serverId}:${channelId}`).emit('message', { ...mapMessageRow(msgRow), serverId, channelId });
+      await emitUnreadBump(serverId, channelId, ch.privacy, author, body);
     });
 
     // Delete a channel message — only the author may delete it. Broadcast removal to the channel.

@@ -876,6 +876,10 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .cc-create:hover:not(:disabled){filter:brightness(1.08)}
 .cc-create:disabled{opacity:.5;cursor:default}
 .dc-channel-lock{margin-left:auto;font-size:11px;opacity:.75}
+/* Unread channel: name pops white + a count pill on the right */
+.dc-channel-item.unread{color:#fff;font-weight:600}
+.dc-channel-unread{margin-left:auto;background:#e0574d;color:#fff;font-size:11px;font-weight:700;line-height:1;border-radius:9px;padding:3px 6px;min-width:18px;text-align:center;flex-shrink:0}
+.dc-channel-lock + .dc-channel-unread{margin-left:6px}
 /* Member row is now a clickable button → opens the public profile card */
 .dc-member-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:transparent;border:none;color:inherit;font:inherit;padding:5px 8px;border-radius:7px;cursor:pointer}
 .dc-member-row:hover{background:rgba(255,255,255,.06)}
@@ -883,6 +887,18 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .dc-member-dot.offline{background:#5c6470}
 .dc-member-role{margin-left:auto;font-size:12px;line-height:1;flex-shrink:0}
 .dc-ctx-empty{padding:8px 12px;color:var(--muted);font-size:12px}
+/* @mention chips in message text (extra pop when it's you) */
+.msg-mention{background:rgba(88,101,242,.25);color:#c9d4ff;border-radius:4px;padding:0 3px;font-weight:600}
+.msg-mention.me{background:rgba(250,166,26,.28);color:#ffd390}
+/* Desktop-notifications setting row */
+.notify-setting{display:flex;align-items:flex-start;gap:12px;margin-bottom:18px}
+.notify-toggle{position:relative;width:44px;height:24px;border-radius:12px;border:none;background:#3a4048;cursor:pointer;flex-shrink:0;transition:background .15s ease;margin-top:2px}
+.notify-toggle.on{background:#23a559}
+.notify-knob{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s ease}
+.notify-toggle.on .notify-knob{left:23px}
+.notify-setting-text{display:flex;flex-direction:column;gap:3px}
+.notify-setting-title{font-weight:600;color:#e6edf5}
+.notify-setting-hint{font-size:12px;color:var(--muted);line-height:1.4}
 /* Brief bottom-center toast for invites / role changes */
 .app-toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#111a24;color:#e6edf5;border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:10px 16px;font-size:14px;box-shadow:0 12px 34px rgba(0,0,0,.5);z-index:600;animation:app-toast-in .18s ease}
 @keyframes app-toast-in{from{opacity:0;transform:translate(-50%,8px)}to{opacity:1;transform:translate(-50%,0)}}

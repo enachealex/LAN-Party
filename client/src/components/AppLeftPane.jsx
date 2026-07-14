@@ -191,6 +191,8 @@ export default function AppLeftPane({
   onLeaveServer,
   onKickMember,
   onSetMemberRole,
+  channelUnreads = {},
+  serverUnreadTotals = {},
 }) {
   const isStaff = myRole === 'owner' || myRole === 'admin'
   const showVoiceOnHome = inVoice && voiceRailTarget === 'home'
@@ -256,6 +258,7 @@ export default function AppLeftPane({
           home
           active={selectedServerId === 'home'}
           voiceActive={showVoiceOnHome}
+          badge={selectedServerId === 'home' ? 0 : totalUnreadMessages}
           onClick={() => onSelectServer?.('home')}
           {...voiceTileProps}
         >
@@ -270,6 +273,7 @@ export default function AppLeftPane({
             title={s.name}
             active={selectedServerId === s.id}
             voiceActive={inVoice && voiceRailTarget === s.id}
+            badge={serverUnreadTotals[s.id] || 0}
             onClick={() => onSelectServer?.(s.id)}
             onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null })}
             {...voiceTileProps}
@@ -310,19 +314,23 @@ export default function AppLeftPane({
                   <span>Text Channels</span>
                   <button type="button" className="dc-dm-add" aria-label="Create Text Channel" onClick={() => onCreateChannel?.('text')}>+</button>
                 </div>
-                {channels.filter((c) => c.type === 'text').map((ch) => (
-                  <button
-                    key={ch.id}
-                    type="button"
-                    className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''}`}
-                    onClick={() => onJoinChannel?.(ch.id)}
-                    onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name })}
-                  >
-                    <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
-                    <span>{ch.name}</span>
-                    {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
-                  </button>
-                ))}
+                {channels.filter((c) => c.type === 'text').map((ch) => {
+                  const unread = channelUnreads[ch.id] || 0
+                  return (
+                    <button
+                      key={ch.id}
+                      type="button"
+                      className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''} ${unread > 0 ? 'unread' : ''}`}
+                      onClick={() => onJoinChannel?.(ch.id)}
+                      onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name })}
+                    >
+                      <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
+                      <span>{ch.name}</span>
+                      {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
+                      {unread > 0 && <span className="dc-channel-unread">{unread > 99 ? '99+' : unread}</span>}
+                    </button>
+                  )
+                })}
               </div>
               <div className="dc-channel-section">
                 <div className="dc-channel-section-label">

@@ -386,14 +386,28 @@ function enlargeUnicodeEmoji(text, keyPrefix) {
 // Render message text, replacing :shortcode: tokens with custom emoji images and
 // enlarging plain unicode emoji to match.
 // `emojiMap` maps name -> url. `onSaveEmoji` lets the user right-click an emoji to save it.
-function renderMessageText(text, emojiMap, onSaveEmoji) {
+function renderMessageText(text, emojiMap, onSaveEmoji, currentUser) {
   if (!text) return null
   const parts = []
   const regex = /:([a-z0-9_]+):/gi
   let last = 0
   let match
   let key = 0
-  const pushText = (chunk) => { if (chunk) parts.push(...[].concat(enlargeUnicodeEmoji(chunk, `t${key++}`))) }
+  // Split out @mentions so they render as highlighted chips (extra pop when it's you).
+  const pushPlain = (chunk) => { if (chunk) parts.push(...[].concat(enlargeUnicodeEmoji(chunk, `t${key++}`))) }
+  const pushText = (chunk) => {
+    if (!chunk) return
+    const mentionRe = /@(\w[\w.-]*)/g
+    let mLast = 0
+    let mm
+    while ((mm = mentionRe.exec(chunk)) !== null) {
+      if (mm.index > mLast) pushPlain(chunk.slice(mLast, mm.index))
+      const isMe = currentUser && mm[1].toLowerCase() === String(currentUser).toLowerCase()
+      parts.push(<span key={`m${key++}`} className={`msg-mention${isMe ? ' me' : ''}`}>@{mm[1]}</span>)
+      mLast = mm.index + mm[0].length
+    }
+    pushPlain(chunk.slice(mLast))
+  }
   const hasCustom = emojiMap && Object.keys(emojiMap).length > 0
   while (hasCustom && (match = regex.exec(text)) !== null) {
     const url = emojiMap[match[1]]
@@ -589,7 +603,7 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
           ) : (
             message.text && !textMedia && (
               <div className="msg-text">
-                {renderMessageText(message.text, emojiMap, onSaveEmoji)}
+                {renderMessageText(message.text, emojiMap, onSaveEmoji, currentUser)}
                 {message.edited && <span className="msg-edited"> (edited)</span>}
               </div>
             )
@@ -851,6 +865,13 @@ export default function App() {
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
   const [serversList, setServersList] = useState([])
+  // Unread channel-message counts: { [serverId]: { [channelId]: n } } (loaded from /unreads,
+  // bumped live by unread:bump, cleared when a channel is viewed).
+  const [channelUnreads, setChannelUnreads] = useState({})
+  // Desktop notifications preference (persisted locally; Notification.permission gates actual use).
+  const [notifyEnabled, setNotifyEnabled] = useState(() => localStorage.getItem('lanparty_notify') === '1')
+  const notifyEnabledRef = useRef(notifyEnabled)
+  useEffect(() => { notifyEnabledRef.current = notifyEnabled }, [notifyEnabled])
   // Create-channel modal (name + type + privacy); channelModalType pre-selects the clicked section.
   const [showChannelModal, setShowChannelModal] = useState(false)
   const [channelModalType, setChannelModalType] = useState('text')
@@ -1688,6 +1709,7 @@ export default function App() {
       loadFriendsData(authToken)
       loadMessagesData(authToken)
       loadServers()
+      loadUnreads()
     })
     s.on('friend:pending-updated', () => loadFriendsData(authToken))
     s.on('friend:list-updated', () => { loadFriendsData(authToken); loadMessagesData(authToken) })
@@ -1708,13 +1730,13 @@ export default function App() {
       const chatKey = chatStorageKey(fromUserId)
       appendHomeMessage(chatKey, message)
       updateDmConversationPreview(fromUserId, fromUsername, message)
-      if (
-        homeChatRef.current?.peerUsername === fromUsername &&
+      const viewingThisDm = homeChatRef.current?.peerUsername === fromUsername &&
         selectedServerIdRef.current === 'home'
-      ) {
+      if (viewingThisDm && !document.hidden) {
         markConversationRead(fromUsername, authToken)
       } else {
         loadMessagesData(authToken)
+        maybeNotify('dm', { author: fromUsername, preview: (message?.text || '').slice(0, 120) || 'New direct message' })
       }
     })
     s.on('server:state', (data) => {
@@ -1751,18 +1773,39 @@ export default function App() {
       const msgs = Array.isArray(payload) ? payload : (payload && payload.messages) || []
       setMessages(oldestMessagesFirst(msgs))
     })
-    s.on('channel:joined', ({ channelId } = {}) => { if (channelId) setActiveChannel(channelId) })
+    s.on('channel:joined', ({ serverId, channelId } = {}) => {
+      if (!channelId) return
+      setActiveChannel(channelId)
+      clearChannelUnread(serverId || selectedServerIdRef.current, channelId)
+    })
     s.on('message', (msg) => {
       // Drop messages that aren't for the server+channel currently on screen (rooms should already
       // guarantee this; the tag check is belt & braces against any stale room membership).
       if (msg && msg.serverId && msg.channelId) {
         const viewServer = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
         if (msg.serverId !== viewServer || msg.channelId !== activeChannelRef.current) return
+        // We're looking at this channel right now — advance our read marker so a reload
+        // doesn't count what we just watched arrive.
+        if (selectedServerIdRef.current !== 'home') s.emit('channel:read', { serverId: msg.serverId, channelId: msg.channelId })
       }
       setMessages(prev => {
         if (prev.some((m) => m.id === msg.id)) return prev
         return oldestMessagesFirst([...prev, msg])
       })
+    })
+    // A channel got a new message somewhere — bump its unread badge unless we're watching it.
+    s.on('unread:bump', (bump = {}) => {
+      const { serverId, channelId, author } = bump
+      if (!serverId || !channelId) return
+      if (author && author === userName) return // our own message
+      const viewingIt = selectedServerIdRef.current === serverId && activeChannelRef.current === channelId
+      if (viewingIt && !document.hidden) { s.emit('channel:read', { serverId, channelId }); return }
+      setChannelUnreads((prev) => {
+        const srv = { ...(prev[serverId] || {}) }
+        srv[channelId] = (srv[channelId] || 0) + 1
+        return { ...prev, [serverId]: srv }
+      })
+      maybeNotify('channel', bump)
     })
     // A server was created/removed somewhere — refresh the rail.
     s.on('servers:updated', () => { loadServers() })
@@ -2088,7 +2131,82 @@ export default function App() {
   const joinChannel = (channelId) => {
     if (!socket) return
     setActiveChannel(channelId)
-    socket.emit('joinChannel', { serverId: currentServerId(), channelId })
+    const serverId = currentServerId()
+    socket.emit('joinChannel', { serverId, channelId })
+    clearChannelUnread(serverId, channelId)
+  }
+
+  // Viewing a channel zeroes its badge (the server's read marker is advanced by joinChannel /
+  // channel:read on its side).
+  const clearChannelUnread = (serverId, channelId) => {
+    setChannelUnreads((prev) => {
+      if (!prev[serverId]?.[channelId]) return prev
+      const srv = { ...prev[serverId] }
+      delete srv[channelId]
+      return { ...prev, [serverId]: srv }
+    })
+  }
+
+  const loadUnreads = async () => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) return
+    try {
+      const res = await fetch(`${SERVER_URL}/unreads`, { headers: { Authorization: `Bearer ${t}` } })
+      if (!res.ok) return
+      const data = await res.json()
+      setChannelUnreads(data.unreads || {})
+    } catch (e) { /* offline — badges just stay stale */ }
+  }
+
+  // Coming back to a hidden tab while a channel is on screen counts as reading it.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.hidden) return
+      const serverId = selectedServerIdRef.current
+      const channelId = activeChannelRef.current
+      if (serverId && serverId !== 'home' && channelId) {
+        clearChannelUnread(serverId, channelId)
+        socketRef.current?.emit('channel:read', { serverId, channelId })
+      }
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [])
+
+  // Desktop notification for activity you'd otherwise miss (tab hidden, or a DM/@mention while
+  // you're elsewhere in the app). Gated on the Settings toggle + browser permission.
+  const maybeNotify = (kind, info = {}) => {
+    if (!notifyEnabledRef.current) return
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+    const me = localStorage.getItem('lanparty_user')
+    const mentioned = (info.mentions || []).includes(me)
+    // Channel chatter only notifies when hidden; @mentions and DMs also notify while visible.
+    if (kind === 'channel' && !document.hidden && !mentioned) return
+    try {
+      const title = kind === 'dm'
+        ? `💬 ${info.author}`
+        : `${mentioned ? '🔔' : '#'} ${info.channelName || 'channel'} · ${info.serverName || 'LAN Party'}`
+      const body = kind === 'dm'
+        ? (info.preview || 'New direct message')
+        : `${info.author}: ${info.preview || 'New message'}`
+      const n = new Notification(title, { body, tag: `lanparty-${kind}-${info.serverId || 'dm'}-${info.channelId || info.author}`, silent: false })
+      n.onclick = () => { window.focus(); n.close() }
+    } catch (e) { /* some browsers throw for backgrounded pages — badge still updates */ }
+  }
+
+  // Settings toggle: turning ON asks the browser for permission first.
+  const toggleNotifications = async () => {
+    if (notifyEnabled) {
+      setNotifyEnabled(false)
+      localStorage.setItem('lanparty_notify', '0')
+      return
+    }
+    if (typeof Notification === 'undefined') { alert('This browser does not support desktop notifications.'); return }
+    let perm = Notification.permission
+    if (perm === 'default') perm = await Notification.requestPermission()
+    if (perm !== 'granted') { alert('Notifications are blocked for this site — allow them in your browser settings, then try again.'); return }
+    setNotifyEnabled(true)
+    localStorage.setItem('lanparty_notify', '1')
   }
 
   const sendMessage = async () => {
@@ -2884,6 +3002,10 @@ export default function App() {
   const isHomeView = selectedServerId === 'home'
   // Channels of the server on screen; the active channel's type drives which panel renders.
   const serverChannels = serverState?.server?.channels || []
+  // Total unreads per server for the rail badges.
+  const serverUnreadTotals = Object.fromEntries(
+    Object.entries(channelUnreads).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
+  )
   const activeChannelObj = serverChannels.find((c) => c.id === activeChannel)
   const activeChannelType = activeChannelObj ? activeChannelObj.type : 'text'
   const activeChannelName = activeChannelObj?.name || activeChannel
@@ -3940,6 +4062,8 @@ export default function App() {
         onLeaveServer={leaveServer}
         onKickMember={kickMember}
         onSetMemberRole={setMemberRole}
+        channelUnreads={channelUnreads[selectedServerId] || {}}
+        serverUnreadTotals={serverUnreadTotals}
       />
 
       <div className="main">
@@ -5003,6 +5127,28 @@ export default function App() {
                 ))}
               </div>
             )}
+
+            {/* Desktop notifications */}
+            <h3 className="profile-settings-section-title">🔔 Notifications</h3>
+            <div className="notify-setting">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={notifyEnabled}
+                className={`notify-toggle ${notifyEnabled ? 'on' : ''}`}
+                onClick={toggleNotifications}
+              >
+                <span className="notify-knob" aria-hidden="true" />
+              </button>
+              <div className="notify-setting-text">
+                <span className="notify-setting-title">Desktop notifications</span>
+                <span className="notify-setting-hint">
+                  {notifyEnabled
+                    ? 'On — DMs and @mentions always notify; channel messages notify when the app is in the background.'
+                    : 'Get notified about DMs, @mentions and channel activity when you look away.'}
+                </span>
+              </div>
+            </div>
 
             {/* Account info */}
             <h3 className="profile-settings-section-title">Account</h3>
