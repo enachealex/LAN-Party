@@ -596,14 +596,27 @@ function TicTacToe({ state, me, onEvent }) {
   const myMark = isX ? 'X' : isO ? 'O' : null
   const seatsOpen = !state.players.X || !state.players.O
   const myTurn = joined && state.winner == null && myMark === state.turn
+  const scores = state.scores || {}
+  const draws = state.draws || 0
+  const winnerName = state.winner && state.winner !== 'draw' ? state.players[state.winner] : null
   const status = state.winner === 'draw' ? "It's a draw!"
-    : state.winner ? `${state.winner} wins! 🎉`
+    : state.winner ? `${winnerName || state.winner} wins! 🎉`
     : !state.players.X || !state.players.O ? 'Waiting for players…'
     : `${state.turn}'s turn`
+  const bothSeated = state.players.X && state.players.O
+  const xScore = scores[state.players.X] || 0
+  const oScore = scores[state.players.O] || 0
   return (
     <div className="ttt-activity">
       <div className="ttt-status">{status}</div>
       <div className="ttt-players">{state.players.X || '—'} (X) vs {state.players.O || '—'} (O)</div>
+      {bothSeated && (
+        <div className="ttt-scoreboard" title="Wins this session">
+          <span className={`ttt-score${xScore > oScore ? ' leading' : ''}`}><b>{state.players.X}</b> {xScore}</span>
+          <span className="ttt-score ttt-score-draws">🤝 {draws}</span>
+          <span className={`ttt-score${oScore > xScore ? ' leading' : ''}`}>{oScore} <b>{state.players.O}</b></span>
+        </div>
+      )}
       <div className="ttt-board">
         {state.board.map((c, i) => (
           <button key={i} type="button" className={`ttt-cell${c ? ' filled' : ''}`} disabled={!myTurn || !!c || state.winner != null} onClick={() => onEvent({ kind: 'move', i })}>{c}</button>

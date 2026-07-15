@@ -1262,3 +1262,10 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 
 /* App logo (The Jump Vault mark) on the sign-in card */
 .auth-logo{display:block;width:84px;height:84px;object-fit:contain;margin-bottom:10px;filter:drop-shadow(0 4px 14px rgba(0,0,0,.35))}
+
+/* Tic-Tac-Toe session scoreboard */
+.ttt-scoreboard{display:flex;align-items:center;gap:14px;background:#0b1016;border:1px solid rgba(255,255,255,.1);border-radius:9px;padding:7px 16px;font-size:13.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.ttt-score b{color:var(--text);font-weight:700}
+.ttt-score.leading{color:#f0a020}
+.ttt-score.leading b{color:#f0a020}
+.ttt-score-draws{opacity:.8;font-size:12.5px}

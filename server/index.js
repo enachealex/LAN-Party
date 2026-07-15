@@ -327,7 +327,7 @@ async function main() {
     if (type === 'watch') return { videoId: null, playing: false, time: 0, ts: Date.now() };
     if (type === 'whiteboard') return { strokes: [] };
     if (type === 'poll') return { question: '', options: [], closed: false };
-    if (type === 'ttt') return { board: Array(9).fill(''), turn: 'X', players: {}, winner: null };
+    if (type === 'ttt') return { board: Array(9).fill(''), turn: 'X', players: {}, winner: null, scores: {}, draws: 0, round: 1 };
     if (type === 'sketch') return { phase: 'lobby', players: [], turnIdx: 0, totalTurns: 0, word: null, wordMask: '', strokes: [], guesses: [], solvedBy: [], lastResult: null };
     // music: shared queue + synced playback (pos anchored to server time ts, like 'watch').
     if (type === 'music') return { queue: [], index: -1, playing: false, pos: 0, ts: Date.now(), history: [] };
@@ -373,8 +373,14 @@ async function main() {
       if (ev.kind === 'join') { if (!s.players.X) s.players.X = user; else if (!s.players.O && s.players.X !== user) s.players.O = user; }
       else if (ev.kind === 'move' && s.winner == null) {
         const mark = s.players.X === user ? 'X' : (s.players.O === user ? 'O' : null);
-        if (mark && mark === s.turn && ev.i >= 0 && ev.i < 9 && !s.board[ev.i]) { s.board[ev.i] = mark; s.turn = mark === 'X' ? 'O' : 'X'; s.winner = tttWinner(s.board); }
-      } else if (ev.kind === 'reset') { s.board = Array(9).fill(''); s.turn = 'X'; s.winner = null; }
+        if (mark && mark === s.turn && ev.i >= 0 && ev.i < 9 && !s.board[ev.i]) {
+          s.board[ev.i] = mark; s.turn = mark === 'X' ? 'O' : 'X'; s.winner = tttWinner(s.board);
+          // Round just ended — put it on the scoreboard (moves are rejected once winner is set,
+          // so this runs exactly once per round).
+          if (s.winner === 'X' || s.winner === 'O') { const name = s.players[s.winner]; if (name) s.scores[name] = (s.scores[name] || 0) + 1; }
+          else if (s.winner === 'draw') s.draws = (s.draws || 0) + 1;
+        }
+      } else if (ev.kind === 'reset') { s.board = Array(9).fill(''); s.turn = 'X'; s.winner = null; s.round = (s.round || 1) + 1; }
     } else if (act.type === 'sketch') {
       const drawer = sketchDrawer(s);
       if (ev.kind === 'join' && s.phase === 'lobby' && s.players.length < 8 && !s.players.some((p) => p.name === user)) {
