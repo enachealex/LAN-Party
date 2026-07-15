@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useLayoutEffect } from 'react'
+import React, { useEffect, useState, useRef, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 
 // Debounce utility
@@ -429,7 +429,20 @@ function renderMessageText(text, emojiMap, onSaveEmoji, currentUser) {
   return parts.length ? parts : text
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab }) {
+// Short one-line preview of a message for the pin bar / pin list / forward confirmation.
+function pinPreview(m) {
+  if (!m) return ''
+  const bodyMedia = m.attachment || mediaFromText(m.text)
+  if (m.text && !mediaFromText(m.text)) return m.text.length > 90 ? m.text.slice(0, 90) + '…' : m.text
+  if (bodyMedia) {
+    if (isGifAttachment(bodyMedia)) return '🎞 GIF'
+    if (isImageAttachment(bodyMedia)) return '📷 Image'
+    return '📎 ' + (bodyMedia.name || 'Attachment')
+  }
+  return m.text || '(empty message)'
+}
+
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, isPinned }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
   const [showTimestamp, setShowTimestamp] = useState(false)
@@ -527,7 +540,7 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
   }
 
   return (
-    <div className={`msg-row ${isOutgoing ? 'outgoing' : 'incoming'}`}>
+    <div className={`msg-row ${isOutgoing ? 'outgoing' : 'incoming'}${isPinned ? ' pinned' : ''}`} data-mid={message.id}>
       <div
         className={`msg-stack ${isToolbarActive ? 'toolbar-open' : ''}`}
         onMouseEnter={showToolbar}
@@ -563,9 +576,13 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
           >
             {canEdit && <button type="button" role="menuitem" onClick={startEdit}>Edit</button>}
             {collabImage && onCollab && <button type="button" role="menuitem" onClick={handleCollab}>Edit together</button>}
-            <button type="button" role="menuitem">Forward</button>
+            {onForward && <button type="button" role="menuitem" onClick={() => { onForward(message); setMenuOpen(false) }}>Forward</button>}
             <button type="button" role="menuitem" onClick={copyMessage}>Copy</button>
-            <button type="button" role="menuitem">Pin</button>
+            {(onPin || onUnpin) && (
+              isPinned
+                ? <button type="button" role="menuitem" onClick={() => { onUnpin?.(message.id); setMenuOpen(false) }}>Unpin</button>
+                : <button type="button" role="menuitem" onClick={() => { onPin?.(message.id); setMenuOpen(false) }}>Pin</button>
+            )}
             {canDelete && <button type="button" role="menuitem" className="danger" onClick={handleDelete}>Delete</button>}
           </div>,
           document.body
@@ -868,6 +885,11 @@ export default function App() {
   // Unread channel-message counts: { [serverId]: { [channelId]: n } } (loaded from /unreads,
   // bumped live by unread:bump, cleared when a channel is viewed).
   const [channelUnreads, setChannelUnreads] = useState({})
+  // Pinned messages of the currently-viewed channel, newest pin first (from pins:updated).
+  const [channelPins, setChannelPins] = useState([])
+  const [showPinsModal, setShowPinsModal] = useState(false)   // "View Pins" list
+  const [pinBarMenu, setPinBarMenu] = useState(null)          // right-click menu on the pin bar: {x,y}
+  const [forwardMsg, setForwardMsg] = useState(null)          // message being forwarded (opens the picker)
   // Desktop notifications preference (persisted locally; Notification.permission gates actual use).
   const [notifyEnabled, setNotifyEnabled] = useState(() => localStorage.getItem('lanparty_notify') === '1')
   const notifyEnabledRef = useRef(notifyEnabled)
@@ -1798,7 +1820,13 @@ export default function App() {
     s.on('channel:joined', ({ serverId, channelId } = {}) => {
       if (!channelId) return
       setActiveChannel(channelId)
+      setChannelPins([]) // cleared until the fresh pins:updated for this channel arrives
       clearChannelUnread(serverId || selectedServerIdRef.current, channelId)
+    })
+    // Pinned-message list for a channel changed (or arrived on join).
+    s.on('pins:updated', ({ serverId, channelId, pins } = {}) => {
+      const viewServer = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
+      if (serverId === viewServer && channelId === activeChannelRef.current) setChannelPins(pins || [])
     })
     s.on('message', (msg) => {
       // Drop messages that aren't for the server+channel currently on screen (rooms should already
@@ -3035,6 +3063,8 @@ export default function App() {
   const isHomeView = selectedServerId === 'home'
   // Channels of the server on screen; the active channel's type drives which panel renders.
   const serverChannels = serverState?.server?.channels || []
+  // Ids of pinned messages in the current channel (for the Pin/Unpin menu toggle).
+  const pinnedIdSet = useMemo(() => new Set(channelPins.map((p) => p.id)), [channelPins])
   // Total unreads per server for the rail badges.
   const serverUnreadTotals = Object.fromEntries(
     Object.entries(channelUnreads).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
@@ -3336,6 +3366,57 @@ export default function App() {
   const deleteChannelMessage = (messageId) => {
     if (!socket || !messageId) return
     socket.emit('message:delete', { serverId: currentServerId(), channelId: activeChannel, id: messageId })
+  }
+
+  // ---- Pinning (channel messages) ----
+  const pinMessage = (messageId) => { if (socket && messageId) socket.emit('message:pin', { id: messageId }) }
+  const unpinMessage = (messageId) => { if (socket && messageId) socket.emit('message:unpin', { id: messageId }) }
+  // Scroll a message into view and flash it. Used from the pin bar and the View Pins list.
+  const jumpToMessage = (messageId) => {
+    setShowPinsModal(false)
+    setPinBarMenu(null)
+    const list = messagesListRef.current
+    if (!list) return
+    const el = list.querySelector(`[data-mid="${CSS.escape(String(messageId))}"]`)
+    if (!el) return // not currently loaded (e.g. very old) — nothing to scroll to
+    stickToBottomRef.current = false // jumping away from the bottom on purpose
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    el.classList.add('msg-jump-flash')
+    setTimeout(() => el.classList.remove('msg-jump-flash'), 1600)
+  }
+
+  // ---- Forwarding: copy a message's content to another channel or DM ----
+  const openForward = (message) => setForwardMsg(message)
+  const forwardToTarget = async (target) => {
+    const m = forwardMsg
+    setForwardMsg(null)
+    if (!m || !target) return
+    const payload = { text: m.text || '', attachment: m.attachment || null }
+    try {
+      if (target.kind === 'channel') {
+        socket?.emit('message', { serverId: target.serverId, channelId: target.channelId, ...payload })
+      } else if (target.kind === 'dm') {
+        const t = token || localStorage.getItem('lanparty_token')
+        const res = await fetch(`${SERVER_URL}/messages/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+          body: JSON.stringify({ toUsername: target.peerUsername, ...payload }),
+        })
+        if (!res.ok) throw new Error((await res.json()).error || 'Forward failed')
+        loadMessagesData()
+      }
+      setToast(`Forwarded to ${target.label}`)
+    } catch (e) { setToast(e.message || 'Could not forward') }
+  }
+  // Destinations for the forward picker: text channels in the current server + existing DM threads.
+  const forwardTargets = () => {
+    const chans = (serverChannels || [])
+      .filter((c) => c.type === 'text')
+      .map((c) => ({ kind: 'channel', serverId: currentServerId(), channelId: c.id, label: `# ${c.name}` }))
+    const dms = (dmConversations || [])
+      .filter((c) => c.peerUsername || c.name)
+      .map((c) => ({ kind: 'dm', peerUsername: c.peerUsername || c.name, label: `@ ${c.peerUsername || c.name}` }))
+    return { chans, dms }
   }
 
   // Delete a home-chat message. DMs are persisted (server DELETE + broadcast); groups are local.
@@ -4151,6 +4232,7 @@ export default function App() {
                       onOpenMedia={(attachment) => openLightbox(homeChatMessages, attachment)}
                       emojiMap={emojiMap}
                       onSaveEmoji={saveCustomEmojiFromChat}
+                      onForward={openForward}
                     />
                   ))
                 )}
@@ -4172,6 +4254,22 @@ export default function App() {
 
           {!isHomeView && activeChannelType === 'text' && (
             <>
+              {channelPins.length > 0 && (
+                <button
+                  type="button"
+                  className="pin-bar"
+                  onClick={() => jumpToMessage(channelPins[0].id)}
+                  onContextMenu={(e) => { e.preventDefault(); setPinBarMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 90) }) }}
+                  title="Click to view · right-click for options"
+                >
+                  <span className="pin-bar-icon">📌</span>
+                  <span className="pin-bar-body">
+                    <span className="pin-bar-author">{channelPins[0].author}</span>
+                    <span className="pin-bar-text">{pinPreview(channelPins[0])}</span>
+                  </span>
+                  {channelPins.length > 1 && <span className="pin-bar-count">{channelPins.length} pins</span>}
+                </button>
+              )}
               <div ref={messagesListRef} className={`${messages.length === 0 ? 'messages empty' : 'messages'} flow-${messageFlow}`}>
                 {messages.length === 0 ? (
                   <div className="empty-state">
@@ -4194,6 +4292,10 @@ export default function App() {
                       onOpenMedia={(attachment) => openLightbox(messages, attachment)}
                       emojiMap={emojiMap}
                       onSaveEmoji={saveCustomEmojiFromChat}
+                      onForward={openForward}
+                      onPin={pinMessage}
+                      onUnpin={unpinMessage}
+                      isPinned={pinnedIdSet.has(m.id)}
                     />
                   ))
                 )}
@@ -4462,6 +4564,72 @@ export default function App() {
         </div>
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
+
+      {/* Right-click menu on the pin bar: View Pins / Unpin the latest */}
+      {pinBarMenu && createPortal(
+        <>
+          <div className="dc-ctx-backdrop" onClick={() => setPinBarMenu(null)} onContextMenu={(e) => { e.preventDefault(); setPinBarMenu(null) }} />
+          <div className="dc-ctx-menu" style={{ left: pinBarMenu.x, top: pinBarMenu.y }} role="menu">
+            <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setPinBarMenu(null); setShowPinsModal(true) }}>📌 View pins</button>
+            <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { const top = channelPins[0]; setPinBarMenu(null); if (top) unpinMessage(top.id) }}>✖ Unpin latest</button>
+          </div>
+        </>,
+        document.body
+      )}
+
+      {/* View Pins modal — every pinned message; click one to jump to it */}
+      {showPinsModal && createPortal(
+        <div className="pins-overlay" onClick={() => setShowPinsModal(false)}>
+          <div className="pins-modal" role="dialog" aria-label="Pinned messages" onClick={(e) => e.stopPropagation()}>
+            <div className="pins-head">
+              <span>📌 Pinned messages — {channelPins.length}</span>
+              <button type="button" className="discover-close" onClick={() => setShowPinsModal(false)} aria-label="Close">✕</button>
+            </div>
+            <div className="pins-list">
+              {channelPins.length === 0 && <div className="pins-empty">No pinned messages.</div>}
+              {channelPins.map((p) => (
+                <div key={p.id} className="pins-item">
+                  <button type="button" className="pins-item-main" onClick={() => jumpToMessage(p.id)}>
+                    <span className="pins-item-author">{p.author}</span>
+                    <span className="pins-item-text">{pinPreview(p)}</span>
+                    {p.pinnedBy && <span className="pins-item-by">pinned by {p.pinnedBy}</span>}
+                  </button>
+                  <button type="button" className="pins-item-unpin" title="Unpin" onClick={() => unpinMessage(p.id)}>✖</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Forward picker — send a copy of a message to a channel or DM */}
+      {forwardMsg && createPortal(
+        <div className="pins-overlay" onClick={() => setForwardMsg(null)}>
+          <div className="pins-modal" role="dialog" aria-label="Forward message" onClick={(e) => e.stopPropagation()}>
+            <div className="pins-head">
+              <span>↪ Forward message</span>
+              <button type="button" className="discover-close" onClick={() => setForwardMsg(null)} aria-label="Close">✕</button>
+            </div>
+            <div className="fwd-preview"><span className="pins-item-author">{forwardMsg.author}</span> <span className="pins-item-text">{pinPreview(forwardMsg)}</span></div>
+            {(() => { const { chans, dms } = forwardTargets(); return (
+              <div className="pins-list">
+                {chans.length > 0 && <div className="fwd-group">Channels in {serverName}</div>}
+                {chans.map((t) => (
+                  <button key={`c-${t.channelId}`} type="button" className="fwd-target" onClick={() => forwardToTarget(t)}>{t.label}</button>
+                ))}
+                {dms.length > 0 && <div className="fwd-group">Direct messages</div>}
+                {dms.map((t, i) => (
+                  <button key={`d-${t.peerUsername}-${i}`} type="button" className="fwd-target" onClick={() => forwardToTarget(t)}>{t.label}</button>
+                ))}
+                {chans.length === 0 && dms.length === 0 && <div className="pins-empty">Nowhere to forward to yet — join a server or start a DM.</div>}
+              </div>
+            ) })()}
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* Watch / Discover — who's live right now (in-app screen shares + Twitch/YouTube/Kik) */}
       {showDiscover && (() => {
         const inAppStreams = discoverStreams.filter((s) => s.kind !== 'external')

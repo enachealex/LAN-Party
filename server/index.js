@@ -294,6 +294,17 @@ async function main() {
   } catch (err) {
     /* column already exists */
   }
+  // Pinned channel messages: pinned_at (ms, NULL = not pinned) + who pinned it.
+  try {
+    await db.run(`ALTER TABLE messages ADD COLUMN pinned_at INTEGER`);
+  } catch (err) {
+    /* column already exists */
+  }
+  try {
+    await db.run(`ALTER TABLE messages ADD COLUMN pinned_by TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
 
   // Seed demo server and channels if missing
   const demo = await db.get('SELECT id FROM servers WHERE id = ?', 'demo');
@@ -583,7 +594,18 @@ async function main() {
       ts: row.ts,
       attachment: parseAttachment(row.attachment_json),
       reactions: formatReactions(parseReactions(row.reactions_json), forUsername),
+      pinnedAt: row.pinned_at || null,
+      pinnedBy: row.pinned_by || null,
     };
+  }
+
+  // Pinned messages of a channel, newest pin first (so pins[0] is what the pinned bar shows).
+  async function channelPins(serverId, channelId, forUsername) {
+    const rows = await db.all(
+      'SELECT id, author, text, ts, attachment_json, reactions_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
+      serverId, channelId
+    );
+    return (rows || []).map((m) => mapMessageRow(m, forUsername));
   }
 
   // Toggle a user's reaction on a message row (table = 'messages' | 'direct_messages').
@@ -2156,8 +2178,9 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       socket.join(`channel:${serverId}:${channelId}`);
       socket.emit('channel:joined', { serverId, channelId });
       if (ch.type === 'text') {
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
         socket.emit('messages:init', { serverId, channelId, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
+        socket.emit('pins:updated', { serverId, channelId, pins: await channelPins(serverId, channelId, socketUser) });
       }
       await markChannelRead(socketUser, serverId, channelId);
     });
@@ -2199,6 +2222,32 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       if (!row || row.author !== info.name) return; // not found or not the author
       await db.run('DELETE FROM messages WHERE id = ?', id);
       io.to(`channel:${row.server_id}:${row.channel_id}`).emit('message:deleted', { id });
+    });
+
+    // Pin / unpin a channel message. Any member who can see the channel may pin (party app). The
+    // pinned list is broadcast to the channel; newest pin is first so the bar shows the latest.
+    const pinGate = async (id) => {
+      const row = await db.get('SELECT id, server_id, channel_id FROM messages WHERE id = ?', id);
+      if (!row) return null;
+      const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", row.channel_id, row.server_id);
+      if (!ch) return null;
+      const myRole = await roleOf(row.server_id, socketUser);
+      if (!myRole || (ch.privacy === 'private' && !isStaffRole(myRole))) return null;
+      return row;
+    };
+    socket.on('message:pin', async ({ id } = {}) => {
+      if (!id) return;
+      const row = await pinGate(id);
+      if (!row) return;
+      await db.run('UPDATE messages SET pinned_at = ?, pinned_by = ? WHERE id = ?', Date.now(), socketUser, id);
+      io.to(`channel:${row.server_id}:${row.channel_id}`).emit('pins:updated', { serverId: row.server_id, channelId: row.channel_id, pins: await channelPins(row.server_id, row.channel_id, socketUser) });
+    });
+    socket.on('message:unpin', async ({ id } = {}) => {
+      if (!id) return;
+      const row = await pinGate(id);
+      if (!row) return;
+      await db.run('UPDATE messages SET pinned_at = NULL, pinned_by = NULL WHERE id = ?', id);
+      io.to(`channel:${row.server_id}:${row.channel_id}`).emit('pins:updated', { serverId: row.server_id, channelId: row.channel_id, pins: await channelPins(row.server_id, row.channel_id, socketUser) });
     });
 
     // Toggle a persisted reaction. scope 'channel' (broadcast to channel) or 'dm' (both peers).
