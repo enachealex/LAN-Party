@@ -35,7 +35,7 @@ export default function ActivityPanel({ activity, me, onEvent, onClose }) {
         <button type="button" className="activity-close" onClick={onClose} title="End this activity for everyone" aria-label="End activity">✕ End</button>
       </div>
       <div className="activity-body">
-        {type === 'music' && <MusicActivity state={state} onEvent={onEvent} />}
+        {type === 'music' && <MusicActivity state={state} me={me} onEvent={onEvent} />}
         {type === 'watch' && <WatchTogether state={state} onEvent={onEvent} />}
         {type === 'whiteboard' && <Whiteboard state={state} onEvent={onEvent} />}
         {type === 'poll' && <PollActivity state={state} me={me} onEvent={onEvent} />}
@@ -54,49 +54,258 @@ const fmtTime = (secs) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
-function MusicActivity({ state, onEvent }) {
+// Spotify token store (per browser). expires_at is pre-shaved by 60s at write time.
+const SPOTIFY_LS_KEY = 'lanparty_spotify'
+const readSpotifyToken = () => { try { return JSON.parse(localStorage.getItem(SPOTIFY_LS_KEY) || 'null') } catch { return null } }
+
+function MusicActivity({ state, me, onEvent }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState(null) // null = nothing searched yet
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [configured, setConfigured] = useState(true)
+  const [spConfigured, setSpConfigured] = useState(false)
+  const [svc, setSvc] = useState('youtube') // which service the search column targets
+  const [spLinked, setSpLinked] = useState(() => !!readSpotifyToken())
+  const [spDeviceReady, setSpDeviceReady] = useState(false)
   const [duration, setDuration] = useState(0)
   const [progress, setProgress] = useState(0)
   const [needsGesture, setNeedsGesture] = useState(false)
+  const [playlists, setPlaylists] = useState(null) // null = panel closed
   const [volume, setVolume] = useState(() => { const v = parseFloat(localStorage.getItem('lanparty_music_vol')); return Number.isFinite(v) ? v : 0.8 })
   const audioRef = useRef(null)
   const curTrackIdRef = useRef(null)
   const retriedRef = useRef(null) // track id we already retried with ?fresh=1
+  const spPlayerRef = useRef(null)
+  const spDeviceRef = useRef(null)
+  const spUriRef = useRef(null)      // last uri we told Spotify to play
+  const spRefreshRef = useRef(null)  // in-flight token refresh (dedupes concurrent callers)
+  const spProgressedRef = useRef(false) // seen real playback on the current uri (for end detection)
+  const currentRef = useRef(null)    // current track, for SDK listeners
+  const onEventRef = useRef(onEvent)
+  useEffect(() => { onEventRef.current = onEvent }, [onEvent])
   const token = localStorage.getItem('lanparty_token') || ''
 
   const current = state.index >= 0 ? state.queue[state.index] : null
+  useEffect(() => { currentRef.current = current }, [current])
+  const djLocked = !!state.dj && state.dj !== me // a DJ is on deck and it isn't you
   // Where the room's playhead is right now (pos anchored at server-time ts).
   const sharedPos = () => (state.pos || 0) + (state.playing ? (Date.now() - (state.ts || Date.now())) / 1000 : 0)
 
   useEffect(() => {
     fetch(`${SERVER_URL}/music/status`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json()).then((d) => setConfigured(!!d.configured)).catch(() => {})
+    fetch(`${SERVER_URL}/music/spotify/status`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json()).then((d) => setSpConfigured(!!d.configured)).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // ---- Spotify auth ----
+  // Returns a live access token, refreshing through the server when it's stale.
+  const freshSpotifyToken = async (force = false) => {
+    const t = readSpotifyToken()
+    if (!t) return null
+    if (!force && t.expires_at > Date.now()) return t.access_token
+    if (!t.refresh_token) { localStorage.removeItem(SPOTIFY_LS_KEY); setSpLinked(false); return null }
+    // Dedupe concurrent refreshes: a rotated refresh_token from one call would invalidate the
+    // others, so share a single in-flight request.
+    if (spRefreshRef.current) return spRefreshRef.current
+    spRefreshRef.current = (async () => {
+      try {
+        const r = await fetch(`${SERVER_URL}/music/spotify/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ refresh_token: t.refresh_token }),
+        })
+        if (!r.ok) throw new Error('refresh failed')
+        const d = await r.json()
+        const next = { access_token: d.access_token, refresh_token: d.refresh_token || t.refresh_token, expires_at: Date.now() + ((d.expires_in || 3600) - 60) * 1000 }
+        localStorage.setItem(SPOTIFY_LS_KEY, JSON.stringify(next))
+        setSpLinked(true)
+        return next.access_token
+      } catch {
+        localStorage.removeItem(SPOTIFY_LS_KEY)
+        setSpLinked(false)
+        return null
+      } finally {
+        spRefreshRef.current = null
+      }
+    })()
+    return spRefreshRef.current
+  }
+
+  const connectSpotify = async () => {
+    try {
+      const r = await fetch(`${SERVER_URL}/music/spotify/login-url?client_origin=${encodeURIComponent(window.location.origin)}`, { headers: { Authorization: `Bearer ${token}` } })
+      const d = await r.json()
+      if (!r.ok) throw new Error(d.error || 'Spotify is not configured')
+      window.open(d.url, 'lanparty-spotify', 'width=500,height=720')
+    } catch (e) { setSearchError(e.message) }
+  }
+
+  // Tokens arrive from the popup (postMessage) or the socket fallback (custom event).
+  useEffect(() => {
+    const serverOrigin = new URL(SERVER_URL || window.location.origin, window.location.origin).origin
+    const onMsg = (e) => {
+      if (e.origin !== serverOrigin) return
+      const d = e.data
+      if (!d || d.type !== 'spotify-auth' || !d.access_token) return
+      localStorage.setItem(SPOTIFY_LS_KEY, JSON.stringify({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + ((d.expires_in || 3600) - 60) * 1000 }))
+      setSpLinked(true)
+    }
+    const onCustom = () => setSpLinked(!!readSpotifyToken())
+    window.addEventListener('message', onMsg)
+    window.addEventListener('lanparty:spotify-auth', onCustom)
+    return () => { window.removeEventListener('message', onMsg); window.removeEventListener('lanparty:spotify-auth', onCustom) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ---- Spotify Web Playback SDK (linked users hear spotify tracks through it) ----
+  useEffect(() => {
+    if (!spLinked) return
+    let cancelled = false
+    const boot = () => {
+      if (cancelled) return
+      if (!window.Spotify) { setTimeout(boot, 250); return }
+      if (spPlayerRef.current) return
+      const player = new window.Spotify.Player({
+        name: 'LAN Party',
+        getOAuthToken: async (cb) => { const t = await freshSpotifyToken(); if (t) cb(t) },
+        volume,
+      })
+      player.addListener('ready', ({ device_id }) => { spDeviceRef.current = device_id; setSpDeviceReady(true) })
+      player.addListener('not_ready', () => { spDeviceRef.current = null; setSpDeviceReady(false) })
+      player.addListener('authentication_error', () => { localStorage.removeItem(SPOTIFY_LS_KEY); setSpLinked(false) })
+      player.addListener('player_state_changed', (st) => {
+        if (!st) return
+        if (st.position > 3000) spProgressedRef.current = true // we've heard real playback of this track
+        const cur = currentRef.current
+        // End-of-track → report it (the server's fromId guard advances the queue exactly once).
+        // Detected by position resetting to 0 + paused AFTER we saw the track actually play, which
+        // is more reliable than the SDK's previous_tracks list under a single-uri play context.
+        if (cur && cur.service === 'spotify' && st.paused && st.position === 0 && spProgressedRef.current) {
+          spProgressedRef.current = false
+          onEventRef.current?.({ kind: 'next', fromId: cur.id })
+        }
+      })
+      player.connect()
+      spPlayerRef.current = player
+    }
+    if (!document.getElementById('spotify-sdk')) {
+      window.onSpotifyWebPlaybackSDKReady = window.onSpotifyWebPlaybackSDKReady || (() => {})
+      const s = document.createElement('script'); s.id = 'spotify-sdk'; s.src = 'https://sdk.scdn.co/spotify-player.js'; document.head.appendChild(s)
+    }
+    boot()
+    // Cleanup covers both unmount and unlink (spLinked→false): tear the player down so it stops
+    // spinning on getOAuthToken with a cleared token.
+    return () => { cancelled = true; spPlayerRef.current?.disconnect?.(); spPlayerRef.current = null; spDeviceRef.current = null; setSpDeviceReady(false) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spLinked])
+
+  // Tell Spotify to play a uri at a position on our device (retries once through a token refresh).
+  const spPlay = async (uri, positionMs, retry = true) => {
+    const t = await freshSpotifyToken()
+    if (!t || !spDeviceRef.current) return
+    const r = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(spDeviceRef.current)}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uris: [uri], position_ms: Math.max(0, Math.floor(positionMs || 0)) }),
+    }).catch(() => null)
+    if (r && r.status === 401 && retry) { await freshSpotifyToken(true); return spPlay(uri, positionMs, false) }
+    if (r && r.status === 403) setSearchError('Spotify playback needs a Premium account.')
+  }
 
   const search = async () => {
     const q = query.trim()
     if (!q || searching) return
     setSearching(true); setSearchError('')
     try {
-      const r = await fetch(`${SERVER_URL}/music/search?q=${encodeURIComponent(q)}`, { headers: { Authorization: `Bearer ${token}` } })
-      const data = await r.json()
-      if (!r.ok) throw new Error(data.error || 'Search failed')
-      setResults(data)
+      if (svc === 'spotify') {
+        let at = await freshSpotifyToken()
+        if (!at) throw new Error('Connect Spotify first to search it.')
+        const spSearch = (accessToken) => fetch(`${SERVER_URL}/music/spotify/search?q=${encodeURIComponent(q)}`, { headers: { Authorization: `Bearer ${token}`, 'X-Spotify-Token': accessToken } })
+        let r = await spSearch(at)
+        if (r.status === 401) {
+          at = await freshSpotifyToken(true)
+          if (!at) throw new Error('Spotify session expired — connect again.')
+          r = await spSearch(at)
+        }
+        const data = await r.json()
+        if (!r.ok) throw new Error(data.error || 'Spotify search failed')
+        setResults(data)
+      } else {
+        const r = await fetch(`${SERVER_URL}/music/search?q=${encodeURIComponent(q)}`, { headers: { Authorization: `Bearer ${token}` } })
+        const data = await r.json()
+        if (!r.ok) throw new Error(data.error || 'Search failed')
+        setResults(data)
+      }
     } catch (e) { setSearchError(e.message); setResults([]) }
     finally { setSearching(false) }
   }
 
-  // Keep the local <audio> matched to the shared state (track, position, play/pause).
+  // ---- Playlists ----
+  const saveQueueAsPlaylist = async () => {
+    if (!state.queue.length) return
+    const name = (window.prompt('Playlist name:') || '').trim()
+    if (!name) return
+    try {
+      const r = await fetch(`${SERVER_URL}/music/playlists`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ name, tracks: state.queue }),
+      })
+      if (r.ok) { if (playlists) loadPlaylistList() }
+      else { const d = await r.json().catch(() => ({})); setSearchError(d.error || 'Could not save playlist') }
+    } catch { setSearchError('Could not save playlist') }
+  }
+  const loadPlaylistList = async () => {
+    const r = await fetch(`${SERVER_URL}/music/playlists`, { headers: { Authorization: `Bearer ${token}` } })
+    if (r.ok) setPlaylists((await r.json()).playlists)
+  }
+  const loadPlaylistIntoQueue = async (id) => {
+    const r = await fetch(`${SERVER_URL}/music/playlists/${id}`, { headers: { Authorization: `Bearer ${token}` } })
+    if (!r.ok) return
+    const { playlist } = await r.json()
+    onEvent({ kind: 'loadList', tracks: playlist.tracks })
+  }
+  const deletePlaylist = async (id) => {
+    await fetch(`${SERVER_URL}/music/playlists/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
+    loadPlaylistList()
+  }
+
+  // Keep local playback matched to the shared state (track, position, play/pause) — the
+  // <audio> proxy for YouTube tracks, the Web Playback SDK for Spotify tracks.
   useEffect(() => {
     const a = audioRef.current
+    const stopAudio = () => { if (a && a.src) { a.pause(); a.removeAttribute('src') } curTrackIdRef.current = null }
+    const stopSpotify = () => { if (spUriRef.current) { spPlayerRef.current?.pause?.().catch?.(() => {}); spUriRef.current = null } }
+    if (!current) { stopAudio(); stopSpotify(); setDuration(0); setProgress(0); return }
+
+    if (current.service === 'spotify') {
+      stopAudio()
+      setDuration((current.durationMs || 0) / 1000)
+      if (!spLinked || !spDeviceReady) return // not linked → this track is silent for you (notice shown)
+      const targetMs = sharedPos() * 1000
+      if (spUriRef.current !== current.id) {
+        spUriRef.current = current.id
+        spProgressedRef.current = false // new track — arm end-detection fresh
+        if (state.playing) spPlay(current.id, targetMs)
+        else spPlay(current.id, targetMs).then(() => spPlayerRef.current?.pause?.().catch?.(() => {}))
+        return
+      }
+      spPlayerRef.current?.getCurrentState?.().then((st) => {
+        if (!st) { if (state.playing) spPlay(current.id, sharedPos() * 1000); return }
+        const target = sharedPos() * 1000
+        if (Math.abs(st.position - target) > 2500) spPlayerRef.current.seek(Math.max(0, target)).catch(() => {})
+        if (state.playing && st.paused) spPlayerRef.current.resume().catch(() => {})
+        else if (!state.playing && !st.paused) spPlayerRef.current.pause().catch(() => {})
+      })
+      return
+    }
+
+    // YouTube path
+    stopSpotify()
     if (!a) return
-    if (!current) { a.pause(); a.removeAttribute('src'); curTrackIdRef.current = null; setDuration(0); setProgress(0); return }
     const tryPlay = () => a.play().then(() => setNeedsGesture(false)).catch(() => setNeedsGesture(true))
     if (curTrackIdRef.current !== current.id) {
       curTrackIdRef.current = current.id
@@ -111,13 +320,24 @@ function MusicActivity({ state, onEvent }) {
     if (state.playing && a.paused) tryPlay()
     else if (!state.playing && !a.paused) a.pause()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.queue, state.index, state.playing, state.pos, state.ts])
+  }, [state.queue, state.index, state.playing, state.pos, state.ts, spLinked, spDeviceReady])
 
-  useEffect(() => { const a = audioRef.current; if (a) a.volume = volume; localStorage.setItem('lanparty_music_vol', String(volume)) }, [volume])
+  useEffect(() => {
+    const a = audioRef.current; if (a) a.volume = volume
+    spPlayerRef.current?.setVolume?.(volume).catch?.(() => {})
+    localStorage.setItem('lanparty_music_vol', String(volume))
+  }, [volume])
 
   // Progress readout for the seek bar (local only — no events).
   useEffect(() => {
-    const t = setInterval(() => { const a = audioRef.current; if (a && !a.paused) setProgress(a.currentTime || 0) }, 500)
+    const t = setInterval(() => {
+      const cur = currentRef.current
+      if (cur?.service === 'spotify') {
+        spPlayerRef.current?.getCurrentState?.().then((st) => { if (st && !st.paused) setProgress(st.position / 1000) })
+      } else {
+        const a = audioRef.current; if (a && !a.paused) setProgress(a.currentTime || 0)
+      }
+    }, 500)
     return () => clearInterval(t)
   }, [])
 
@@ -141,7 +361,7 @@ function MusicActivity({ state, onEvent }) {
 
   return (
     <div className="music-activity">
-      <audio ref={audioRef} onEnded={onEnded} onError={onAudioError} onLoadedMetadata={(e) => setDuration(e.target.duration || 0)} />
+      <audio ref={audioRef} onEnded={onEnded} onError={onAudioError} onLoadedMetadata={(e) => { if (currentRef.current?.service !== 'spotify') setDuration(e.target.duration || 0) }} />
       {!configured && (
         <div className="music-note">Music search isn't configured — add a YouTube API key (YOUTUBE_API_KEY or server/youtube.key) on the server.</div>
       )}
@@ -149,16 +369,29 @@ function MusicActivity({ state, onEvent }) {
       <div className="music-columns">
         {/* Search */}
         <div className="music-col">
-          <div className="music-search-row">
-            <input
-              className="music-input"
-              placeholder="Search songs or paste a YouTube link…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') search() }}
-            />
-            <button type="button" className="music-btn" onClick={search} disabled={searching || !query.trim()}>{searching ? '…' : 'Search'}</button>
+          <div className="music-svc-tabs" role="tablist" aria-label="Music service">
+            <button type="button" role="tab" aria-selected={svc === 'youtube'} className={`music-svc${svc === 'youtube' ? ' active' : ''}`} onClick={() => { setSvc('youtube'); setResults(null); setSearchError('') }}>▶ YouTube</button>
+            {spConfigured && (
+              <button type="button" role="tab" aria-selected={svc === 'spotify'} className={`music-svc spotify${svc === 'spotify' ? ' active' : ''}`} onClick={() => { setSvc('spotify'); setResults(null); setSearchError('') }}>🟢 Spotify</button>
+            )}
           </div>
+          {svc === 'spotify' && !spLinked ? (
+            <div className="music-connect">
+              <p>Link your Spotify account to search and hear Spotify tracks. Playback needs Spotify&nbsp;Premium.</p>
+              <button type="button" className="music-btn music-btn-spotify" onClick={connectSpotify}>Connect Spotify</button>
+            </div>
+          ) : (
+            <div className="music-search-row">
+              <input
+                className="music-input"
+                placeholder={svc === 'spotify' ? 'Search Spotify…' : 'Search songs or paste a YouTube link…'}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') search() }}
+              />
+              <button type="button" className="music-btn" onClick={search} disabled={searching || !query.trim()}>{searching ? '…' : 'Search'}</button>
+            </div>
+          )}
           {searchError && <div className="music-note">{searchError}</div>}
           <div className="music-list">
             {results && results.length === 0 && !searchError && <div className="music-empty">No results.</div>}
@@ -166,39 +399,60 @@ function MusicActivity({ state, onEvent }) {
               <div key={t.id} className="music-row">
                 {t.thumbnail ? <img className="music-thumb" src={t.thumbnail} alt="" /> : <span className="music-thumb music-thumb-empty">🎵</span>}
                 <span className="music-meta"><span className="music-title">{t.title}</span><span className="music-artist">{t.artist}</span></span>
-                <button type="button" className="music-mini" title="Play now" onClick={() => onEvent({ kind: 'playNow', track: t })}>▶</button>
+                <button type="button" className="music-mini" title={djLocked ? `Only the DJ (${state.dj}) can play tracks` : 'Play now'} disabled={djLocked} onClick={() => onEvent({ kind: 'playNow', track: t })}>▶</button>
                 <button type="button" className="music-mini" title="Add to queue" onClick={() => onEvent({ kind: 'add', track: t })}>＋</button>
               </div>
             ))}
-            {!results && <div className="music-empty">Find something to play — the whole channel hears it together.</div>}
+            {!results && !(svc === 'spotify' && !spLinked) && <div className="music-empty">Find something to play — the whole channel hears it together.</div>}
           </div>
         </div>
 
         {/* Now playing + queue */}
         <div className="music-col">
+          <div className="music-dj-row">
+            {state.dj ? (
+              <>
+                <span className="music-dj-badge">🎧 DJ: <b>{state.dj}</b>{state.dj === me ? ' (you)' : ''}</span>
+                {state.dj === me
+                  ? <button type="button" className="music-mini music-dj-btn" onClick={() => onEvent({ kind: 'djRelease' })}>Release</button>
+                  : <button type="button" className="music-mini music-dj-btn" title="Takes over only if the DJ left the channel" onClick={() => onEvent({ kind: 'djClaim' })}>Take over</button>}
+              </>
+            ) : (
+              <>
+                <span className="music-dj-badge muted">🎧 Open decks — anyone can control</span>
+                <button type="button" className="music-mini music-dj-btn" onClick={() => onEvent({ kind: 'djClaim' })}>Become DJ</button>
+              </>
+            )}
+          </div>
           <div className="music-nowplaying">
             {current ? (
               <>
                 {current.thumbnail ? <img className="music-thumb music-thumb-lg" src={current.thumbnail} alt="" /> : <span className="music-thumb music-thumb-lg music-thumb-empty">🎵</span>}
-                <span className="music-meta"><span className="music-title">{current.title}</span><span className="music-artist">{current.artist} · added by {current.addedBy}</span></span>
+                <span className="music-meta">
+                  <span className="music-title">{current.title}</span>
+                  <span className="music-artist">{current.service === 'spotify' ? '🟢 ' : ''}{current.artist} · added by {current.addedBy}</span>
+                </span>
               </>
             ) : (
               <span className="music-empty">Nothing playing yet.</span>
             )}
           </div>
-          {needsGesture && current && (
+          {current?.service === 'spotify' && !spLinked && (
+            <div className="music-note">This is a Spotify track — <button type="button" className="music-linklike" onClick={connectSpotify}>connect Spotify</button> (Premium) to hear it.</div>
+          )}
+          {needsGesture && current && current.service !== 'spotify' && (
             <button type="button" className="music-btn music-join-audio" onClick={resumeAudio}>🔊 Tap to hear the music</button>
           )}
           <div className="music-controls">
-            <button type="button" className="music-ctl" disabled={!current} title={state.playing ? 'Pause for everyone' : 'Play for everyone'}
-              onClick={() => onEvent({ kind: state.playing ? 'pause' : 'play', pos: audioRef.current?.currentTime || 0 })}>
+            <button type="button" className="music-ctl" disabled={!current || djLocked} title={djLocked ? `Only the DJ (${state.dj}) controls playback` : (state.playing ? 'Pause for everyone' : 'Play for everyone')}
+              onClick={() => onEvent({ kind: state.playing ? 'pause' : 'play', pos: progress || 0 })}>
               {state.playing ? '⏸' : '▶'}
             </button>
-            <button type="button" className="music-ctl" disabled={!current} title="Skip" onClick={() => onEvent({ kind: 'skip' })}>⏭</button>
+            <button type="button" className="music-ctl" disabled={!current || djLocked} title="Skip" onClick={() => onEvent({ kind: 'skip' })}>⏭</button>
             <input
               className="music-seek" type="range" min="0" max={Math.max(1, Math.floor(duration))} step="1"
               value={Math.min(Math.floor(progress), Math.floor(duration) || 0)}
-              disabled={!current || !duration}
+              disabled={!current || !duration || djLocked}
               onChange={(e) => { const v = Number(e.target.value); setProgress(v); onEvent({ kind: 'seek', pos: v }) }}
               aria-label="Seek"
             />
@@ -211,18 +465,32 @@ function MusicActivity({ state, onEvent }) {
           <div className="music-queue-head">
             <span>Up next — {Math.max(0, state.queue.length - (state.index + 1))}</span>
             <span className="music-queue-actions">
-              <button type="button" className="music-mini" title="Shuffle upcoming" onClick={() => onEvent({ kind: 'shuffle' })} disabled={state.queue.length - state.index < 3}>🔀</button>
-              <button type="button" className="music-mini" title="Clear queue" onClick={() => onEvent({ kind: 'clear' })} disabled={!state.queue.length}>🗑</button>
+              <button type="button" className="music-mini" title="Save queue as playlist" onClick={saveQueueAsPlaylist} disabled={!state.queue.length}>💾</button>
+              <button type="button" className="music-mini" title="My playlists" onClick={() => { if (playlists) setPlaylists(null); else loadPlaylistList() }}>📂</button>
+              <button type="button" className="music-mini" title="Shuffle upcoming" onClick={() => onEvent({ kind: 'shuffle' })} disabled={djLocked || state.queue.length - state.index < 3}>🔀</button>
+              <button type="button" className="music-mini" title="Clear queue" onClick={() => onEvent({ kind: 'clear' })} disabled={djLocked || !state.queue.length}>🗑</button>
             </span>
           </div>
+          {playlists && (
+            <div className="music-playlists">
+              {playlists.length === 0 && <div className="music-empty">No saved playlists yet — 💾 saves the current queue.</div>}
+              {playlists.map((p) => (
+                <div key={p.id} className="music-row">
+                  <span className="music-meta"><span className="music-title">📂 {p.name}</span><span className="music-artist">{p.count} tracks</span></span>
+                  <button type="button" className="music-mini" title={djLocked ? `Only the DJ (${state.dj}) can load playlists` : 'Load into queue'} disabled={djLocked} onClick={() => loadPlaylistIntoQueue(p.id)}>▶</button>
+                  <button type="button" className="music-mini" title="Delete playlist" onClick={() => deletePlaylist(p.id)}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="music-list music-queue">
             {state.queue.map((t, i) => (
               <div key={`${t.id}-${i}`} className={`music-row${i === state.index ? ' playing' : ''}${i < state.index ? ' played' : ''}`}>
-                <button type="button" className="music-row-main" title={i === state.index ? 'Playing now' : 'Play this'} onClick={() => { if (i !== state.index) onEvent({ kind: 'jump', i }) }}>
+                <button type="button" className="music-row-main" disabled={djLocked && i !== state.index} title={i === state.index ? 'Playing now' : (djLocked ? `Only the DJ (${state.dj}) can jump` : 'Play this')} onClick={() => { if (i !== state.index && !djLocked) onEvent({ kind: 'jump', i }) }}>
                   {t.thumbnail ? <img className="music-thumb" src={t.thumbnail} alt="" /> : <span className="music-thumb music-thumb-empty">🎵</span>}
-                  <span className="music-meta"><span className="music-title">{i === state.index ? '🔊 ' : ''}{t.title}</span><span className="music-artist">{t.artist} · {t.addedBy}</span></span>
+                  <span className="music-meta"><span className="music-title">{i === state.index ? '🔊 ' : ''}{t.service === 'spotify' ? '🟢 ' : ''}{t.title}</span><span className="music-artist">{t.artist} · {t.addedBy}</span></span>
                 </button>
-                <button type="button" className="music-mini" title="Remove" onClick={() => onEvent({ kind: 'remove', i })}>✕</button>
+                <button type="button" className="music-mini" title="Remove" disabled={djLocked} onClick={() => onEvent({ kind: 'remove', i })}>✕</button>
               </div>
             ))}
             {!state.queue.length && <div className="music-empty">Queue is empty.</div>}

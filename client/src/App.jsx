@@ -1809,6 +1809,17 @@ export default function App() {
     })
     // A server was created/removed somewhere — refresh the rail.
     s.on('servers:updated', () => { loadServers() })
+    // Spotify OAuth fallback: if the popup couldn't postMessage (blocked opener), the server
+    // delivers the tokens over the socket instead. Stored locally; the Music activity reacts.
+    s.on('spotify:auth', (payload) => {
+      if (!payload?.access_token) return
+      localStorage.setItem('lanparty_spotify', JSON.stringify({
+        access_token: payload.access_token,
+        refresh_token: payload.refresh_token,
+        expires_at: Date.now() + ((payload.expires_in || 3600) - 60) * 1000,
+      }))
+      window.dispatchEvent(new CustomEvent('lanparty:spotify-auth'))
+    })
 
     // Persisted reaction changed — apply the authoritative counts (mine computed for this user).
     s.on('reaction:updated', ({ scope, messageId, reactions }) => {

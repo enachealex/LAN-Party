@@ -25,6 +25,8 @@ Point an A/AAAA record for `lanparty.thejumpvault.com` at your VPS's public IP. 
 | `TURN_USERNAME` / `TURN_CREDENTIAL` | with TURN | TURN credentials. |
 | `GIPHY_API_KEY` | no | Enables the Giphy tab (or drop a `server/giphy.key` file). |
 | `YOUTUBE_API_KEY` | for Music | Enables Music activity search (or drop a `server/youtube.key` file). Playback also needs `yt-dlp` on PATH — the Dockerfile installs it. |
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | for Spotify | Enables the Spotify tab in Music (or drop a `server/spotify.key` JSON file). Register `https://lanparty.thejumpvault.com/callback` as a Redirect URI in the Spotify Developer Dashboard. |
+| `SPOTIFY_REDIRECT_URI` | no | Override the OAuth redirect (defaults to this server's origin + `/callback`). |
 
 Generate a secret: `openssl rand -hex 32`.
 
