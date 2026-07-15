@@ -804,14 +804,20 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .activity-close:hover{background:rgba(224,87,77,.3)}
 .activity-body{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 /* Watch Together */
-.watch-activity{flex:1;min-height:0;display:flex;flex-direction:column}
-.watch-bar{display:flex;gap:8px;padding:12px}
-.watch-input{flex:1;min-width:0;padding:9px 12px;background:#0b1016;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:var(--text);font-size:13px}
+/* Watch Together: player on the left, "load a video" panel in its own column on the right */
+.watch-activity{flex:1;min-height:0;display:flex;gap:12px;padding:12px}
+.watch-main{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
+.watch-side{flex:none;width:250px;display:flex;flex-direction:column;gap:9px;background:#0b1016;border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:14px;align-self:flex-start}
+.watch-side-title{font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+.watch-input{min-width:0;padding:9px 12px;background:#10161d;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:var(--text);font-size:13px}
 .watch-input:focus{outline:none;border-color:var(--accent-end)}
-.watch-load{padding:9px 18px;border:none;border-radius:8px;background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#021022;font-weight:800;cursor:pointer}
-.watch-player{flex:1;min-height:0;margin:0 12px 12px;border-radius:10px;overflow:hidden;background:#000}
+.watch-load{padding:9px 14px;border:none;border-radius:8px;background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#021022;font-weight:800;cursor:pointer}
+.watch-load:disabled{opacity:.45;cursor:default}
+.watch-side-hint{color:var(--muted);font-size:11.5px;line-height:1.5}
+.watch-player{flex:1;min-height:0;border-radius:10px;overflow:hidden;background:#000}
 .watch-player>div,.watch-player iframe{width:100%;height:100%}
 .watch-empty{flex:1;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--muted);font-size:14px;padding:24px;line-height:1.5}
+@media (max-width: 760px){.watch-activity{flex-direction:column-reverse;overflow-y:auto}.watch-side{width:auto;align-self:stretch}.watch-main{min-height:240px}}
 /* Whiteboard */
 .wb-activity{flex:1;min-height:0;display:flex;flex-direction:column}
 .wb-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:10px 12px}

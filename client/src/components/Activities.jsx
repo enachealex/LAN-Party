@@ -317,11 +317,18 @@ function WatchTogether({ state, onEvent }) {
 
   return (
     <div className="watch-activity">
-      <div className="watch-bar">
-        <input className="watch-input" placeholder="Paste a YouTube link…" value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') load() }} />
-        <button type="button" className="watch-load" onClick={load}>Load</button>
+      <div className="watch-main">
+        {state.videoId ? <div className="watch-player" ref={containerRef} /> : <div className="watch-empty">Load a YouTube video from the panel on the right — play, pause, and seek stay in sync for everyone.</div>}
       </div>
-      {state.videoId ? <div className="watch-player" ref={containerRef} /> : <div className="watch-empty">Paste a YouTube link above to start watching together. Play, pause, and seek stay in sync for everyone.</div>}
+      <div className="watch-side">
+        <div className="watch-side-title">Load a video</div>
+        <input className="watch-input" placeholder="Paste a YouTube link…" value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') load() }} />
+        <button type="button" className="watch-load" onClick={load} disabled={!ytId(url)}>Load for everyone</button>
+        <div className="watch-side-hint">
+          Works with watch, youtu.be, and Shorts links.
+          {state.videoId ? ' Loading a new link replaces what the room is watching.' : ''}
+        </div>
+      </div>
     </div>
   )
 }
