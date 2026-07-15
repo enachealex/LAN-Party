@@ -939,6 +939,8 @@ export default function App() {
   const pendingUnreadScrollRef = useRef(0)
   // Tracks which chat the scroll position has already been initialized for.
   const scrollInitKeyRef = useRef(null)
+  // Whether the view is pinned to the newest message (true = follow new content / late-loading media).
+  const stickToBottomRef = useRef(true)
 
   // Keep an object URL for previewing the pending file in the composer; revoke on change/unmount.
   useEffect(() => {
@@ -978,17 +980,37 @@ export default function App() {
         const target = list.children[firstUnreadIndex]
         if (target) {
           list.scrollTop = Math.max(0, target.offsetTop - list.offsetTop)
+          stickToBottomRef.current = false // reading from the unread marker, don't follow new media
           return
         }
       }
       list.scrollTop = list.scrollHeight
+      stickToBottomRef.current = true
       return
     }
 
     // Same chat, a message arrived: keep pinned to the bottom only if already near it.
     const distanceFromBottom = list.scrollHeight - list.scrollTop - list.clientHeight
-    if (distanceFromBottom < 120) list.scrollTop = list.scrollHeight
+    if (distanceFromBottom < 120) { list.scrollTop = list.scrollHeight; stickToBottomRef.current = true }
   }, [activeChatKey, activeMessageCount])
+
+  // Follow late-loading content (images, GIFs, embeds): when a message's media finishes
+  // loading it grows the list AFTER the scroll above ran with a too-short scrollHeight, leaving
+  // the newest image below the fold. A capture-phase `load` listener re-pins to the bottom while
+  // the user is still parked there; a scroll listener releases the pin when they scroll up.
+  useEffect(() => {
+    const list = messagesListRef.current
+    if (!list) return
+    const nearBottom = () => list.scrollHeight - list.scrollTop - list.clientHeight < 120
+    const onScroll = () => { stickToBottomRef.current = nearBottom() }
+    const onMediaLoad = () => { if (stickToBottomRef.current) list.scrollTop = list.scrollHeight }
+    list.addEventListener('scroll', onScroll, { passive: true })
+    list.addEventListener('load', onMediaLoad, true) // `load` doesn't bubble, but fires in capture
+    return () => {
+      list.removeEventListener('scroll', onScroll)
+      list.removeEventListener('load', onMediaLoad, true)
+    }
+  }, [activeChatKey])
 
   useEffect(() => {
     setActiveReactionMessageId(null)
