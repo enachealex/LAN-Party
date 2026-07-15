@@ -1253,3 +1253,6 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .music-history summary{cursor:pointer;padding:4px 0}
 .music-history .music-row{margin-top:6px}
 @media (max-width: 900px){.music-columns{flex-direction:column;overflow-y:auto}.music-col{overflow:visible}.music-list{max-height:220px}}
+
+/* App logo (The Jump Vault mark) on the sign-in card */
+.auth-logo{display:block;width:84px;height:84px;object-fit:contain;margin-bottom:10px;filter:drop-shadow(0 4px 14px rgba(0,0,0,.35))}
