@@ -2112,11 +2112,11 @@ export default function App() {
   }
 
   // Submit from the create-channel modal (name + chosen type + privacy).
-  const submitCreateChannel = async ({ name: chName, type, privacy }) => {
+  const submitCreateChannel = async ({ name: chName, type, privacy, members }) => {
     const sid = currentServerId()
     const t = token || localStorage.getItem('lanparty_token')
     try {
-      const res = await fetch(`${SERVER_URL}/servers/${encodeURIComponent(sid)}/channels`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: chName, type, privacy }) })
+      const res = await fetch(`${SERVER_URL}/servers/${encodeURIComponent(sid)}/channels`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: chName, type, privacy, members: privacy === 'private' ? (members || []) : [] }) })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Could not create channel')
       setShowChannelModal(false)
@@ -4519,6 +4519,7 @@ export default function App() {
         open={showChannelModal}
         initialType={channelModalType}
         serverName={serverName}
+        members={(serverState?.members || []).filter((m) => m.username && m.role !== 'owner' && m.role !== 'admin' && m.username !== name)}
         onCreate={submitCreateChannel}
         onClose={() => setShowChannelModal(false)}
       />

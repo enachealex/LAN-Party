@@ -168,6 +168,14 @@ async function main() {
     role TEXT DEFAULT 'member',
     PRIMARY KEY (server_id, username)
   )`);
+  // Explicit access grants for PRIVATE channels. A private channel is visible to owner/admins
+  // (who manage the server) plus any username listed here.
+  await db.exec(`CREATE TABLE IF NOT EXISTS channel_members (
+    server_id TEXT,
+    channel_id TEXT,
+    username TEXT,
+    PRIMARY KEY (server_id, channel_id, username)
+  )`);
   await db.exec(`CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id TEXT,
@@ -944,8 +952,27 @@ async function main() {
     roster.sort((a, b) => roleRank(a.role) - roleRank(b.role) || (b.online - a.online) || String(a.name).localeCompare(String(b.name)));
     return roster;
   }
-  // Channels visible to a given role: staff see everything, members/guests only public channels.
-  const visibleChannels = (channels, role) => (isStaffRole(role) ? channels : channels.filter((c) => c.privacy !== 'private'));
+  // Is a user explicitly granted access to a private channel?
+  async function inChannelMembers(serverId, channelId, username) {
+    if (!username) return false;
+    const row = await db.get('SELECT 1 FROM channel_members WHERE server_id = ? AND channel_id = ? AND username = ?', serverId, channelId, username);
+    return !!row;
+  }
+  // Can this user see/use the channel? Public → any member. Private → owner/admins or an explicit grant.
+  async function canAccessChannel(serverId, channelId, username, privacy, role) {
+    if (!role) return false;                 // not a member of the server
+    if (privacy !== 'private') return true;  // public channel
+    if (isStaffRole(role)) return true;      // owner/admins manage everything
+    return inChannelMembers(serverId, channelId, username);
+  }
+  // Channels a given user can see: staff see all; others see public channels + the private ones
+  // they've been explicitly added to.
+  async function visibleChannelsFor(serverId, channels, username, role) {
+    if (isStaffRole(role)) return channels;
+    const grantedRows = await db.all('SELECT channel_id FROM channel_members WHERE server_id = ? AND username = ?', serverId, username);
+    const granted = new Set(grantedRows.map((r) => r.channel_id));
+    return channels.filter((c) => c.privacy !== 'private' || granted.has(c.id));
+  }
 
   // --- Unreads ---
   async function markChannelRead(username, serverId, channelId) {
@@ -969,10 +996,14 @@ async function main() {
       preview: String(text || '').slice(0, 120), mentions,
     };
     if (serverId === DEMO_ID) { io.emit('unread:bump', payload); return; } // public commons: everyone's a member
+    // For a private channel, only staff + explicitly-granted members should be nudged.
+    const granted = privacy === 'private'
+      ? new Set((await db.all('SELECT username FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId)).map((r) => r.username))
+      : null;
     const members = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
     for (const m of members) {
       if (m.username === author) continue;
-      if (privacy === 'private' && !isStaffRole(m.role)) continue;
+      if (privacy === 'private' && !isStaffRole(m.role) && !granted.has(m.username)) continue;
       io.to(`user:${m.username}`).emit('unread:bump', payload);
     }
   }
@@ -986,8 +1017,10 @@ async function main() {
     const roster = await serverRoster(serverId);
     const room = io.sockets.adapter.rooms.get(`server:${serverId}`) || new Set();
     for (const sid of room) {
-      const role = await roleOf(serverId, clients[sid]?.username);
-      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, channels: visibleChannels(allChannels, role) }, members: roster, myRole: role });
+      const username = clients[sid]?.username;
+      const role = await roleOf(serverId, username);
+      const channels = await visibleChannelsFor(serverId, allChannels, username, role);
+      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, channels }, members: roster, myRole: role });
     }
   }
 
@@ -1025,7 +1058,7 @@ async function main() {
     const unreads = {};
     for (const sid of serverIds) {
       const chans = await db.all("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE server_id = ?", sid);
-      const visible = new Set(visibleChannels(chans, myRole.get(sid)).map((c) => c.id));
+      const visible = new Set((await visibleChannelsFor(sid, chans, me, myRole.get(sid))).map((c) => c.id));
       for (const c of counts) {
         if (c.server_id !== sid || !visible.has(c.channel_id)) continue;
         (unreads[sid] ||= {})[c.channel_id] = c.n;
@@ -1061,8 +1094,46 @@ async function main() {
     if (!name) return res.status(400).json({ error: 'Channel name required' });
     const chId = newId('ch');
     await db.run('INSERT INTO channels (id, server_id, name, type, privacy) VALUES (?, ?, ?, ?, ?)', chId, serverId, name, type, privacy);
+    // For a private channel, grant the requested members access (must be members of this server).
+    // Staff (owner/admins) always have access, so they don't need a row.
+    if (privacy === 'private') {
+      const requested = Array.isArray((req.body || {}).members) ? (req.body || {}).members : [];
+      const seen = new Set();
+      for (const uRaw of requested.slice(0, 100)) {
+        const u = String(uRaw || '').trim();
+        if (!u || seen.has(u)) continue;
+        seen.add(u);
+        if (await isMember(serverId, u)) await db.run('INSERT OR IGNORE INTO channel_members (server_id, channel_id, username) VALUES (?, ?, ?)', serverId, chId, u);
+      }
+    }
     await broadcastServerState(serverId);
     return res.json({ channel: { id: chId, name, type, privacy } });
+  });
+
+  // Read / manage a private channel's access list (owner/admins only). Public channels have none.
+  app.get('/servers/:serverId/channels/:channelId/members', authMiddleware, async (req, res) => {
+    const { serverId, channelId } = req.params;
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can view channel access' });
+    const rows = await db.all('SELECT username FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId);
+    return res.json({ members: rows.map((r) => r.username) });
+  });
+  app.post('/servers/:serverId/channels/:channelId/members', authMiddleware, async (req, res) => {
+    const { serverId, channelId } = req.params;
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
+    const u = String((req.body || {}).username || '').trim();
+    if (!u) return res.status(400).json({ error: 'Username required' });
+    if (!(await isMember(serverId, u))) return res.status(400).json({ error: `${u} isn't a member of this server` });
+    await db.run('INSERT OR IGNORE INTO channel_members (server_id, channel_id, username) VALUES (?, ?, ?)', serverId, channelId, u);
+    await broadcastServerState(serverId);
+    io.to(`user:${u}`).emit('servers:updated'); // nudge the newly-granted user to refresh
+    return res.json({ success: true });
+  });
+  app.delete('/servers/:serverId/channels/:channelId/members/:username', authMiddleware, async (req, res) => {
+    const { serverId, channelId, username } = req.params;
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
+    await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ? AND username = ?', serverId, channelId, username);
+    await broadcastServerState(serverId);
+    return res.json({ success: true });
   });
 
   // Rebroadcast a server's state (role-filtered per socket).
@@ -1093,6 +1164,7 @@ async function main() {
     const members = await db.all('SELECT username FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM messages WHERE server_id = ?', serverId);
     await db.run('DELETE FROM channels WHERE server_id = ?', serverId);
+    await db.run('DELETE FROM channel_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_emojis WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
@@ -1124,6 +1196,7 @@ async function main() {
       if ((textCount?.n || 0) <= 1) return res.status(400).json({ error: 'A server needs at least one text channel' });
     }
     await db.run('DELETE FROM messages WHERE server_id = ? AND channel_id = ?', serverId, channelId);
+    await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channels WHERE id = ?', channelId);
     await pushServerState(serverId);
     return res.json({ success: true });
@@ -1162,6 +1235,7 @@ async function main() {
     if (!targetRole) return res.status(404).json({ error: 'Not a member' });
     if (myRole === 'admin' && targetRole === 'admin') return res.status(403).json({ error: "Admins can't remove other admins" });
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, target);
+    await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, target);
     io.to(`user:${target}`).emit('servers:updated');
     io.to(`user:${target}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);
@@ -1194,6 +1268,7 @@ async function main() {
     if (srv.owner === me) return res.status(400).json({ error: 'Owners must delete the server instead of leaving' });
     if (!(await isMember(serverId, me))) return res.status(400).json({ error: 'Not a member' });
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, me);
+    await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, me);
     io.to(`user:${me}`).emit('servers:updated');
     io.to(`user:${me}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);
@@ -2153,7 +2228,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       await broadcastServerState(serverId); // role-filtered state to everyone (incl. this newcomer)
 
       // Enter the first text channel this user can actually see, and send its history.
-      const firstText = visibleChannels(allChannels, myRole).find((c) => c.type === 'text');
+      const firstText = (await visibleChannelsFor(serverId, allChannels, socketUser, myRole)).find((c) => c.type === 'text');
       if (firstText) {
         socket.join(`channel:${serverId}:${firstText.id}`);
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
@@ -2170,8 +2245,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       const ch = await db.get("SELECT id, type, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       if (!ch) return;
       const myRole = await roleOf(serverId, socketUser);
-      if (!myRole) return; // not a member
-      if (ch.privacy === 'private' && !isStaffRole(myRole)) return; // private = owner/admins only
+      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) return; // not a member / not granted
       for (const room of socket.rooms) {
         if (room !== socket.id && room.startsWith('channel:')) socket.leave(room);
       }
@@ -2191,7 +2265,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       if (!ch) return;
       const myRole = await roleOf(serverId, socketUser);
-      if (!myRole || (ch.privacy === 'private' && !isStaffRole(myRole))) return;
+      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) return;
       await markChannelRead(socketUser, serverId, channelId);
     });
 
@@ -2200,7 +2274,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       if (!ch) return;
       const myRole = await roleOf(serverId, socketUser);
-      if (!myRole || (ch.privacy === 'private' && !isStaffRole(myRole))) return;
+      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) return;
       const author = clients[socket.id]?.name || 'Anon';
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);
@@ -2232,7 +2306,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", row.channel_id, row.server_id);
       if (!ch) return null;
       const myRole = await roleOf(row.server_id, socketUser);
-      if (!myRole || (ch.privacy === 'private' && !isStaffRole(myRole))) return null;
+      if (!(await canAccessChannel(row.server_id, row.channel_id, socketUser, ch.privacy, myRole))) return null;
       return row;
     };
     socket.on('message:pin', async ({ id } = {}) => {
