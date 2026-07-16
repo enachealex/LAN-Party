@@ -175,6 +175,7 @@ export default function AppLeftPane({
   onDeleteServer,
   onRenameChannel,
   onDeleteChannel,
+  onManageAccess,
   activeChannel,
   onJoinChannel,
   voiceChannelId = null,
@@ -322,7 +323,7 @@ export default function AppLeftPane({
                       type="button"
                       className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''} ${unread > 0 ? 'unread' : ''}`}
                       onClick={() => onJoinChannel?.(ch.id)}
-                      onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name })}
+                      onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy })}
                     >
                       <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
                       <span>{ch.name}</span>
@@ -345,7 +346,7 @@ export default function AppLeftPane({
                         type="button"
                         className="dc-channel-item"
                         onClick={() => onJoinChannel?.(ch.id)}
-                        onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name })}
+                        onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy })}
                       >
                         <span className="dc-channel-icon dc-channel-icon-voice"><ChannelSpeakerIcon /></span>
                         <span>{ch.name}</span>
@@ -516,6 +517,9 @@ export default function AppLeftPane({
             <>
               <div className="dc-ctx-title">#{ctxMenu.name}</div>
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameChannel?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename</button>
+              {ctxMenu.privacy === 'private' && isStaff && serverId !== 'demo' && (
+                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onManageAccess?.(ctxMenu.id, ctxMenu.name) }}>🔑 Manage access</button>
+              )}
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onDeleteChannel?.(ctxMenu.id, ctxMenu.name) }}>🗑️ Delete</button>
             </>
           )}

@@ -17,6 +17,7 @@ import Soundboard from './components/Soundboard'
 import CollabCanvas from './components/CollabCanvas'
 import ActivityPanel, { ACTIVITY_TYPES } from './components/Activities'
 import CreateChannelModal from './components/CreateChannelModal'
+import ManageChannelAccessModal from './components/ManageChannelAccessModal'
 import { COLOR_SCHEMES, matchSchemeId } from './colorSchemes'
 import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
@@ -897,6 +898,8 @@ export default function App() {
   // Create-channel modal (name + type + privacy); channelModalType pre-selects the clicked section.
   const [showChannelModal, setShowChannelModal] = useState(false)
   const [channelModalType, setChannelModalType] = useState('text')
+  // Manage-access modal for an existing private channel: { id, name } or null.
+  const [manageAccessChannel, setManageAccessChannel] = useState(null)
   // Mirrors activeChannel so socket callbacks (bound once) never read stale closures.
   // (selectedServerIdRef already exists below and is kept in sync the same way.)
   const activeChannelRef = useRef('general')
@@ -4160,6 +4163,7 @@ export default function App() {
         onDeleteServer={deleteServer}
         onRenameChannel={renameChannel}
         onDeleteChannel={deleteChannel}
+        onManageAccess={(id, chName) => setManageAccessChannel({ id, name: chName })}
         activeChannel={activeChannel}
         onJoinChannel={joinChannel}
         voiceChannelId={voiceChannelId}
@@ -4522,6 +4526,15 @@ export default function App() {
         members={(serverState?.members || []).filter((m) => m.username && m.role !== 'owner' && m.role !== 'admin' && m.username !== name)}
         onCreate={submitCreateChannel}
         onClose={() => setShowChannelModal(false)}
+      />
+      <ManageChannelAccessModal
+        open={!!manageAccessChannel}
+        serverId={currentServerId()}
+        channel={manageAccessChannel}
+        roster={(serverState?.members || []).filter((m) => m.username !== name)}
+        serverUrl={SERVER_URL}
+        token={token || localStorage.getItem('lanparty_token')}
+        onClose={() => setManageAccessChannel(null)}
       />
       {/* Public profile card (click a member) */}
       {profileCard && (
