@@ -126,9 +126,19 @@ async function main() {
   // letting it fall through to the GIF-list API route below.
   app.use('/gifs', express.static(gifsDir, { redirect: false }));
   app.use('/sounds', express.static(soundsDir, { redirect: false }));
-  // Serve the built client (single-origin hosting). Enabled when CLIENT_DIST exists.
+  // Serve the built client (single-origin hosting) UNDER /app; a landing page sits at /.
+  // Enabled when CLIENT_DIST exists (i.e. the client has been built + is present).
   const serveClient = fs.existsSync(path.join(CLIENT_DIST, 'index.html'));
-  if (serveClient) app.use(express.static(CLIENT_DIST));
+  const LANDING_PAGE = path.join(__dirname, 'landing.html');
+  const hasLanding = fs.existsSync(LANDING_PAGE);
+  if (serveClient) {
+    // Landing page at the root (only when we have one; otherwise fall back to the app at /).
+    if (hasLanding) {
+      app.get('/', (req, res) => res.sendFile(LANDING_PAGE));
+    }
+    // The app + its assets live under /app.
+    app.use('/app', express.static(CLIENT_DIST));
+  }
   // parse json with error handling for invalid JSON
   app.use(express.json());
   app.use((err, req, res, next) => {
@@ -2513,12 +2523,19 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
     cleanupExpiredUploads().catch((err) => console.warn('upload cleanup failed', err));
   }, CLEANUP_INTERVAL_MS).unref();
 
-  // SPA fallback: any non-API GET returns index.html so the client boots (must be LAST, after all
-  // API routes + static mounts). Skipped for API-ish paths so a bad API call still 404s as JSON-ish.
+  // SPA fallback for the app: any /app/* GET returns the app's index.html so client-side routes
+  // boot (must be LAST, after all API routes + static mounts). API paths stay at root and are
+  // untouched. When there's no landing page, / also falls through to the app for compatibility.
   if (serveClient) {
     app.get('*', (req, res, next) => {
-      if (req.method !== 'GET' || req.path.startsWith('/uploads') || req.path.startsWith('/gifs') || req.path.startsWith('/sounds') || req.path.startsWith('/socket.io')) return next();
-      res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+      if (req.method !== 'GET') return next();
+      const p = req.path;
+      if (p.startsWith('/app')) return res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+      // Without a landing page, keep the old behavior (app at root); with one, don't swallow other paths.
+      if (!hasLanding && !p.startsWith('/uploads') && !p.startsWith('/gifs') && !p.startsWith('/sounds') && !p.startsWith('/socket.io')) {
+        return res.sendFile(path.join(CLIENT_DIST, 'index.html'));
+      }
+      return next();
     });
   }
 

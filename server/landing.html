@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LAN Party — game-night comms for your crew</title>
+    <meta name="description" content="LAN Party is a free communication app for game nights: servers, voice & video, screen share, and built-in activities like synced music, Watch Together, and party games. Launch it in your browser." />
+    <meta name="theme-color" content="#7a0d0d" />
+    <link rel="icon" type="image/png" href="/app/icons/logo-192.png" />
+    <link rel="apple-touch-icon" href="/app/icons/logo-192.png" />
+    <meta property="og:title" content="LAN Party" />
+    <meta property="og:description" content="Game-night comms for your crew — voice, video, and built-in party activities. Free, in your browser." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://lanparty.thejumpvault.com/" />
+    <style>
+      :root {
+        --bg: #0e0604;
+        --bg2: #1a0d09;
+        --panel: rgba(38, 17, 12, 0.7);
+        --line: rgba(224, 138, 110, 0.18);
+        --text: #f6ece5;
+        --muted: #d3b9ad;
+        --red: #c8433a;
+        --red-deep: #7a0d0d;
+        --amber: #f0a070;
+      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        font-family: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at 15% -10%, rgba(200, 68, 42, 0.28), transparent 38%),
+          radial-gradient(circle at 90% 0%, rgba(240, 160, 112, 0.16), transparent 32%),
+          linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%);
+      }
+      .wrap { max-width: 960px; margin: 0 auto; padding: 28px 22px 60px; }
+      header.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; color: inherit; }
+      .brand img { width: 44px; height: 44px; object-fit: contain; }
+      .brand b { font-size: 20px; letter-spacing: .01em; }
+      .top-cta {
+        display: inline-block; padding: 9px 18px; border-radius: 999px;
+        background: var(--red); color: #fff; font-weight: 700; text-decoration: none; font-size: 14px;
+        border: 1px solid transparent; transition: transform .15s ease, box-shadow .2s ease;
+      }
+      .top-cta:hover { transform: translateY(-2px); box-shadow: 0 10px 26px rgba(0,0,0,.4); }
+
+      .hero { text-align: center; padding: 70px 0 26px; }
+      .hero h1 {
+        margin: 0 0 10px; font-size: clamp(2.8rem, 8vw, 5rem); line-height: 0.98;
+        letter-spacing: -0.02em; font-weight: 800;
+      }
+      .hero .tag { margin: 0 auto 14px; font-size: clamp(1.2rem, 3.5vw, 1.7rem); color: var(--amber); font-weight: 600; }
+      .hero p.lede { max-width: 60ch; margin: 0 auto 30px; color: var(--muted); font-size: 1.08rem; line-height: 1.65; }
+      .actions { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+      .btn {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 15px 30px; border-radius: 999px; font-weight: 800; font-size: 1.05rem;
+        text-decoration: none; cursor: pointer; border: 1px solid transparent;
+        transition: transform .15s ease, box-shadow .2s ease, background-color .2s ease;
+      }
+      .btn.primary {
+        background: linear-gradient(135deg, var(--red), var(--red-deep)); color: #fff;
+        box-shadow: 0 12px 34px rgba(200, 68, 42, 0.35);
+      }
+      .btn.primary:hover { transform: translateY(-2px); box-shadow: 0 16px 44px rgba(200, 68, 42, 0.5); }
+      .btn.ghost { background: transparent; color: var(--text); border-color: var(--line); }
+      .btn.ghost:hover { transform: translateY(-2px); border-color: var(--amber); }
+      .free-note { margin: 16px 0 0; color: var(--muted); font-size: 0.9rem; }
+
+      .features {
+        display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 54px 0 0;
+      }
+      .card {
+        background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 22px;
+      }
+      .card .ico { font-size: 26px; }
+      .card h3 { margin: 12px 0 8px; font-size: 1.2rem; }
+      .card p { margin: 0; color: var(--muted); line-height: 1.6; font-size: 0.96rem; }
+
+      .strip {
+        margin: 46px 0 0; padding: 20px 22px; border-radius: 16px;
+        background: rgba(240, 160, 112, 0.08); border: 1px solid var(--line);
+        display: flex; flex-wrap: wrap; gap: 10px 18px; justify-content: center; color: var(--muted); font-size: 0.95rem;
+      }
+      .strip b { color: var(--text); font-weight: 700; }
+
+      .bottom-cta { text-align: center; margin: 52px 0 0; }
+      .bottom-cta h2 { font-size: clamp(1.6rem, 4vw, 2.2rem); margin: 0 0 8px; }
+      .bottom-cta p { color: var(--muted); margin: 0 0 20px; }
+
+      footer { text-align: center; margin-top: 54px; color: var(--muted); font-size: 0.9rem; }
+      footer a { color: var(--amber); text-decoration: none; }
+      footer a:hover { color: var(--red); }
+
+      @media (max-width: 720px) { .features { grid-template-columns: 1fr; } .hero { padding-top: 44px; } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="top">
+        <a class="brand" href="/">
+          <img src="/app/icons/logo-192.png" alt="LAN Party logo" width="44" height="44" />
+          <b>LAN Party</b>
+        </a>
+        <a class="top-cta" href="/app/">Launch App</a>
+      </header>
+
+      <section class="hero">
+        <h1>LAN Party</h1>
+        <p class="tag">Get the crew in one place.</p>
+        <p class="lede">
+          A communication app built for game nights. Spin up a server, hop into text and voice
+          channels, turn on your camera or share your screen — and when there's a lull, launch a
+          built-in activity: queue music everyone hears in sync, watch a video together, or start a
+          round of Sketch &amp; Guess.
+        </p>
+        <div class="actions">
+          <a class="btn primary" href="/app/">🚀 Launch App</a>
+          <a class="btn ghost" href="#features">See what's inside</a>
+        </div>
+        <p class="free-note">Free · runs in your browser · installs to your desktop or phone like an app.</p>
+      </section>
+
+      <section class="features" id="features">
+        <div class="card">
+          <div class="ico">💬</div>
+          <h3>Talk</h3>
+          <p>Make a server for your crew and organize it into text and voice channels. Invite friends, set roles, and lock private channels to just the people you choose.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🎥</div>
+          <h3>See</h3>
+          <p>Clear voice chat with camera and screen sharing — show off a play, stream your game to the room, or just hang out face to face. Background blur included.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🎉</div>
+          <h3>Play</h3>
+          <p>Shared music with a live queue and DJ mode, Watch Together for synced video, plus party games like Sketch &amp; Guess, Tic-Tac-Toe, polls, and a whiteboard.</p>
+        </div>
+      </section>
+
+      <div class="strip">
+        <span><b>Servers</b> &amp; channels</span>
+        <span><b>Voice</b> &amp; video</span>
+        <span><b>Screen share</b></span>
+        <span><b>Synced music</b> (YouTube &amp; Spotify)</span>
+        <span><b>Party games</b></span>
+        <span><b>GIFs</b> &amp; soundboard</span>
+      </div>
+
+      <section class="bottom-cta">
+        <h2>Ready for the next game night?</h2>
+        <p>Sign up in seconds — no download required.</p>
+        <a class="btn primary" href="/app/">🚀 Launch App</a>
+      </section>
+
+      <footer>
+        <p>A <a href="https://thejumpvault.com">The Jump Vault</a> app.</p>
+      </footer>
+    </div>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&display=swap" />
+  </body>
+</html>
