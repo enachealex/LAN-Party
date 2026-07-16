@@ -2,9 +2,10 @@ import React, { useState, useEffect, useMemo, useRef } from 'react'
 import ProfileAvatar from './ProfileAvatar'
 import { nameStyleToCss } from '../profileData'
 
-const FRIENDS_ICON_URL = '/icons/friends-nav.png'
-const CREATE_MESSAGE_ICON_URL = '/icons/create-message.png'
-const ADD_FRIEND_ICON_URL = '/icons/add-friend.png'
+const ICON_BASE = import.meta.env.BASE_URL + 'icons/'
+const FRIENDS_ICON_URL = ICON_BASE + 'friends-nav.png'
+const CREATE_MESSAGE_ICON_URL = ICON_BASE + 'create-message.png'
+const ADD_FRIEND_ICON_URL = ICON_BASE + 'add-friend.png'
 
 // Varied demo profiles so you can preview how other users' customizations look.
 const MOCK_PROFILES = {

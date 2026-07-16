@@ -15,12 +15,15 @@ const STATUS_OPTIONS = [
   { id: 'offline', label: 'Offline' },
 ]
 
-const HOME_ICON_URL = '/icons/home.png'
-const MICROPHONE_ICON_URL = '/icons/microphone.png'
-const HEADPHONES_ICON_URL = '/icons/headphones.png'
-const SETTINGS_ICON_URL = '/icons/settings.png'
-const ADD_SERVER_ICON_URL = '/icons/add-server.png'
-const DOWNLOAD_APPS_ICON_URL = '/icons/download-apps.png'
+// Icons live in public/icons; prefix with the app's base path (e.g. /app/) so they resolve
+// wherever the app is mounted.
+const ICON_BASE = import.meta.env.BASE_URL + 'icons/'
+const HOME_ICON_URL = ICON_BASE + 'home.png'
+const MICROPHONE_ICON_URL = ICON_BASE + 'microphone.png'
+const HEADPHONES_ICON_URL = ICON_BASE + 'headphones.png'
+const SETTINGS_ICON_URL = ICON_BASE + 'settings.png'
+const ADD_SERVER_ICON_URL = ICON_BASE + 'add-server.png'
+const DOWNLOAD_APPS_ICON_URL = ICON_BASE + 'download-apps.png'
 
 const SPEAKER_ICON_PATH = 'M12 3a9 9 0 0 0-9 9v3a3 3 0 0 0 3 3h1v-6H6a7 7 0 0 1 14 0v6h1a3 3 0 0 0 3-3v-3a9 9 0 0 0-9-9Zm-1 14h2v3h-2v-3Z'
 

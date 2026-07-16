@@ -4978,7 +4978,7 @@ export default function App() {
       <div className={`auth-modal ${!isAuthenticated && authChecked ? 'open' : ''}`} role="dialog" aria-hidden={isAuthenticated || !authChecked}>
         <div className="auth-inner">
           <div className="auth-left">
-            <img className="auth-logo" src="/icons/logo-192.png" alt="LAN Party logo" width="84" height="84" />
+            <img className="auth-logo" src={import.meta.env.BASE_URL + 'icons/logo-192.png'} alt="LAN Party logo" width="84" height="84" />
             <h2>Welcome to LAN Party</h2>
             <p>Sign in to join your servers and voice chats.</p>
             {authMode === 'register' && (
