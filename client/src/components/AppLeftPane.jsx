@@ -361,40 +361,7 @@ export default function AppLeftPane({
                   )
                 })}
               </div>
-              {members.length > 0 && (
-                <div className="dc-members-section">
-                  <div className="dc-channel-section-label">
-                    <span>Members — {members.length}</span>
-                    {isStaff && serverId !== 'demo' && (
-                      <button type="button" className="dc-dm-add" aria-label="Invite people" title="Invite people" onClick={() => onInviteServer?.(serverId)}>+</button>
-                    )}
-                  </div>
-                  <ul className="dc-members-list">
-                    {members.map((m) => {
-                      const isMe = (m.username && m.username === currentUsername) || m.id === socketId
-                      const role = m.role || (m.username === serverOwner ? 'owner' : 'member')
-                      const online = m.online !== false
-                      const canManage = serverId !== 'demo' && isStaff && !isMe && m.username && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
-                      return (
-                        <li key={m.username || m.id}>
-                          <button
-                            type="button"
-                            className="dc-member-row"
-                            onClick={() => m.username && onSelectMember?.(m.username)}
-                            onContextMenu={canManage ? (e) => openCtxMenu(e, { kind: 'member', id: m.username, name: m.name, username: m.username, role }) : undefined}
-                            title={m.username ? `View ${m.name}'s profile${canManage ? ' — right-click to manage' : ''}` : undefined}
-                          >
-                            <span className={`dc-member-dot ${online ? 'online' : 'offline'}`} />
-                            <span className="dc-member-name">{m.name}{isMe ? ' (you)' : ''}</span>
-                            {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
-                            {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
-                          </button>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </div>
-              )}
+              {/* Member list moved to the right-side Members panel (opened from the topbar). */}
             </>
           ) : (
             <HomeLeftPanel
@@ -524,18 +491,6 @@ export default function AppLeftPane({
             </>
           )}
 
-          {ctxMenu.kind === 'member' && (
-            <>
-              <div className="dc-ctx-title">{ctxMenu.name}{ctxMenu.role !== 'member' ? ` · ${ctxMenu.role}` : ''}</div>
-              {myRole === 'owner' && ctxMenu.role === 'member' && (
-                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'admin') }}>🛡️ Make admin</button>
-              )}
-              {myRole === 'owner' && ctxMenu.role === 'admin' && (
-                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'member') }}>⬇️ Remove admin</button>
-              )}
-              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onKickMember?.(ctxMenu.username) }}>🚫 Remove from server</button>
-            </>
-          )}
         </div>,
         document.body
       )}

@@ -699,9 +699,14 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .dc-settings-icon,.dc-microphone-icon{object-fit:contain}
 .members-panel-header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.03);font-weight:700}
 .members-close{background:transparent;border:none;color:var(--muted);cursor:pointer}
-.members-panel-body{padding:12px 16px;overflow:auto}
+.members-panel-body{padding:8px;overflow:auto}
 .members-panel-body ul{list-style:none;padding:0;margin:0}
-.members-panel-body li{padding:8px 0;border-bottom:1px dashed rgba(255,255,255,0.02)}
+.members-panel-list li{padding:0;border:none}
+.members-invite-btn{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text);font-size:12.5px;font-weight:700;padding:4px 10px;border-radius:7px;cursor:pointer}
+.members-invite-btn:hover{background:rgba(255,255,255,.08)}
+.members-panel-row{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:transparent;border:none;color:inherit;font:inherit;padding:8px 10px;border-radius:8px;cursor:pointer}
+.members-panel-row:hover{background:rgba(255,255,255,.06)}
+.members-panel-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
 
 /* Connect box in sidebar (appear if not connected) */
 .connect-box{margin-top:8px;display:flex;gap:8px;align-items:center}

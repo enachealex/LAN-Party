@@ -787,6 +787,7 @@ export default function App() {
   // networks in production. Defaults to public STUN until the fetch resolves.
   const iceConfigRef = useRef([{ urls: 'stun:stun.l.google.com:19302' }])
   const [showMembersPanel, setShowMembersPanel] = useState(false)
+  const [memberMenu, setMemberMenu] = useState(null) // right-click manage menu: { x, y, username, name, role }
   const [deferredPrompt, setDeferredPrompt] = useState(null)
   const [showInstallPanel, setShowInstallPanel] = useState(false)
   // Public app directory modal.
@@ -3104,6 +3105,9 @@ export default function App() {
     return {
       id: String(member.id ?? member.username ?? member.name ?? `server-member-${index}`),
       name: memberName,
+      username: member.username || null,
+      role: member.role || (member.username === serverState?.server?.owner ? 'owner' : 'member'),
+      online: member.online !== false,
       isYou: member.id === socket?.id || member.username === name || memberName === name,
     }
   })
@@ -4203,7 +4207,7 @@ export default function App() {
                       } else {
                         setShowInstallPanel(true)
                       }
-                    }}>Create Application</button>
+                    }}>Download App</button>
                     {showMembersButton && (
                       <button className="members-btn" onClick={() => setShowMembersPanel(true)}>Members</button>
                     )}
@@ -4883,21 +4887,64 @@ export default function App() {
       <div className={`overlay ${showMembersPanel || showInstallPanel || showSignOutConfirm || showStatusMenu || showAddFriendModal ? 'open' : ''}`} onClick={() => { setShowMembersPanel(false); setShowInstallPanel(false); setShowSignOutConfirm(false); setShowStatusMenu(false); closeAddFriendModal() }} />
       <div className={`members-panel ${showMembersPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showMembersPanel}>
         <div className="members-panel-header">
-          <div>{isHomeView ? `${homeChat?.name || 'Group'} Members` : 'Server Members'}</div>
-          <button className="members-close" onClick={() => setShowMembersPanel(false)}>✕</button>
+          <div>{isHomeView ? `${homeChat?.name || 'Group'} Members` : 'Server Members'} — {membersPanelUsers.length}</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {!isHomeView && (serverState?.myRole === 'owner' || serverState?.myRole === 'admin') && currentServerId() !== 'demo' && (
+              <button className="members-invite-btn" title="Invite people" onClick={() => inviteToServer(currentServerId())}>+ Invite</button>
+            )}
+            <button className="members-close" onClick={() => setShowMembersPanel(false)}>✕</button>
+          </div>
         </div>
         <div className="members-panel-body">
           {membersPanelUsers.length > 0 ? (
-            <ul>
-              {membersPanelUsers.map((member) => (
-                <li key={member.id}>{member.name}{member.isYou ? ' (you)' : ''}</li>
-              ))}
+            <ul className="members-panel-list">
+              {membersPanelUsers.map((member) => {
+                const myRole = serverState?.myRole
+                const isStaff = myRole === 'owner' || myRole === 'admin'
+                const role = member.role || 'member'
+                const canManage = !isHomeView && currentServerId() !== 'demo' && isStaff && !member.isYou && member.username
+                  && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
+                return (
+                  <li key={member.id}>
+                    <button
+                      type="button"
+                      className="members-panel-row"
+                      onClick={() => member.username && openMemberProfile(member.username)}
+                      onContextMenu={canManage ? (e) => { e.preventDefault(); setMemberMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 120), username: member.username, name: member.name, role }) } : undefined}
+                      title={member.username ? `View ${member.name}'s profile${canManage ? ' — right-click to manage' : ''}` : undefined}
+                    >
+                      {!isHomeView && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
+                      <span className="members-panel-name">{member.name}{member.isYou ? ' (you)' : ''}</span>
+                      {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
+                      {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
+                    </button>
+                  </li>
+                )
+              })}
             </ul>
           ) : (
             <div style={{ color: '#9fb0bf', fontSize: 14 }}>No members found for this chat.</div>
           )}
         </div>
       </div>
+
+      {/* Right-click manage menu for a member (kick / promote), staff only */}
+      {memberMenu && createPortal(
+        <>
+          <div className="dc-ctx-backdrop" onClick={() => setMemberMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMemberMenu(null) }} />
+          <div className="dc-ctx-menu" style={{ left: memberMenu.x, top: memberMenu.y }} role="menu">
+            <div className="dc-ctx-title">{memberMenu.name}{memberMenu.role !== 'member' ? ` · ${memberMenu.role}` : ''}</div>
+            {serverState?.myRole === 'owner' && memberMenu.role === 'member' && (
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'admin') }}>🛡️ Make admin</button>
+            )}
+            {serverState?.myRole === 'owner' && memberMenu.role === 'admin' && (
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'member') }}>⬇️ Remove admin</button>
+            )}
+            <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setMemberMenu(null); kickMember(memberMenu.username) }}>🚫 Remove from server</button>
+          </div>
+        </>,
+        document.body
+      )}
 
       {/* Sign-out confirmation (centered modal) */}
       <div className={`auth-overlay ${showSignOutConfirm ? 'open' : ''}`} />
