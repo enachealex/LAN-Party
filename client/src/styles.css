@@ -1029,6 +1029,18 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .call-bar-btn.hangup{background:#e0574d;color:#fff}
 .call-bar-btn.hangup:hover{background:#cf4a41}
 .call-remote-video{position:fixed;z-index:6300;right:20px;bottom:90px;width:280px;max-width:40vw;border-radius:12px;border:1px solid rgba(255,255,255,.15);box-shadow:0 18px 50px rgba(0,0,0,.5);background:#000}
+
+/* Edit Profile footer: Sign Out on the left, Cancel/Save on the right, all matched height */
+.profile-settings-actions{justify-content:space-between;align-items:center}
+.profile-settings-actions .profile-settings-signout{margin-top:0}
+.profile-settings-actions-right{display:flex;gap:8px;align-items:center}
+.profile-save-btn,.profile-cancel-btn,.profile-settings-actions .profile-settings-signout{min-height:38px;padding:8px 16px;border-radius:8px;font-size:14px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box}
+.profile-cancel-btn{background:transparent;border:1px solid rgba(255,255,255,.16);color:var(--text);cursor:pointer}
+.profile-cancel-btn:hover{border-color:rgba(255,255,255,.32)}
+
+/* Remove-my-app button in the App Directory */
+.app-card-remove{margin-left:auto;background:transparent;border:1px solid rgba(242,63,67,.4);color:#f23f43;font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;cursor:pointer}
+.app-card-remove:hover{background:rgba(242,63,67,.12)}
 /* Discover: external streams (Twitch/YouTube/Kik) */
 .discover-head-actions{display:flex;align-items:center;gap:8px}
 .discover-announce{padding:7px 14px;border:none;border-radius:9px;background:linear-gradient(135deg,#9146ff,#e0574d);color:#fff;font-size:12px;font-weight:800;cursor:pointer}

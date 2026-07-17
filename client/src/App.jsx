@@ -1638,6 +1638,16 @@ export default function App() {
     const patch = gaming ? { profile: normalized, gamingProfile: gaming } : { profile: normalized }
     patchUserSettings(patch)
     setUserSettings((prev) => ({ ...(prev || {}), ...patch }))
+    setShowProfileEditor(false)
+    setToast('Profile saved')
+  }
+
+  // Discard in-progress profile edits and leave Edit Profile mode (nothing is persisted until Save).
+  const cancelProfileEdit = () => {
+    setEditingProfile(normalizeProfile(profile))
+    setEditingSettings((s) => ({ ...(s || {}), gamingProfile: (userSettings && userSettings.gamingProfile) || { genres: [], currentGames: '' } }))
+    setCustomTagInput('')
+    setShowProfileEditor(false)
   }
 
   // Apply a preset color scheme: update live CSS vars, local state, and persist (merging so
@@ -4196,6 +4206,17 @@ export default function App() {
     setPublicApps(data.apps || [])
   }
 
+  // Remove one of your own uploaded apps (window.confirm works in Electron; only prompt doesn't).
+  const removeApp = async (id) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) return
+    if (!window.confirm('Remove this app from the directory?')) return
+    const res = await fetch(`${SERVER_URL}/apps/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${t}` } })
+    const data = await res.json().catch(() => ({}))
+    if (res.ok) setPublicApps(data.apps || [])
+    else alert(data.error || 'Could not remove app')
+  }
+
   // Custom emojis for the server currently on screen.
   const serverEmojiGroups = serverState?.server
     ? [{ serverId: serverState.server.id, serverName: serverState.server.name || 'Server', emojis: serverEmojis[serverState.server.id] || [] }]
@@ -5501,6 +5522,8 @@ export default function App() {
         apps={publicApps}
         onClose={() => setShowAppDirectory(false)}
         onUpload={uploadApp}
+        onRemove={removeApp}
+        currentUser={name}
         resolveSrc={emojiSrc}
       />
 
@@ -5530,14 +5553,17 @@ export default function App() {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="profile-settings-header">
-          <h2 id="profile-settings-title">Settings</h2>
+          <h2 id="profile-settings-title">{showProfileEditor ? 'Edit Profile' : 'Settings'}</h2>
           <button type="button" className="members-close" onClick={() => setShowSettingsPanel(false)} aria-label="Close">✕</button>
         </div>
+        {/* In Edit Profile mode the non-profile tabs are hidden so the popup is focused on the profile. */}
+        {!showProfileEditor && (
         <div className="profile-settings-tabs" role="tablist">
           <button type="button" role="tab" aria-selected={settingsTab === 'profile'} className={`profile-settings-tab${settingsTab === 'profile' ? ' active' : ''}`} onClick={() => setSettingsTab('profile')}>Profile</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'appearance'} className={`profile-settings-tab${settingsTab === 'appearance' ? ' active' : ''}`} onClick={() => setSettingsTab('appearance')}>Appearance</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'messages'} className={`profile-settings-tab${settingsTab === 'messages' ? ' active' : ''}`} onClick={() => setSettingsTab('messages')}>Messages</button>
         </div>
+        )}
         <div className="profile-settings-body">
           {settingsTab === 'profile' && editingProfile && (
           <section className="profile-settings-section">
@@ -5554,14 +5580,16 @@ export default function App() {
                 {editingProfile.statusMessage && <span className="profile-preview-status">{editingProfile.statusMessage}</span>}
                 {editingProfile.bio && <span className="profile-preview-bio">{editingProfile.bio}</span>}
               </div>
-              <button
-                type="button"
-                className={`profile-edit-toggle${showProfileEditor ? ' active' : ''}`}
-                aria-expanded={showProfileEditor}
-                onClick={() => setShowProfileEditor((v) => !v)}
-              >
-                {showProfileEditor ? 'Done' : 'Edit Profile'}
-              </button>
+              {!showProfileEditor && (
+                <button
+                  type="button"
+                  className="profile-edit-toggle"
+                  aria-expanded={showProfileEditor}
+                  onClick={() => setShowProfileEditor(true)}
+                >
+                  Edit Profile
+                </button>
+              )}
             </div>
 
             {/* Gaming profile — favorite genres + what you're playing lately */}
@@ -5725,7 +5753,12 @@ export default function App() {
               {isAuthenticated && (
                 <button type="button" className="profile-settings-signout" onClick={() => { setShowSettingsPanel(false); setShowSignOutConfirm(true) }}>Sign out</button>
               )}
-              <button type="button" className="connect-btn" onClick={saveProfile}>Save Profile</button>
+              <div className="profile-settings-actions-right">
+                {showProfileEditor && (
+                  <button type="button" className="profile-cancel-btn" onClick={cancelProfileEdit}>Cancel</button>
+                )}
+                <button type="button" className="connect-btn profile-save-btn" onClick={saveProfile}>Save Profile</button>
+              </div>
             </div>
           </section>
           )}

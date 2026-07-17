@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 
 // Centered modal listing public apps and an upload form to publish a new one.
-export default function AppDirectoryModal({ open, apps = [], onClose, onUpload, resolveSrc = (u) => u }) {
+export default function AppDirectoryModal({ open, apps = [], onClose, onUpload, onRemove, currentUser = '', resolveSrc = (u) => u }) {
   const [mode, setMode] = useState('browse') // 'browse' | 'upload'
   const [form, setForm] = useState({ name: '', description: '', url: '' })
   const [iconFile, setIconFile] = useState(null)
@@ -76,6 +76,9 @@ export default function AppDirectoryModal({ open, apps = [], onClose, onUpload, 
                       <div className="app-card-foot">
                         <span className="app-card-by">by {app.createdBy || 'someone'}</span>
                         {app.url && <a className="app-card-try" href={app.url} target="_blank" rel="noreferrer">Try it →</a>}
+                        {currentUser && app.createdBy === currentUser && (
+                          <button type="button" className="app-card-remove" onClick={() => onRemove?.(app.id)} title="Remove your app">Remove</button>
+                        )}
                       </div>
                     </div>
                   </div>

@@ -1381,6 +1381,18 @@ async function main() {
     return res.json({ success: true, apps });
   });
 
+  // Remove an app from the directory — only the user who uploaded it may remove it.
+  app.delete('/apps/:id', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid app id' });
+    const row = await db.get('SELECT created_by FROM apps WHERE id = ?', id);
+    if (!row) return res.status(404).json({ error: 'App not found' });
+    if (row.created_by !== req.user.username) return res.status(403).json({ error: 'You can only remove apps you uploaded' });
+    await db.run('DELETE FROM apps WHERE id = ?', id);
+    const apps = await db.all('SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt FROM apps ORDER BY created_at DESC');
+    return res.json({ success: true, apps });
+  });
+
   // --- Shared GIF library ---
   // List all GIFs (newest first).
   app.get('/gifs', authMiddleware, async (req, res) => {
