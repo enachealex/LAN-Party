@@ -1042,17 +1042,15 @@ async function main() {
     }
   }
 
-  // The rail shows the public 'demo' server plus every server the user is a member of (with role).
+  // The rail shows only the servers the user owns or has been invited to. New users start with an
+  // empty rail (no server is auto-joined at registration) and land on the home view.
   app.get('/servers', authMiddleware, async (req, res) => {
     const me = req.user.username;
-    const demo = await db.get('SELECT id, name, owner FROM servers WHERE id = ?', DEMO_ID);
     const mine = await db.all(
       'SELECT s.id, s.name, s.owner, m.role FROM server_members m JOIN servers s ON s.id = m.server_id WHERE m.username = ? ORDER BY s.rowid ASC',
       me
     );
-    const out = [];
-    if (demo) out.push({ id: demo.id, name: demo.name, owner: demo.owner || null, role: 'member' });
-    for (const s of mine) out.push({ id: s.id, name: s.name, owner: s.owner || null, role: s.role });
+    const out = mine.map((s) => ({ id: s.id, name: s.name, owner: s.owner || null, role: s.role }));
     return res.json({ servers: out });
   });
 
@@ -1069,9 +1067,9 @@ async function main() {
       me, me
     );
     if (!counts.length) return res.json({ unreads: {} });
-    // Roles for my servers: demo is implicit, others from membership rows.
+    // Roles for my servers, from membership rows (no implicit public server anymore).
     const memberships = await db.all('SELECT server_id, role FROM server_members WHERE username = ?', me);
-    const myRole = new Map([[DEMO_ID, 'member'], ...memberships.map((m) => [m.server_id, m.role])]);
+    const myRole = new Map(memberships.map((m) => [m.server_id, m.role]));
     const serverIds = [...new Set(counts.map((c) => c.server_id))].filter((id) => myRole.has(id));
     const unreads = {};
     for (const sid of serverIds) {
