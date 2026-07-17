@@ -816,6 +816,13 @@ export default function App() {
   // Editable username (in Edit Profile) — changing it reissues the auth token.
   const [editUsername, setEditUsername] = useState('')
   const [usernameSaving, setUsernameSaving] = useState(false)
+  // Email-link account flows (password reset / deactivation confirm), keyed off ?reset= / ?deactivate=.
+  const [accountFlow, setAccountFlow] = useState(null) // { type:'reset'|'deactivate', token, email }
+  const [flowPassword, setFlowPassword] = useState('')
+  const [flowPasswordConfirm, setFlowPasswordConfirm] = useState('')
+  const [flowError, setFlowError] = useState(null)
+  const [flowBusy, setFlowBusy] = useState(false)
+  const [flowDone, setFlowDone] = useState(null)
   // Direction new messages flow: 'bottom' (anchor to bottom, default) or 'top' (fill from top down).
   const [messageFlow, setMessageFlow] = useState('bottom')
   // The user's customizable profile (avatar, decorations, bio, tags, name styling).
@@ -1200,6 +1207,18 @@ export default function App() {
       if (socket) socket.disconnect()
       if (localStream) localStream.getTracks().forEach(t => t.stop())
     }
+  }, [])
+
+  // Email-link flows: /app/?reset=TOKEN&email=… or ?deactivate=TOKEN&email=… → open the matching
+  // overlay and scrub the token out of the address bar.
+  useEffect(() => {
+    try {
+      const p = new URLSearchParams(window.location.search)
+      const email = p.get('email') || ''
+      if (p.get('reset')) setAccountFlow({ type: 'reset', token: p.get('reset'), email })
+      else if (p.get('deactivate')) setAccountFlow({ type: 'deactivate', token: p.get('deactivate'), email })
+      if (p.get('reset') || p.get('deactivate')) window.history.replaceState({}, '', window.location.pathname)
+    } catch (_) { /* ignore */ }
   }, [])
 
   // Try to restore session from token
@@ -2167,6 +2186,46 @@ export default function App() {
     } catch (err) {
       setForgotMessage(err.message)
     } finally { setAuthLoading(false) }
+  }
+
+  // Complete a password reset from the emailed link.
+  const submitReset = async () => {
+    setFlowError(null)
+    if (!flowPassword || flowPassword !== flowPasswordConfirm) { setFlowError('Passwords do not match'); return }
+    setFlowBusy(true)
+    try {
+      const res = await fetch(`${SERVER_URL}/auth/reset`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: accountFlow.token, email: accountFlow.email, password: flowPassword, passwordConfirm: flowPasswordConfirm }) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { setFlowError(data.error || 'Could not reset password'); return }
+      setAccountFlow(null); setFlowPassword(''); setFlowPasswordConfirm('')
+      setFlowDone('Password reset! Log in with your new password.')
+    } catch (_) { setFlowError('Could not reach the server') } finally { setFlowBusy(false) }
+  }
+
+  // Confirm account deactivation from the emailed link → deletes the account, then signs out.
+  const submitDeactivateConfirm = async () => {
+    setFlowError(null); setFlowBusy(true)
+    try {
+      const res = await fetch(`${SERVER_URL}/account/deactivate/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: accountFlow.token, email: accountFlow.email }) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { setFlowError(data.error || 'Could not deactivate the account'); return }
+      try { socketRef.current?.disconnect() } catch (_) {}
+      localStorage.removeItem('lanparty_token'); localStorage.removeItem('lanparty_user')
+      setIsAuthenticated(false); setToken(null); setName('')
+      setAccountFlow(null)
+      setFlowDone('Your account has been deactivated. Sorry to see you go 💔')
+    } catch (_) { setFlowError('Could not reach the server') } finally { setFlowBusy(false) }
+  }
+
+  // Start deactivation from Settings → emails a confirmation link.
+  const requestDeactivate = async () => {
+    if (!window.confirm('Deactivate your account? We’ll email a confirmation link. Confirming permanently deletes your account and all its data.')) return
+    try {
+      const t = token || localStorage.getItem('lanparty_token')
+      const res = await fetch(`${SERVER_URL}/account/deactivate`, { method: 'POST', headers: { Authorization: `Bearer ${t}` } })
+      const data = await res.json().catch(() => ({}))
+      setToast(res.ok ? 'Check your email to confirm deactivation.' : (data.error || 'Could not start deactivation'))
+    } catch (_) { setToast('Could not reach the server') }
   }
 
   // The server id the main view is talking to ('home' shows DMs, backed by the default server).
@@ -5552,6 +5611,44 @@ export default function App() {
         </>
       )}
 
+      {/* Email-link account flows: password reset / deactivation confirm (works signed-out too) */}
+      {(accountFlow || flowDone) && (
+        <div className="account-flow-overlay" role="dialog" aria-modal="true">
+          <div className="account-flow-card">
+            {flowDone ? (
+              <>
+                <div className="account-flow-logo">🎮</div>
+                <h2 className="account-flow-title">All set</h2>
+                <p className="account-flow-text">{flowDone}</p>
+                <div className="account-flow-actions single"><button className="account-flow-btn primary" onClick={() => setFlowDone(null)}>Continue</button></div>
+              </>
+            ) : accountFlow.type === 'reset' ? (
+              <>
+                <h2 className="account-flow-title">Reset your password</h2>
+                <p className="account-flow-text">Set a new password for <b>{accountFlow.email}</b>.</p>
+                <input className="account-flow-input" type="password" placeholder="New password" value={flowPassword} onChange={(e) => setFlowPassword(e.target.value)} />
+                <input className="account-flow-input" type="password" placeholder="Confirm new password" value={flowPasswordConfirm} onChange={(e) => setFlowPasswordConfirm(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitReset() }} />
+                {flowError && <div className="account-flow-error">{flowError}</div>}
+                <div className="account-flow-actions">
+                  <button className="account-flow-btn ghost" onClick={() => setAccountFlow(null)}>Cancel</button>
+                  <button className="account-flow-btn primary" disabled={flowBusy || !flowPassword} onClick={submitReset}>{flowBusy ? 'Saving…' : 'Reset password'}</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h2 className="account-flow-title">Confirm deactivation</h2>
+                <p className="account-flow-text">This permanently deletes the account for <b>{accountFlow.email}</b> and all its data. This can’t be undone.</p>
+                {flowError && <div className="account-flow-error">{flowError}</div>}
+                <div className="account-flow-actions">
+                  <button className="account-flow-btn ghost" onClick={() => setAccountFlow(null)}>Cancel</button>
+                  <button className="account-flow-btn danger" disabled={flowBusy} onClick={submitDeactivateConfirm}>{flowBusy ? 'Deactivating…' : 'Deactivate account'}</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Public app directory */}
       <AppDirectoryModal
         open={showAppDirectory}
@@ -5817,6 +5914,13 @@ export default function App() {
               </div>
               <div className="profile-settings-field"><span className="profile-settings-label">Email</span><span className="profile-settings-value">{userEmail || '—'}</span></div>
             </div>
+
+            {isAuthenticated && (
+              <div className="profile-danger-zone">
+                <button type="button" className="profile-deactivate-btn" onClick={requestDeactivate}>Deactivate account</button>
+                <span className="profile-danger-hint">Permanently deletes your account &amp; data. We email a confirmation link first.</span>
+              </div>
+            )}
 
             <div className="profile-settings-actions">
               {isAuthenticated && (

@@ -9,6 +9,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const mailer = require('./email');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
@@ -282,6 +283,13 @@ async function main() {
     type TEXT,
     created_by TEXT,
     created_at INTEGER NOT NULL
+  )`);
+  // Short-lived one-time tokens for password reset + account-deactivation confirmation.
+  await db.exec(`CREATE TABLE IF NOT EXISTS auth_tokens (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER,
+    purpose TEXT,
+    expires_at INTEGER
   )`);
   try {
     await db.run(`ALTER TABLE messages ADD COLUMN attachment_json TEXT`);
@@ -878,15 +886,99 @@ async function main() {
     return res.json({ success: true, user: { username: user.username, email: user.email, settings: JSON.parse(user.settings || '{}') } });
   });
 
+  const newAuthToken = () => crypto.randomBytes(24).toString('base64url');
+
   app.post('/auth/forgot', async (req, res) => {
-    const { email } = req.body || {};
+    const email = String((req.body || {}).email || '').trim();
     if (!email) return res.status(400).json({ error: 'Missing email' });
-    const user = await db.get('SELECT * FROM users WHERE email = ?', email);
-    if (!user) return res.status(404).json({ error: 'Email not found' });
-    const token = Math.random().toString(36).slice(2, 10);
-    mockEmails.push({ to: email, subject: 'Password Reset', body: `Use this mock token to reset: ${token}` });
-    console.log('Mock password reset email queued for', email);
-    return res.json({ success: true, message: 'Reset email sent (mock)' });
+    const user = await db.get('SELECT id, username FROM users WHERE email = ?', email);
+    // Only send when the account exists, but always report success so emails can't be enumerated.
+    if (user) {
+      const token = newAuthToken();
+      await db.run('INSERT INTO auth_tokens (token, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)', token, user.id, 'reset', Date.now() + 60 * 60 * 1000);
+      mailer.sendPasswordReset(user.username, email, token).catch((e) => console.warn('reset email error', e && e.message));
+    }
+    return res.json({ success: true, message: 'If that email exists, a reset link is on its way.' });
+  });
+
+  // Complete a password reset with the emailed token.
+  app.post('/auth/reset', async (req, res) => {
+    const { token, email, password, passwordConfirm } = req.body || {};
+    if (!token || !email || !password) return res.status(400).json({ error: 'Missing fields' });
+    if (passwordConfirm != null && password !== passwordConfirm) return res.status(400).json({ error: 'Passwords do not match' });
+    if (!isStrongPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters and include 1 uppercase letter, 1 lowercase letter, 1 number, and 1 special character.' });
+    const row = await db.get('SELECT user_id, purpose, expires_at FROM auth_tokens WHERE token = ?', token);
+    if (!row || row.purpose !== 'reset' || row.expires_at < Date.now()) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
+    const user = await db.get('SELECT id, email FROM users WHERE id = ?', row.user_id);
+    if (!user || user.email !== email) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
+    await db.run('UPDATE users SET password_hash = ? WHERE id = ?', bcrypt.hashSync(password, 10), user.id);
+    await db.run('DELETE FROM auth_tokens WHERE token = ?', token);
+    return res.json({ success: true });
+  });
+
+  // Permanently delete a user and everything they own/authored (used by account deactivation).
+  async function deleteUserCompletely(userId, username) {
+    const owned = await db.all('SELECT id FROM servers WHERE owner = ?', username);
+    await db.run('BEGIN');
+    try {
+      for (const s of owned) {
+        await db.run('DELETE FROM channel_members WHERE channel_id IN (SELECT id FROM channels WHERE server_id = ?)', s.id);
+        await db.run('DELETE FROM channel_reads WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM messages WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM channels WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_members WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_emojis WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM servers WHERE id = ?', s.id);
+      }
+      await db.run('DELETE FROM server_members WHERE username = ?', username);
+      await db.run('DELETE FROM channel_members WHERE username = ?', username);
+      await db.run('DELETE FROM channel_reads WHERE username = ?', username);
+      await db.run('DELETE FROM music_playlists WHERE username = ?', username);
+      await db.run('DELETE FROM messages WHERE author = ?', username);
+      await db.run('UPDATE messages SET pinned_by = NULL WHERE pinned_by = ?', username);
+      await db.run('DELETE FROM server_emojis WHERE created_by = ?', username);
+      await db.run('DELETE FROM apps WHERE created_by = ?', username);
+      await db.run('DELETE FROM gifs WHERE created_by = ?', username);
+      await db.run('DELETE FROM sounds WHERE created_by = ?', username);
+      await db.run('DELETE FROM friendships WHERE user_id = ? OR friend_user_id = ?', userId, userId);
+      await db.run('DELETE FROM friend_requests WHERE from_user_id = ? OR to_user_id = ?', userId, userId);
+      await db.run('DELETE FROM direct_messages WHERE sender_id = ? OR recipient_id = ?', userId, userId);
+      await db.run('DELETE FROM auth_tokens WHERE user_id = ?', userId);
+      await db.run('DELETE FROM users WHERE id = ?', userId);
+      await db.run('COMMIT');
+    } catch (e) {
+      await db.run('ROLLBACK').catch(() => {});
+      throw e;
+    }
+  }
+
+  // Step 1: request deactivation → emails a confirmation link.
+  app.post('/account/deactivate', authMiddleware, async (req, res) => {
+    const me = await db.get('SELECT id, username, email FROM users WHERE username = ?', req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    if (!me.email) return res.status(400).json({ error: 'No email on file to confirm with' });
+    const token = newAuthToken();
+    await db.run('INSERT INTO auth_tokens (token, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)', token, me.id, 'deactivate', Date.now() + 60 * 60 * 1000);
+    mailer.sendDeactivationConfirm(me.username, me.email, token).catch((e) => console.warn('deactivation confirm email error', e && e.message));
+    return res.json({ success: true, message: 'Check your email to confirm deactivation.' });
+  });
+
+  // Step 2: confirm with the emailed token → delete the account + send the goodbye email.
+  app.post('/account/deactivate/confirm', async (req, res) => {
+    const { token, email } = req.body || {};
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+    const row = await db.get('SELECT user_id, purpose, expires_at FROM auth_tokens WHERE token = ?', token);
+    if (!row || row.purpose !== 'deactivate' || row.expires_at < Date.now()) return res.status(400).json({ error: 'This confirmation link is invalid or has expired.' });
+    const user = await db.get('SELECT id, username, email FROM users WHERE id = ?', row.user_id);
+    if (!user || (email && user.email !== email)) return res.status(400).json({ error: 'This confirmation link is invalid or has expired.' });
+    try {
+      await deleteUserCompletely(user.id, user.username);
+    } catch (e) {
+      console.error('deactivation failed', e);
+      return res.status(500).json({ error: 'Could not deactivate the account' });
+    }
+    if (user.email) mailer.sendDeactivationDone(user.username, user.email).catch((e) => console.warn('deactivation done email error', e && e.message));
+    return res.json({ success: true });
   });
 
   // Logout: revoke the presented token so it cannot be used again
