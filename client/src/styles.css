@@ -965,6 +965,27 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .reg-genre{padding:6px 11px;border-radius:14px;border:1px solid rgba(255,255,255,.16);background:transparent;color:var(--text);font-size:12px;font-weight:700;cursor:pointer;transition:background .1s ease}
 .reg-genre:hover{background:rgba(255,255,255,.08)}
 .reg-genre.active{background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#021022;border-color:transparent}
+
+/* First-login onboarding (welcome screen + gaming profile moved out of signup) */
+.onboarding-overlay{position:fixed;inset:0;z-index:6000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(6,8,12,.82);backdrop-filter:blur(6px)}
+.onboarding-card{width:100%;max-width:560px;max-height:92vh;overflow-y:auto;background:#12161c;border:1px solid rgba(255,255,255,.09);border-radius:18px;padding:34px 32px;box-shadow:0 30px 80px rgba(0,0,0,.55);text-align:center;color:#edf3fb}
+.onboarding-logo{width:72px;height:72px;object-fit:contain;margin-bottom:8px}
+.onboarding-eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:12px;font-weight:800;color:var(--accent-start);margin-bottom:6px}
+.onboarding-title{font-size:26px;margin:0 0 12px;font-weight:800}
+.onboarding-lede{color:#b7c4d4;line-height:1.6;margin:0 auto 22px;max-width:46ch;font-size:15px}
+.onboarding-genres{justify-content:center;margin:0 0 18px}
+.onboarding-label{display:block;text-align:left;font-size:14px;color:#cdd8e6;margin:6px 0 8px;font-weight:600}
+.onboarding-input{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;background:#0c1015;border:1px solid rgba(255,255,255,.12);color:#edf3fb;font-size:15px}
+.onboarding-input:focus{outline:none;border-color:var(--accent-start)}
+.onboarding-actions{display:flex;gap:12px;justify-content:center;margin-top:24px}
+.onboarding-actions.between{justify-content:space-between}
+.onboarding-btn{padding:12px 26px;border-radius:999px;font-weight:800;font-size:15px;cursor:pointer;border:1px solid transparent;transition:transform .12s ease,box-shadow .2s ease,filter .2s ease}
+.onboarding-btn.primary{background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#04121f;box-shadow:0 10px 26px rgba(0,0,0,.35)}
+.onboarding-btn.primary:hover{transform:translateY(-1px);filter:brightness(1.05)}
+.onboarding-btn.primary:disabled{opacity:.6;cursor:default;transform:none;filter:none}
+.onboarding-btn.ghost{background:transparent;color:#b7c4d4;border-color:rgba(255,255,255,.16)}
+.onboarding-btn.ghost:hover{border-color:rgba(255,255,255,.32);color:#edf3fb}
+.onboarding-btn.ghost:disabled{opacity:.5;cursor:default}
 /* Discover: external streams (Twitch/YouTube/Kik) */
 .discover-head-actions{display:flex;align-items:center;gap:8px}
 .discover-announce{padding:7px 14px;border:none;border-radius:9px;background:linear-gradient(135deg,#9146ff,#e0574d);color:#fff;font-size:12px;font-weight:800;cursor:pointer}

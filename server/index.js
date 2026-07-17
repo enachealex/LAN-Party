@@ -801,7 +801,7 @@ async function main() {
   }
 
   app.post('/auth/register', async (req, res) => {
-    const { username, email, password, passwordConfirm, genres, currentGames } = req.body || {};
+    const { username, email, password, passwordConfirm } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
     if (password !== passwordConfirm) return res.status(400).json({ error: 'Passwords do not match' });
     if (!isStrongPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters and include 1 uppercase letter, 1 lowercase letter, 1 number, and 1 special character.' });
@@ -814,12 +814,12 @@ async function main() {
     if (byEmail) return res.status(409).json({ error: 'Email already exists', field: 'email' });
     const defaultSettings = {
       railColor: '#7a0d0d', sidebarColor: '#0f1418', panelColor: '#111417', headerColor: '#7a0d0d', accentStart: '#2bc3ff', accentEnd: '#0b86ff', fontColor: '#edf6ff', leftTileColor: '#1f2933',
-      // Gaming profile collected at signup: favorite genres + what they're playing lately.
-      gamingProfile: {
-        genres: (Array.isArray(genres) ? genres : []).slice(0, 12).map((g) => String(g).slice(0, 30)),
-        currentGames: String(currentGames || '').trim().slice(0, 200),
-        updatedAt: Date.now(),
-      },
+      // Gaming profile (favorite genres + what they're playing lately) is now collected on first
+      // login via the welcome/onboarding flow, not at signup. Start empty until then.
+      gamingProfile: { genres: [], currentGames: '', updatedAt: 0 },
+      // New accounts see the first-login welcome + gaming-profile onboarding. Existing users don't
+      // have this flag, so `=== false` is false for them and they skip it.
+      onboardingComplete: false,
     };
     const hash = bcrypt.hashSync(password, 10);
     await db.run('INSERT INTO users (username, email, password_hash, settings) VALUES (?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings));

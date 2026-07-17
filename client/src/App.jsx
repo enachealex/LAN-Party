@@ -879,9 +879,12 @@ export default function App() {
   const [showRegPassword, setShowRegPassword] = useState(false)
   const [showRegPasswordConfirm, setShowRegPasswordConfirm] = useState(false)
   const [regEmailError, setRegEmailError] = useState(null)
-  // Gaming profile asked at signup: favorite genres + games played in the past 2 weeks.
-  const [regGenres, setRegGenres] = useState([])
-  const [regCurrentGames, setRegCurrentGames] = useState('')
+  // First-login onboarding: a welcome screen, then the gaming profile (moved out of registration).
+  const [showOnboarding, setShowOnboarding] = useState(false)
+  const [onbStep, setOnbStep] = useState(0) // 0 = welcome, 1 = "what do you love playing?"
+  const [onbGenres, setOnbGenres] = useState([])
+  const [onbCurrentGames, setOnbCurrentGames] = useState('')
+  const [onbSaving, setOnbSaving] = useState(false)
   const [leftNav, setLeftNav] = useState('friends')
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
@@ -1177,6 +1180,8 @@ export default function App() {
         setUserEmail(data.user.email || '')
         setUserSettings(data.user.settings)
         applySettings(data.user.settings)
+        // Resume onboarding if a new account refreshed before finishing it.
+        maybeStartOnboarding(data.user.settings)
         // sync and connect
         try {
           const syncRes = await fetch(`${SERVER_URL}/user/sync`, { headers: { 'Authorization': `Bearer ${t}` } })
@@ -1623,8 +1628,6 @@ export default function App() {
     setRegEmail('')
     setRegPassword('')
     setRegPasswordConfirm('')
-    setRegGenres([])
-    setRegCurrentGames('')
     setAuthError(null)
     setForgotMessage(null)
     setRegUsernameError(null)
@@ -1945,6 +1948,33 @@ export default function App() {
     s.on('collab:clear', () => collabCanvasRef.current?.clearCanvas())
   }
 
+  // First-login onboarding: show the welcome + gaming-profile flow only for brand-new accounts.
+  // New users get settings.onboardingComplete === false from the server; existing users don't have
+  // the flag, so `=== false` is false for them and they skip it.
+  const maybeStartOnboarding = (settings) => {
+    if (settings && settings.onboardingComplete === false) {
+      setOnbGenres([])
+      setOnbCurrentGames('')
+      setOnbStep(0)
+      setShowOnboarding(true)
+    }
+  }
+
+  // Persist the gaming profile chosen during onboarding and mark it complete so it won't show again.
+  const finishOnboarding = async (skip = false) => {
+    setOnbSaving(true)
+    const gamingProfile = {
+      genres: skip ? [] : onbGenres.slice(0, 12),
+      currentGames: skip ? '' : onbCurrentGames.trim().slice(0, 200),
+      updatedAt: Date.now(),
+    }
+    const patch = { gamingProfile, onboardingComplete: true }
+    setUserSettings((prev) => ({ ...(prev || {}), ...patch }))
+    try { await patchUserSettings(patch) } catch (_) { /* best-effort; flag still set locally */ }
+    setOnbSaving(false)
+    setShowOnboarding(false)
+  }
+
   // Auth handlers
   const handleLogin = async (e) => {
     e && e.preventDefault && e.preventDefault()
@@ -1970,6 +2000,8 @@ export default function App() {
         setUserSettings(data.user.settings)
         applySettings(data.user.settings)
       }
+      // First login for a new account → run the welcome + gaming-profile onboarding.
+      maybeStartOnboarding(data.user.settings)
 
       // sync messaging data for user (use token)
       try {
@@ -2017,7 +2049,7 @@ export default function App() {
     try {
       const res = await fetch(`${SERVER_URL}/auth/register`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: regUsername, email: regEmail, password: regPassword, passwordConfirm: regPasswordConfirm, genres: regGenres, currentGames: regCurrentGames })
+        body: JSON.stringify({ username: regUsername, email: regEmail, password: regPassword, passwordConfirm: regPasswordConfirm })
       })
       const data = await res.json()
       if (!res.ok) {
@@ -5166,29 +5198,6 @@ export default function App() {
                   <div className="field-error-message" role="alert">Passwords do not match</div>
                 )}
 
-                <label style={{ marginTop: 12 }}>🎮 What do you love playing? <span className="reg-optional">(pick any)</span></label>
-                <div className="reg-genres">
-                  {GAME_GENRES.map((g) => (
-                    <button
-                      key={g}
-                      type="button"
-                      className={`reg-genre${regGenres.includes(g) ? ' active' : ''}`}
-                      onClick={() => setRegGenres((prev) => prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g])}
-                    >
-                      {g}
-                    </button>
-                  ))}
-                </div>
-                <label>What are you playing right now? <span className="reg-optional">(past 2 weeks)</span></label>
-                <input
-                  className="half-field"
-                  type="text"
-                  placeholder="e.g. Valorant, Baldur's Gate 3"
-                  maxLength={200}
-                  value={regCurrentGames}
-                  onChange={(e) => setRegCurrentGames(e.target.value)}
-                />
-
                 <div style={{display:'flex',justifyContent:'flex-end',marginTop:10}}>
                   <button type="submit" className="connect-btn" disabled={!canCreate} aria-disabled={!canCreate}>{authLoading ? 'Creating...' : 'Create Account'}</button>
                 </div>
@@ -5197,6 +5206,61 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* First-login onboarding: a welcome screen, then the gaming profile (moved out of signup) */}
+      {isAuthenticated && showOnboarding && (
+        <div className="onboarding-overlay" role="dialog" aria-modal="true" aria-labelledby="onb-title">
+          <div className="onboarding-card">
+            {onbStep === 0 ? (
+              <>
+                <img className="onboarding-logo" src={import.meta.env.BASE_URL + 'icons/logo-192.png'} alt="LAN Party logo" width="72" height="72" />
+                <div className="onboarding-eyebrow">Welcome to LAN Party</div>
+                <h2 id="onb-title" className="onboarding-title">Hey {name}! 🎉</h2>
+                <p className="onboarding-lede">
+                  This is your place for game nights — text &amp; voice channels, camera and screen
+                  share, party activities like synced music and Sketch &amp; Guess, and watching
+                  Twitch, YouTube &amp; Kik streams together. Create a server or hop into a friend's to
+                  get going.
+                </p>
+                <div className="onboarding-actions">
+                  <button className="onboarding-btn primary" onClick={() => setOnbStep(1)}>Get started →</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="onboarding-eyebrow">Step 2 of 2</div>
+                <h2 id="onb-title" className="onboarding-title">🎮 What do you love playing?</h2>
+                <p className="onboarding-lede">Pick your favorite genres so friends can find you on Discover — totally optional, and you can change it later in your profile.</p>
+                <div className="reg-genres onboarding-genres">
+                  {GAME_GENRES.map((g) => (
+                    <button
+                      key={g}
+                      type="button"
+                      className={`reg-genre${onbGenres.includes(g) ? ' active' : ''}`}
+                      onClick={() => setOnbGenres((prev) => prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g])}
+                    >
+                      {g}
+                    </button>
+                  ))}
+                </div>
+                <label className="onboarding-label">What are you playing right now? <span className="reg-optional">(past 2 weeks)</span></label>
+                <input
+                  className="onboarding-input"
+                  type="text"
+                  placeholder="e.g. Valorant, Baldur's Gate 3"
+                  maxLength={200}
+                  value={onbCurrentGames}
+                  onChange={(e) => setOnbCurrentGames(e.target.value)}
+                />
+                <div className="onboarding-actions between">
+                  <button className="onboarding-btn ghost" onClick={() => finishOnboarding(true)} disabled={onbSaving}>Skip</button>
+                  <button className="onboarding-btn primary" onClick={() => finishOnboarding(false)} disabled={onbSaving}>{onbSaving ? 'Saving…' : 'Finish'}</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Public app directory */}
       <AppDirectoryModal
