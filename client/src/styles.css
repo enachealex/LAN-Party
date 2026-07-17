@@ -1105,11 +1105,12 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .extviewer-mini-btn{background:transparent;border:none;color:var(--text);font-size:15px;font-weight:800;cursor:pointer;padding:2px 8px;border-radius:6px;line-height:1}
 .extviewer-mini-btn:hover{background:rgba(255,255,255,.12)}
 /* Picture-in-picture: a small, draggable, always-on-top floating player */
-.extviewer-overlay.mini{position:fixed;inset:auto;left:24px;top:90px;width:344px;height:auto;padding:0;background:transparent;display:block;z-index:6100;box-shadow:0 18px 50px rgba(0,0,0,.6);border-radius:12px}
-.extviewer-overlay.mini .extviewer-frame{width:344px;height:auto;border-radius:12px}
-.extviewer-overlay.mini .extviewer-embed{height:194px;flex:none}
+.extviewer-overlay.mini{position:fixed;inset:auto;left:24px;top:90px;width:344px;height:226px;padding:0;background:transparent;display:block;z-index:6100;box-shadow:0 18px 50px rgba(0,0,0,.6);border-radius:12px}
+.extviewer-overlay.mini .extviewer-frame{width:100%;height:100%;border-radius:12px}
+.extviewer-overlay.mini .extviewer-embed{flex:1;height:auto}
 .extviewer-overlay.mini .extviewer-head.drag{cursor:move;user-select:none}
 .extviewer-overlay.mini .extviewer-title{font-size:12px}
+.extviewer-resize{position:absolute;right:2px;bottom:2px;width:16px;height:16px;cursor:nwse-resize;z-index:3;background:linear-gradient(135deg,transparent 45%,rgba(255,255,255,.55) 45%,rgba(255,255,255,.55) 55%,transparent 55%,transparent 70%,rgba(255,255,255,.55) 70%,rgba(255,255,255,.55) 80%,transparent 80%);border-radius:0 0 10px 0}
 /* Sketch & Guess */
 .sketch-lobby{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:22px;text-align:center}
 .sketch-lobby-title{font-size:22px;font-weight:800;color:var(--text)}

@@ -823,9 +823,10 @@ export default function App() {
   const [flowError, setFlowError] = useState(null)
   const [flowBusy, setFlowBusy] = useState(false)
   const [flowDone, setFlowDone] = useState(null)
-  // Live-stream picture-in-picture: minimized state + draggable position.
+  // Live-stream picture-in-picture: minimized state + draggable position + resizable size.
   const [streamMini, setStreamMini] = useState(false)
   const [streamPos, setStreamPos] = useState({ x: 24, y: 90 })
+  const [streamSize, setStreamSize] = useState({ w: 344, h: 226 })
   // Direction new messages flow: 'bottom' (anchor to bottom, default) or 'top' (fill from top down).
   const [messageFlow, setMessageFlow] = useState('bottom')
   // The user's customizable profile (avatar, decorations, bio, tags, name styling).
@@ -2879,6 +2880,26 @@ export default function App() {
       x: Math.max(0, Math.min(window.innerWidth - W, origin.x + (ev.clientX - startX))),
       y: Math.max(0, Math.min(window.innerHeight - H, origin.y + (ev.clientY - startY))),
     })
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+  // Resize the PiP miniplayer from its bottom-right corner (keeps it fully on-screen by nudging
+  // its position if growing would push it past an edge).
+  const startResizeStream = (e) => {
+    e.stopPropagation()
+    if (e.button !== 0) return
+    const startX = e.clientX, startY = e.clientY
+    const origin = { ...streamSize }
+    const onMove = (ev) => {
+      const w = Math.max(240, Math.min(window.innerWidth - 12, origin.w + (ev.clientX - startX)))
+      const h = Math.max(150, Math.min(window.innerHeight - 12, origin.h + (ev.clientY - startY)))
+      setStreamSize({ w, h })
+      setStreamPos((p) => ({
+        x: Math.max(6, Math.min(p.x, window.innerWidth - w - 6)),
+        y: Math.max(6, Math.min(p.y, window.innerHeight - h - 6)),
+      }))
+    }
     const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
@@ -5085,7 +5106,7 @@ export default function App() {
         <div
           className={`extviewer-overlay ${streamMini ? 'mini' : ''}`}
           onClick={() => { if (!streamMini) minimizeStream() }}
-          style={streamMini ? { left: streamPos.x, top: streamPos.y } : undefined}
+          style={streamMini ? { left: streamPos.x, top: streamPos.y, width: streamSize.w, height: streamSize.h } : undefined}
         >
           <div className="extviewer-frame" onClick={(e) => e.stopPropagation()}>
             <div
@@ -5104,6 +5125,7 @@ export default function App() {
               <div className="discover-empty">This stream can't be embedded — check the link the streamer shared.</div>
             )}
           </div>
+          {streamMini && <div className="extviewer-resize" onMouseDown={startResizeStream} title="Resize" />}
         </div>
       )}
       {/* Teams-style pre-join screen */}
