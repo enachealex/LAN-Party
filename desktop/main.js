@@ -60,6 +60,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // Keep timers + requestAnimationFrame running at full rate when the window is hidden/minimized
+      // to the tray, so a shared camera (which flows through a canvas.captureStream) never freezes
+      // and calls keep working in the background.
+      backgroundThrottling: false,
     },
   })
 

@@ -161,7 +161,16 @@ export class WebcamEffectProcessor {
         this._drawSimple()
       }
     }
-    this.rafId = requestAnimationFrame(this._loop)
+    // requestAnimationFrame is PAUSED while the window/tab is hidden, which would freeze the camera
+    // for everyone until you come back. Fall back to a timer when hidden so the feed keeps flowing —
+    // full-rate in the desktop app (backgroundThrottling:false), reduced-rate in a hidden browser tab.
+    if (typeof document !== 'undefined' && document.hidden) {
+      this.rafId = null
+      this._hiddenTimer = setTimeout(this._loop, 1000 / 15)
+    } else {
+      this._hiddenTimer = null
+      this.rafId = requestAnimationFrame(this._loop)
+    }
   }
 
   // Non-segmentation draw: 'hide' → fill the frame with the background; otherwise raw passthrough.
@@ -231,6 +240,7 @@ export class WebcamEffectProcessor {
     this.running = false
     if (this.rafId) cancelAnimationFrame(this.rafId)
     this.rafId = null
+    if (this._hiddenTimer) { clearTimeout(this._hiddenTimer); this._hiddenTimer = null }
     try { this.segmenter && this.segmenter.close() } catch (e) { /* ignore */ }
     this.segmenter = null
     if (this.video) { try { this.video.pause() } catch (e) {} this.video.srcObject = null; this.video = null }
