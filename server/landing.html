@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LAN Party — game-night comms for your crew</title>
-    <meta name="description" content="LAN Party is a free communication app for game nights: servers, voice & video, screen share, and built-in activities like synced music, Watch Together, and party games. Launch it in your browser." />
+    <meta name="description" content="LAN Party is a free communication app for game nights: servers, voice & video, screen share, synced music, party games, and watching Twitch, YouTube, and Kik live streams together. Use it in your browser or the auto-updating Windows app." />
     <meta name="theme-color" content="#7a0d0d" />
     <link rel="icon" type="image/png" href="/app/icons/logo-192.png" />
     <link rel="apple-touch-icon" href="/app/icons/logo-192.png" />
@@ -96,7 +96,47 @@
       footer a { color: var(--amber); text-decoration: none; }
       footer a:hover { color: var(--red); }
 
-      @media (max-width: 720px) { .features { grid-template-columns: 1fr; } .hero { padding-top: 44px; } }
+      /* Screenshot gallery */
+      .shots { margin: 60px 0 0; }
+      .shots h2 { text-align: center; font-size: clamp(1.6rem, 4vw, 2.2rem); margin: 0 0 8px; }
+      .shots .sub { text-align: center; color: var(--muted); margin: 0 0 26px; }
+      .shot {
+        border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+        background: #0a0503; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+      }
+      .shot img { display: block; width: 100%; height: auto; }
+      .shot .cap { padding: 12px 16px; color: var(--muted); font-size: 0.9rem; border-top: 1px solid var(--line); }
+      .shot .cap b { color: var(--text); font-weight: 700; }
+      .shots-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 16px; }
+
+      /* Watch live streams band */
+      .watch {
+        margin: 46px 0 0; padding: 28px 26px; border-radius: 16px; text-align: center;
+        background: linear-gradient(135deg, rgba(145, 70, 255, 0.16), rgba(255, 0, 0, 0.12));
+        border: 1px solid var(--line);
+      }
+      .watch h3 { margin: 8px 0 8px; font-size: 1.35rem; }
+      .watch p { margin: 0 auto; color: var(--muted); max-width: 62ch; line-height: 1.65; }
+      .watch .platforms { display: flex; gap: 10px 14px; justify-content: center; flex-wrap: wrap; margin-top: 18px; }
+      .watch .platforms span {
+        padding: 7px 15px; border-radius: 999px; font-weight: 700; font-size: 0.9rem;
+        border: 1px solid var(--line); background: rgba(0, 0, 0, 0.28); color: var(--text);
+      }
+
+      /* Download button + header layout */
+      .btn.download { background: linear-gradient(135deg, var(--amber), #d97a3c); color: #22110a; box-shadow: 0 12px 34px rgba(240, 160, 112, 0.28); }
+      .btn.download:hover { transform: translateY(-2px); box-shadow: 0 16px 44px rgba(240, 160, 112, 0.44); }
+      .header-ctas { display: flex; align-items: center; gap: 10px; }
+      .top-cta.alt { background: transparent; border-color: var(--line); color: var(--text); }
+      .top-cta.alt:hover { border-color: var(--amber); box-shadow: none; }
+      .win-note { margin: 12px 0 0; color: var(--muted); font-size: 0.82rem; }
+
+      @media (max-width: 720px) {
+        .features { grid-template-columns: 1fr; }
+        .hero { padding-top: 44px; }
+        .shots-grid { grid-template-columns: 1fr; }
+        .top-cta.alt { display: none; }
+      }
     </style>
   </head>
   <body>
@@ -106,7 +146,10 @@
           <img src="/app/icons/logo-192.png" alt="LAN Party logo" width="44" height="44" />
           <b>LAN Party</b>
         </a>
-        <a class="top-cta" href="/app/">Launch App</a>
+        <div class="header-ctas">
+          <a class="top-cta alt" href="/downloads/LAN-Party-Setup.exe">⬇ Windows app</a>
+          <a class="top-cta" href="/app/">Launch App</a>
+        </div>
       </header>
 
       <section class="hero">
@@ -120,9 +163,32 @@
         </p>
         <div class="actions">
           <a class="btn primary" href="/app/">🚀 Launch App</a>
-          <a class="btn ghost" href="#features">See what's inside</a>
+          <a class="btn download" href="/downloads/LAN-Party-Setup.exe">⬇ Download for Windows</a>
         </div>
-        <p class="free-note">Free · runs in your browser · installs to your desktop or phone like an app.</p>
+        <p class="free-note">Free · runs in your browser · or install the Windows desktop app that auto-updates itself on launch.</p>
+      </section>
+
+      <section class="shots" id="screens">
+        <h2>See it in action</h2>
+        <p class="sub">A real game-night server — chat, party activities, and synced music.</p>
+        <div class="shot">
+          <img src="/landing-assets/01-chat.jpg" alt="LAN Party chat — a Game Night server with text and voice channels" width="1600" height="997" loading="lazy" />
+          <div class="cap"><b>Servers &amp; channels</b> — text and voice for your whole crew, all in one place.</div>
+        </div>
+        <div class="shots-grid">
+          <div class="shot">
+            <img src="/landing-assets/03-activities.jpg" alt="Activities launcher with party games" width="1600" height="997" loading="lazy" />
+            <div class="cap"><b>Party activities</b> — Music, Sketch &amp; Guess, Watch Together, polls &amp; more.</div>
+          </div>
+          <div class="shot">
+            <img src="/landing-assets/04-music.jpg" alt="Synced music with a shared queue" width="1600" height="997" loading="lazy" />
+            <div class="cap"><b>Synced music</b> — search YouTube or Spotify, queue together, pass the DJ role.</div>
+          </div>
+          <div class="shot">
+            <img src="/landing-assets/02-members.jpg" alt="Server members list with roles" width="1600" height="997" loading="lazy" />
+            <div class="cap"><b>Roles &amp; invites</b> — owners, admins, and private channels you control.</div>
+          </div>
+        </div>
       </section>
 
       <section class="features" id="features">
@@ -143,19 +209,39 @@
         </div>
       </section>
 
+      <section class="watch">
+        <div class="ico" style="font-size: 26px">📺</div>
+        <h3>Watch live streams together</h3>
+        <p>
+          Someone going live? Pull the stream up right inside your server and watch it as a group —
+          live video from <b>Twitch</b>, <b>YouTube</b>, and <b>Kik</b> without anyone leaving the
+          party. The Discover panel shows what's streaming so nobody misses the action.
+        </p>
+        <div class="platforms">
+          <span>🟣 Twitch</span>
+          <span>🔴 YouTube Live</span>
+          <span>🟢 Kik</span>
+        </div>
+      </section>
+
       <div class="strip">
         <span><b>Servers</b> &amp; channels</span>
         <span><b>Voice</b> &amp; video</span>
         <span><b>Screen share</b></span>
         <span><b>Synced music</b> (YouTube &amp; Spotify)</span>
         <span><b>Party games</b></span>
+        <span><b>Live streams</b> (Twitch, YouTube &amp; Kik)</span>
         <span><b>GIFs</b> &amp; soundboard</span>
       </div>
 
       <section class="bottom-cta">
         <h2>Ready for the next game night?</h2>
-        <p>Sign up in seconds — no download required.</p>
-        <a class="btn primary" href="/app/">🚀 Launch App</a>
+        <p>Launch it in your browser in seconds — or grab the desktop app that keeps itself up to date.</p>
+        <div class="actions">
+          <a class="btn primary" href="/app/">🚀 Launch App</a>
+          <a class="btn download" href="/downloads/LAN-Party-Setup.exe">⬇ Download for Windows</a>
+        </div>
+        <p class="win-note">Windows 10 &amp; 11 · ~80&nbsp;MB · updates automatically on launch · your conversations stay synced to your account, never stored on the device.</p>
       </section>
 
       <footer>

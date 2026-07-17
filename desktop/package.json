@@ -1,31 +1,59 @@
 {
   "name": "lan-party-desktop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Electron desktop wrapper for the LAN Party communication app",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "cross-env ELECTRON_START_URL=http://localhost:5173 electron .",
+    "dev": "cross-env LANPARTY_URL=http://localhost:5173 electron .",
     "build": "electron-builder"
   },
   "build": {
     "appId": "com.thejumpvault.lanparty",
     "productName": "LAN Party",
     "copyright": "© The Jump Vault (thejumpvault.com)",
-    "files": ["main.js", "preload.js", "package.json"],
-    "extraResources": [{ "from": "../client/dist", "to": "client-dist" }],
+    "artifactName": "LAN-Party-Setup.${ext}",
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
     "win": {
       "target": "nsis",
+      "icon": "build/icon.png",
       "publisherName": "The Jump Vault",
       "rfc3161TimeStampServer": "http://timestamp.digicert.com"
     },
-    "mac": { "target": "dmg", "category": "public.app-category.social-networking" },
-    "linux": { "target": "AppImage" }
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false,
+      "shortcutName": "LAN Party"
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://lanparty.thejumpvault.com/downloads/"
+      }
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.social-networking",
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "build/icon.png"
+    }
   },
   "devDependencies": {
     "cross-env": "^7.0.3",
     "electron": "^31.7.7",
     "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
   }
 }

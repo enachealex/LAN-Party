@@ -44,6 +44,10 @@ async function main() {
   // Soundboard clips are also persistent (outside /uploads).
   const soundsDir = path.join(DATA_DIR, 'sounds');
   fs.mkdirSync(soundsDir, { recursive: true });
+  // Desktop installer + auto-update feed (LAN-Party-Setup.exe, latest.yml, .blockmap).
+  // Lives on the data volume (the big files are pushed here out-of-band), NOT swept by cleanup.
+  const downloadsDir = path.join(DATA_DIR, 'downloads');
+  fs.mkdirSync(downloadsDir, { recursive: true });
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -126,6 +130,10 @@ async function main() {
   // letting it fall through to the GIF-list API route below.
   app.use('/gifs', express.static(gifsDir, { redirect: false }));
   app.use('/sounds', express.static(soundsDir, { redirect: false }));
+  // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
+  app.use('/downloads', express.static(downloadsDir, { redirect: false }));
+  // Static images used by the landing page (app screenshots). Committed with the repo.
+  app.use('/landing-assets', express.static(path.join(__dirname, 'landing-assets'), { redirect: false }));
   // Serve the built client (single-origin hosting) UNDER /app; a landing page sits at /.
   // Enabled when CLIENT_DIST exists (i.e. the client has been built + is present).
   const serveClient = fs.existsSync(path.join(CLIENT_DIST, 'index.html'));
