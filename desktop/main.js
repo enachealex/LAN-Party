@@ -47,11 +47,18 @@ function createOverlayWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'overlay-preload.js'),
       contextIsolation: true, nodeIntegration: false, backgroundThrottling: false,
+      // Fresh session with no service worker — the app's SW (registered by the main window) otherwise
+      // intercepts same-origin loads in a new window and the overlay page fails with ERR_FAILED.
+      partition: 'overlay-nosw',
     },
   })
   overlayWindow.setAlwaysOnTop(true, 'screen-saver')
   overlayWindow.setVisibleOnAllWorkspaces(true)
-  overlayWindow.loadFile(path.join(__dirname, 'overlay.html'))
+  // Load the overlay page from the app origin over https — loading local file:// content into a
+  // second BrowserWindow fails with ERR_FAILED on Windows, but https works, and the overlay-preload
+  // still provides the overlayBridge IPC regardless of the page's URL.
+  overlayWindow.loadURL(new URL('overlay.html', APP_URL).toString())
+    .catch((e) => console.error('[overlay] load failed', e && e.message))
   overlayWindow.on('closed', () => { overlayWindow = null })
   return overlayWindow
 }
