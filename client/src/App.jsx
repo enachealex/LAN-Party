@@ -885,6 +885,9 @@ export default function App() {
   const [onbGenres, setOnbGenres] = useState([])
   const [onbCurrentGames, setOnbCurrentGames] = useState('')
   const [onbSaving, setOnbSaving] = useState(false)
+  // In-app text prompt (replaces window.prompt, which Electron doesn't support). Promise-based.
+  const [promptModal, setPromptModal] = useState(null) // { title, label, placeholder, submitLabel, resolve }
+  const [promptValue, setPromptValue] = useState('')
   const [leftNav, setLeftNav] = useState('friends')
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
@@ -2128,8 +2131,21 @@ export default function App() {
     }
   }
 
+  // Promise-based text prompt via an in-app modal (window.prompt is unsupported in the Electron app).
+  const askPrompt = (opts = {}) => new Promise((resolve) => {
+    setPromptValue(opts.initial || '')
+    setPromptModal({
+      title: opts.title || 'Enter a value',
+      label: opts.label || '',
+      placeholder: opts.placeholder || '',
+      submitLabel: opts.submitLabel || 'OK',
+      resolve,
+    })
+  })
+  const resolvePrompt = (value) => { promptModal?.resolve(value); setPromptModal(null) }
+
   const createServer = async () => {
-    const serverName = (window.prompt('Name your new server:') || '').trim()
+    const serverName = ((await askPrompt({ title: 'Create a server', label: 'Server name', placeholder: 'e.g. Game Night', submitLabel: 'Create' })) || '').trim()
     if (!serverName) return
     const t = token || localStorage.getItem('lanparty_token')
     try {
@@ -2171,7 +2187,7 @@ export default function App() {
   }
 
   const renameServer = async (serverId, oldName) => {
-    const name2 = (window.prompt('Rename server:', oldName || '') || '').trim()
+    const name2 = ((await askPrompt({ title: 'Rename server', label: 'Server name', initial: oldName || '', submitLabel: 'Rename' })) || '').trim()
     if (!name2 || name2 === oldName) return
     const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) })
     if (!res.ok) alert((await res.json()).error || 'Rename failed')
@@ -2185,7 +2201,7 @@ export default function App() {
   }
 
   const renameChannel = async (channelId, oldName) => {
-    const name2 = (window.prompt('Rename channel:', oldName || '') || '').trim()
+    const name2 = ((await askPrompt({ title: 'Rename channel', label: 'Channel name', initial: oldName || '', submitLabel: 'Rename' })) || '').trim()
     if (!name2 || name2 === oldName) return
     const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/channels/${encodeURIComponent(channelId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) })
     if (!res.ok) alert((await res.json()).error || 'Rename failed')
@@ -2199,7 +2215,7 @@ export default function App() {
 
   // ---- Membership management (invite / leave / kick / roles) ----
   const inviteToServer = async (serverId) => {
-    const uname = (window.prompt('Invite a user to this server by username:') || '').trim()
+    const uname = ((await askPrompt({ title: 'Invite to server', label: 'Username', placeholder: 'their exact username', submitLabel: 'Invite' })) || '').trim()
     if (!uname) return
     const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/invite`, { method: 'POST', body: JSON.stringify({ username: uname }) })
     if (res.ok) setToast(`Invited ${uname}`)
@@ -5258,6 +5274,34 @@ export default function App() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* In-app text prompt — replaces window.prompt (unsupported in the Electron desktop app) */}
+      {promptModal && (
+        <div className="prompt-overlay" role="dialog" aria-modal="true" aria-labelledby="prompt-title" onMouseDown={(e) => { if (e.target === e.currentTarget) resolvePrompt(null) }}>
+          <div className="prompt-card">
+            <div id="prompt-title" className="prompt-title">{promptModal.title}</div>
+            {promptModal.label && <label className="prompt-label" htmlFor="prompt-input">{promptModal.label}</label>}
+            <input
+              id="prompt-input"
+              className="prompt-input"
+              autoFocus
+              type="text"
+              maxLength={80}
+              placeholder={promptModal.placeholder}
+              value={promptValue}
+              onChange={(e) => setPromptValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); resolvePrompt(promptValue) }
+                else if (e.key === 'Escape') { e.preventDefault(); resolvePrompt(null) }
+              }}
+            />
+            <div className="prompt-actions">
+              <button className="prompt-btn ghost" onClick={() => resolvePrompt(null)}>Cancel</button>
+              <button className="prompt-btn primary" onClick={() => resolvePrompt(promptValue)}>{promptModal.submitLabel}</button>
+            </div>
           </div>
         </div>
       )}
