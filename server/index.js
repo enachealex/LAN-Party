@@ -2489,6 +2489,36 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       io.to(to).emit('voice:signal', { from: socket.id, signal });
     });
 
+    // ---- Direct 1:1 calls between friends (ring/accept/decline + WebRTC relay) ----
+    // Invite/accept/decline/cancel/end route by user room or peer socket id; call:signal relays
+    // WebRTC offers/answers/ICE by socket id (like voice:signal, but on a separate channel so it
+    // never collides with server-voice-channel signaling).
+    socket.on('call:invite', ({ to, video } = {}) => {
+      if (!socketUser || !to) return;
+      const room = io.sockets.adapter.rooms.get(`user:${to}`);
+      if (!room || room.size === 0) { socket.emit('call:unavailable', { to }); return; }
+      io.to(`user:${to}`).emit('call:incoming', { from: socketUser, fromSocket: socket.id, video: !!video });
+    });
+    socket.on('call:accept', ({ to } = {}) => { // to = caller's socket id
+      if (!to) return;
+      io.to(to).emit('call:accepted', { from: socketUser, fromSocket: socket.id });
+      // Tell this user's OTHER devices to stop ringing.
+      socket.to(`user:${socketUser}`).emit('call:handled');
+    });
+    socket.on('call:decline', ({ to } = {}) => { // to = caller's socket id
+      if (to) io.to(to).emit('call:declined', { from: socketUser });
+      socket.to(`user:${socketUser}`).emit('call:handled');
+    });
+    socket.on('call:cancel', ({ to } = {}) => { // to = callee username (caller hangs up before answer)
+      if (to) io.to(`user:${to}`).emit('call:canceled', { from: socketUser });
+    });
+    socket.on('call:end', ({ to } = {}) => { // to = peer socket id (during a connected call)
+      if (to) io.to(to).emit('call:ended', { from: socketUser });
+    });
+    socket.on('call:signal', ({ to, signal } = {}) => { // WebRTC relay, to = peer socket id
+      if (to) io.to(to).emit('call:signal', { from: socket.id, signal });
+    });
+
     // NOTE: emit voice:peer-left from 'disconnecting' (not 'disconnect') — Socket.IO clears
     // socket.rooms before 'disconnect' fires, so iterating rooms there finds nothing and peers
     // never learn someone left (ghost tiles pile up). 'disconnecting' still has the rooms intact.

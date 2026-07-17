@@ -741,6 +741,20 @@ function EffectsIcon() { return (<svg {...svgProps}><path d="M12 3l1.6 4.2L18 8.
 // White phone handset (like 📞) for the Leave button.
 function HangupIcon() { return (<svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.62 10.79a15.53 15.53 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24 11.36 11.36 0 0 0 3.57.57 1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.24 1.02l-2.2 2.2z" /></svg>) }
 
+// Plays a WebRTC remote MediaStream (audio, or video for video calls) via imperative srcObject.
+function RemoteMedia({ stream, video }) {
+  const ref = useRef(null)
+  useEffect(() => { if (ref.current) ref.current.srcObject = stream || null }, [stream])
+  return video
+    ? <video ref={ref} autoPlay playsInline className="call-remote-video" />
+    : <audio ref={ref} autoPlay />
+}
+
+function formatDuration(sec) {
+  const s = Math.max(0, Math.floor(sec || 0))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
 export default function App() {
   const [socket, setSocket] = useState(null)
   const [name, setName] = useState('')
@@ -888,6 +902,14 @@ export default function App() {
   // In-app text prompt (replaces window.prompt, which Electron doesn't support). Promise-based.
   const [promptModal, setPromptModal] = useState(null) // { title, label, placeholder, submitLabel, resolve }
   const [promptValue, setPromptValue] = useState('')
+  // Direct 1:1 friend calls (separate from server voice channels; own peer connection + signaling).
+  const [call, setCall] = useState(null) // { status:'outgoing'|'incoming'|'connecting'|'connected', peer, peerSocket, video, startedAt }
+  const [callRemoteStream, setCallRemoteStream] = useState(null)
+  const [callMuted, setCallMuted] = useState(false)
+  const [callElapsed, setCallElapsed] = useState(0)
+  const callRef = useRef(null)
+  const callPcRef = useRef(null)
+  const callLocalStreamRef = useRef(null)
   const [leftNav, setLeftNav] = useState('friends')
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
@@ -993,6 +1015,15 @@ export default function App() {
   useEffect(() => {
     homeChatRef.current = homeChat
   }, [homeChat])
+
+  // Mirror call state for socket callbacks + tick the in-call timer once connected.
+  useEffect(() => { callRef.current = call }, [call])
+  useEffect(() => {
+    if (call?.status !== 'connected') return
+    const started = call.startedAt || Date.now()
+    const id = setInterval(() => setCallElapsed(Math.floor((Date.now() - started) / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [call?.status, call?.startedAt])
 
   // Identity of the currently-open chat (channel or home chat).
   const activeChatKey = homeChat ? `home:${homeChat.id}` : `channel:${selectedServerId}:${activeChannel}`
@@ -1934,6 +1965,15 @@ export default function App() {
       if (id) setPeerNames((prev) => ({ ...prev, [id]: peerName }))
     })
     s.on('voice:signal', ({ from, signal }) => { handleSignal(from, signal) })
+    // Direct 1:1 friend calls
+    s.on('call:incoming', ({ from, fromSocket, video }) => onCallIncoming(from, fromSocket, video))
+    s.on('call:accepted', ({ from, fromSocket }) => onCallAccepted(from, fromSocket))
+    s.on('call:declined', () => onCallDeclined())
+    s.on('call:canceled', () => onCallCanceled())
+    s.on('call:ended', () => onCallEnded())
+    s.on('call:unavailable', () => onCallUnavailable())
+    s.on('call:handled', () => onCallHandledElsewhere())
+    s.on('call:signal', ({ from, signal }) => handleCallSignal(from, signal))
     s.on('voice:peer-left', ({ id }) => { removePeer(id); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
     s.on('voice:screenshare-state', ({ id, sharing }) => setScreenSharingPeers((prev) => ({ ...prev, [id]: sharing })))
     // Watch/Discover: the server pushes the full list of who's live whenever it changes.
@@ -2237,6 +2277,114 @@ export default function App() {
     if (res.ok) setToast(`${username} is now ${role === 'admin' ? 'an admin' : 'a member'}`)
     else alert((await res.json()).error || 'Could not change role')
   }
+
+  // ---- Direct 1:1 friend calls (WebRTC, separate from server voice channels) ----
+  const teardownCall = () => {
+    try { callPcRef.current?.close() } catch (_) {}
+    callPcRef.current = null
+    if (callLocalStreamRef.current) { try { callLocalStreamRef.current.getTracks().forEach((t) => t.stop()) } catch (_) {} callLocalStreamRef.current = null }
+    setCallRemoteStream(null)
+    setCallMuted(false)
+    setCallElapsed(0)
+    setCall(null)
+  }
+
+  const startCallPeer = async (peerSocket, isCaller) => {
+    const pc = new RTCPeerConnection({ iceServers: iceConfigRef.current })
+    callPcRef.current = pc
+    const ls = callLocalStreamRef.current
+    if (ls) ls.getTracks().forEach((t) => pc.addTrack(t, ls))
+    pc.onicecandidate = (e) => { if (e.candidate) socketRef.current?.emit('call:signal', { to: peerSocket, signal: { candidate: e.candidate } }) }
+    pc.ontrack = (e) => { setCallRemoteStream(e.streams[0]) }
+    pc.onconnectionstatechange = () => {
+      const st = pc.connectionState
+      if (st === 'connected') setCall((c) => (c ? { ...c, status: 'connected', startedAt: c.startedAt || Date.now() } : c))
+      else if ((st === 'failed' || st === 'closed' || st === 'disconnected') && callRef.current) teardownCall()
+    }
+    if (isCaller) {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      socketRef.current?.emit('call:signal', { to: peerSocket, signal: { description: pc.localDescription } })
+    }
+  }
+
+  const handleCallSignal = async (fromSocket, signal) => {
+    const pc = callPcRef.current
+    if (!pc) return
+    try {
+      if (signal.description) {
+        await pc.setRemoteDescription(signal.description)
+        if (signal.description.type === 'offer') {
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          socketRef.current?.emit('call:signal', { to: fromSocket, signal: { description: pc.localDescription } })
+        }
+      } else if (signal.candidate) {
+        await pc.addIceCandidate(signal.candidate)
+      }
+    } catch (err) { console.warn('call signal error', err) }
+  }
+
+  const startCall = async (peerUsername, withVideo = false) => {
+    if (!peerUsername || callRef.current) return
+    let stream
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: withVideo }) }
+    catch (e) { alert('Microphone access is required to call.'); return }
+    callLocalStreamRef.current = stream
+    setCall({ status: 'outgoing', peer: peerUsername, peerSocket: null, video: withVideo })
+    socketRef.current?.emit('call:invite', { to: peerUsername, video: withVideo })
+  }
+
+  const acceptCall = async () => {
+    const c = callRef.current
+    if (!c || c.status !== 'incoming') return
+    let stream
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: c.video }) }
+    catch (e) { declineCall(); return }
+    callLocalStreamRef.current = stream
+    setCall({ ...c, status: 'connecting' })
+    await startCallPeer(c.peerSocket, false) // create the peer, then answer the caller's offer
+    socketRef.current?.emit('call:accept', { to: c.peerSocket })
+  }
+
+  const declineCall = () => {
+    const c = callRef.current
+    if (c?.peerSocket) socketRef.current?.emit('call:decline', { to: c.peerSocket })
+    teardownCall()
+  }
+
+  const hangUpCall = () => {
+    const c = callRef.current
+    if (c) {
+      if (c.status === 'outgoing') socketRef.current?.emit('call:cancel', { to: c.peer })
+      else if (c.peerSocket) socketRef.current?.emit('call:end', { to: c.peerSocket })
+    }
+    teardownCall()
+  }
+
+  const toggleCallMute = () => {
+    setCallMuted((m) => {
+      const next = !m
+      callLocalStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = !next })
+      return next
+    })
+  }
+
+  // Reactions to inbound call socket events (bound in connect()).
+  const onCallIncoming = (from, fromSocket, video) => {
+    if (callRef.current) { socketRef.current?.emit('call:decline', { to: fromSocket }); return } // busy
+    setCall({ status: 'incoming', peer: from, peerSocket: fromSocket, video: !!video })
+  }
+  const onCallAccepted = async (from, fromSocket) => {
+    if (!callRef.current || callRef.current.status !== 'outgoing') return
+    setCall((c) => (c ? { ...c, status: 'connecting', peerSocket: fromSocket } : c))
+    await startCallPeer(fromSocket, true) // caller creates the offer once the callee accepts
+  }
+  const onCallDeclined = () => { if (callRef.current) { setToast(`${callRef.current.peer} declined`); teardownCall() } }
+  const onCallCanceled = () => { if (callRef.current?.status === 'incoming') teardownCall() }
+  const onCallEnded = () => { if (callRef.current) teardownCall() }
+  const onCallHandledElsewhere = () => { if (callRef.current?.status === 'incoming') teardownCall() }
+  const onCallUnavailable = () => { setToast(`${callRef.current?.peer || 'They'} can't be reached`); teardownCall() }
   useEffect(() => {
     if (!toast) return
     const t = setTimeout(() => setToast(null), 3200)
@@ -4260,6 +4408,11 @@ export default function App() {
                         }
                       }}>Download App</button>
                     )}
+                    {homeChat?.peerUsername && !call && (
+                      <button className="call-btn" title={`Call ${homeChat.peerUsername}`} onClick={() => startCall(homeChat.peerUsername, false)}>
+                        <span aria-hidden>📞</span> Call
+                      </button>
+                    )}
                     {showMembersButton && (
                       <button className="members-btn" onClick={() => setShowMembersPanel(true)}>Members</button>
                     )}
@@ -5304,6 +5457,42 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Direct friend call: incoming ring, or the in-call bar (remote audio plays via RemoteMedia) */}
+      {call && (
+        <>
+          <RemoteMedia stream={callRemoteStream} video={call.video} />
+          {call.status === 'incoming' ? (
+            <div className="call-overlay" role="dialog" aria-modal="true" aria-label={`Incoming call from ${call.peer}`}>
+              <div className="call-ring-card">
+                <div className="call-ring-avatar">{(call.peer || '?').slice(0, 1).toUpperCase()}</div>
+                <div className="call-ring-name">{call.peer}</div>
+                <div className="call-ring-sub">Incoming {call.video ? 'video ' : ''}call…</div>
+                <div className="call-ring-actions">
+                  <button className="call-ring-btn decline" onClick={declineCall}>Decline</button>
+                  <button className="call-ring-btn accept" onClick={acceptCall}>Accept</button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="call-bar">
+              <div className="call-bar-info">
+                <span className="call-bar-avatar">{(call.peer || '?').slice(0, 1).toUpperCase()}</span>
+                <span className="call-bar-text">
+                  <span className="call-bar-name">{call.peer}</span>
+                  <span className="call-bar-status">{call.status === 'outgoing' ? 'Calling…' : call.status === 'connecting' ? 'Connecting…' : formatDuration(callElapsed)}</span>
+                </span>
+              </div>
+              <div className="call-bar-actions">
+                {(call.status === 'connected' || call.status === 'connecting') && (
+                  <button className={`call-bar-btn ${callMuted ? 'active' : ''}`} title={callMuted ? 'Unmute' : 'Mute'} onClick={toggleCallMute}>{callMuted ? '🔇' : '🎙️'}</button>
+                )}
+                <button className="call-bar-btn hangup" title="Hang up" onClick={hangUpCall}>📞</button>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {/* Public app directory */}

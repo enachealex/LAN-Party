@@ -1000,6 +1000,35 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .prompt-btn.primary:hover{filter:brightness(1.06)}
 .prompt-btn.ghost{background:transparent;color:#b7c4d4;border-color:rgba(255,255,255,.16)}
 .prompt-btn.ghost:hover{border-color:rgba(255,255,255,.32);color:#edf3fb}
+
+/* Direct friend calls: DM-header call button, incoming ring overlay, in-call bar */
+.call-btn{padding:7px 14px;border-radius:8px;border:1px solid rgba(255,255,255,.16);background:transparent;color:var(--text);font-size:13px;font-weight:800;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.call-btn:hover{background:rgba(43,182,115,.18);border-color:#2bb673}
+.call-overlay{position:fixed;inset:0;z-index:6400;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(6,8,12,.72);backdrop-filter:blur(5px)}
+.call-ring-card{width:100%;max-width:340px;background:#12161c;border:1px solid rgba(255,255,255,.1);border-radius:18px;padding:30px 26px;text-align:center;color:#edf3fb;box-shadow:0 24px 64px rgba(0,0,0,.55)}
+.call-ring-avatar{width:76px;height:76px;border-radius:50%;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:800;color:#04121f;background:linear-gradient(135deg,var(--accent-start),var(--accent-end));animation:callpulse 1.4s ease-in-out infinite}
+@keyframes callpulse{0%,100%{box-shadow:0 0 0 0 rgba(43,195,255,.45)}50%{box-shadow:0 0 0 14px rgba(43,195,255,0)}}
+.call-ring-name{font-size:20px;font-weight:800;margin-bottom:4px}
+.call-ring-sub{color:#9fb0bf;font-size:13px;margin-bottom:22px}
+.call-ring-actions{display:flex;gap:14px;justify-content:center}
+.call-ring-btn{flex:1;padding:12px 0;border-radius:10px;border:none;font-weight:800;font-size:14px;cursor:pointer;color:#fff}
+.call-ring-btn.accept{background:#2bb673}
+.call-ring-btn.accept:hover{background:#25a366}
+.call-ring-btn.decline{background:#e0574d}
+.call-ring-btn.decline:hover{background:#cf4a41}
+.call-bar{position:fixed;z-index:6300;left:50%;bottom:22px;transform:translateX(-50%);display:flex;align-items:center;gap:16px;background:#12161c;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:10px 14px;box-shadow:0 18px 50px rgba(0,0,0,.5);color:#edf3fb;min-width:280px;max-width:calc(100vw - 32px)}
+.call-bar-info{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+.call-bar-avatar{width:38px;height:38px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-weight:800;color:#04121f;background:linear-gradient(135deg,var(--accent-start),var(--accent-end))}
+.call-bar-text{display:flex;flex-direction:column;min-width:0}
+.call-bar-name{font-weight:800;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.call-bar-status{font-size:12px;color:#9fb0bf}
+.call-bar-actions{display:flex;gap:8px}
+.call-bar-btn{width:40px;height:40px;border-radius:50%;border:none;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;background:#222933;color:#edf3fb}
+.call-bar-btn:hover{background:#2c343f}
+.call-bar-btn.active{background:#e0574d;color:#fff}
+.call-bar-btn.hangup{background:#e0574d;color:#fff}
+.call-bar-btn.hangup:hover{background:#cf4a41}
+.call-remote-video{position:fixed;z-index:6300;right:20px;bottom:90px;width:280px;max-width:40vw;border-radius:12px;border:1px solid rgba(255,255,255,.15);box-shadow:0 18px 50px rgba(0,0,0,.5);background:#000}
 /* Discover: external streams (Twitch/YouTube/Kik) */
 .discover-head-actions{display:flex;align-items:center;gap:8px}
 .discover-announce{padding:7px 14px;border:none;border-radius:9px;background:linear-gradient(135deg,#9146ff,#e0574d);color:#fff;font-size:12px;font-weight:800;cursor:pointer}
