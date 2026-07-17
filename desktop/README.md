@@ -25,27 +25,34 @@ client from `client/dist` is bundled as an extra resource (`client-dist`).
 `main.js` grants camera / mic / screen-capture and provides a source to `getDisplayMedia`
 via `desktopCapturer` (uses the OS picker where supported) so screen sharing works in the app.
 
-## Code signing (self-signed, The Jump Vault)
+## Code signing (Publisher = Jump Vault LLC)
 
-The app can be digitally signed with a self-signed certificate for **The Jump Vault (thejumpvault.com)**.
+The SmartScreen "Publisher" line comes **only** from the app's Authenticode signature — an unsigned
+build always shows "Unknown publisher" no matter what `publisherName` says. To show
+**Jump Vault LLC**, the `.exe` must be signed with a certificate whose subject is `Jump Vault LLC`.
 
-1. Generate the certificate (creates `certs/thejumpvault.pfx` + `.cer`, gitignored):
+**Trusted CA cert (the real fix — shows the publisher for everyone, drops the warning):** buy an OV
+or EV code-signing certificate issued to Jump Vault LLC from a trusted CA (DigiCert, Sectigo,
+SSL.com…). Then sign as below with that `.pfx` (or the CA's cloud-signing token).
+
+**Self-signed (interim — your own machine only):**
+1. Generate the certificate (creates `certs/jumpvaultllc.pfx` + `.cer`, gitignored):
    ```powershell
    ./scripts/create-cert.ps1
    ```
 2. Build a **signed** installer (electron-builder reads these env vars):
    ```powershell
-   $env:CSC_LINK = "certs/thejumpvault.pfx"
+   $env:CSC_LINK = "certs/jumpvaultllc.pfx"
    $env:CSC_KEY_PASSWORD = "<the password you chose>"
    npm run build
    ```
-   The build config sets `publisherName: "The Jump Vault"` and RFC-3161 timestamping. Without the
+   The build config sets `publisherName: "Jump Vault LLC"` and RFC-3161 timestamping. Without the
    env vars, builds are unsigned.
 3. To trust the signature on a test machine (as Administrator), import the public `.cer` into
    `TrustedPublisher` and `Root` (commands are printed by the script).
 
-Self-signed proves integrity + publisher identity but is **not** trusted by Windows SmartScreen by
-default — for warning-free public distribution you'd need a cert from a trusted CA.
+A self-signed cert is **not** trusted by Windows on other machines — they still see "Unknown
+publisher." Only a trusted-CA cert removes the warning for everyone.
 
 ## Notes / next steps
 - Giphy: uses the **Web JS/React SDK** (not React Native). Key stays server-side via the proxy.

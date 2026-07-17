@@ -790,6 +790,8 @@ export default function App() {
   const [memberMenu, setMemberMenu] = useState(null) // right-click manage menu: { x, y, username, name, role }
   const [deferredPrompt, setDeferredPrompt] = useState(null)
   const [showInstallPanel, setShowInstallPanel] = useState(false)
+  // Hide browser "Download App" / PWA install UI when already running inside the Electron desktop shell.
+  const isDesktopApp = typeof window !== 'undefined' && !!window.desktop?.isElectron
   // Public app directory modal.
   const [showAppDirectory, setShowAppDirectory] = useState(false)
   const [publicApps, setPublicApps] = useState([])
@@ -2040,7 +2042,7 @@ export default function App() {
       const res = await fetch(`${SERVER_URL}/auth/forgot`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: forgotEmail }) })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Request failed')
-      setForgotMessage(data.message || 'If that email exists, a reset link was sent (mock).')
+      setForgotMessage(data.message || 'If that email exists, a reset link was sent.')
     } catch (err) {
       setForgotMessage(err.message)
     } finally { setAuthLoading(false) }
@@ -4197,17 +4199,19 @@ export default function App() {
                   </div>
 
                   <div className="topbar-right" style={{display:'flex',gap:8,alignItems:'center'}}>
-                    <button className="create-app-btn" onClick={() => {
-                      if (deferredPrompt) {
-                        deferredPrompt.prompt()
-                        deferredPrompt.userChoice.then(choice => {
-                          console.log('PWA choice', choice)
-                          setDeferredPrompt(null)
-                        })
-                      } else {
-                        setShowInstallPanel(true)
-                      }
-                    }}>Download App</button>
+                    {!isDesktopApp && (
+                      <button className="create-app-btn" onClick={() => {
+                        if (deferredPrompt) {
+                          deferredPrompt.prompt()
+                          deferredPrompt.userChoice.then(choice => {
+                            console.log('PWA choice', choice)
+                            setDeferredPrompt(null)
+                          })
+                        } else {
+                          setShowInstallPanel(true)
+                        }
+                      }}>Download App</button>
+                    )}
                     {showMembersButton && (
                       <button className="members-btn" onClick={() => setShowMembersPanel(true)}>Members</button>
                     )}
@@ -5210,11 +5214,11 @@ export default function App() {
           <button className="members-close" onClick={() => setShowInstallPanel(false)}>✕</button>
         </div>
         <div className="members-panel-body">
-          <p>If your browser supports Progressive Web Apps, you can install the app by using the browser's install option. Otherwise you can download a native installer in a future build.</p>
+          <p>If your browser supports Progressive Web Apps, you can install LAN Party from the browser install option. You can also use the native Windows desktop app when available.</p>
           <p>Options:</p>
           <ul>
             <li>Install as PWA (use browser menu or the prompt)</li>
-            <li>Download native installer (not available in demo)</li>
+            <li>Use the native desktop installer if you already have it</li>
           </ul>
         </div>
       </div>
@@ -5435,6 +5439,7 @@ export default function App() {
             <div className="scheme-grid">
               {COLOR_SCHEMES.map((scheme) => {
                 const active = matchSchemeId(editingSettings || userSettings) === scheme.id
+                const { railColor, headerColor, panelColor, sidebarColor, accentStart, accentEnd, leftTileColor } = scheme.colors
                 return (
                   <button
                     key={scheme.id}
@@ -5443,12 +5448,19 @@ export default function App() {
                     onClick={() => selectScheme(scheme)}
                     aria-pressed={active}
                   >
-                    <span className="scheme-swatches">
-                      <span style={{ background: scheme.colors.railColor }} />
-                      <span style={{ background: scheme.colors.headerColor }} />
-                      <span style={{ background: `linear-gradient(90deg, ${scheme.colors.accentStart}, ${scheme.colors.accentEnd})` }} />
-                      <span style={{ background: scheme.colors.panelColor }} />
-                    </span>
+                    <div className="scheme-preview" aria-hidden="true">
+                      <div className="scheme-preview-rail" style={{ backgroundColor: railColor }} />
+                      <div className="scheme-preview-main" style={{ backgroundColor: sidebarColor }}>
+                        <div className="scheme-preview-header" style={{ backgroundColor: headerColor }} />
+                        <div className="scheme-preview-panel" style={{ backgroundColor: panelColor }}>
+                          <div className="scheme-preview-tile" style={{ backgroundColor: leftTileColor }} />
+                          <div
+                            className="scheme-preview-accent"
+                            style={{ backgroundImage: `linear-gradient(90deg, ${accentStart}, ${accentEnd})` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
                     <span className="scheme-name">{scheme.name}{active ? ' ✓' : ''}</span>
                   </button>
                 )

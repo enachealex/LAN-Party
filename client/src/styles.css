@@ -645,11 +645,16 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .profile-settings-tab.active{color:var(--text);border-bottom-color:var(--accent-end)}
 /* Color scheme cards */
 .scheme-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
-.scheme-card{display:flex;flex-direction:column;gap:8px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);cursor:pointer;text-align:left}
+.scheme-card{display:flex;flex-direction:column;gap:8px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);cursor:pointer;text-align:left;color:inherit}
 .scheme-card:hover{background:rgba(255,255,255,.07)}
 .scheme-card.active{border-color:var(--accent-end);box-shadow:0 0 0 1px var(--accent-end)}
-.scheme-swatches{display:flex;height:34px;border-radius:7px;overflow:hidden;border:1px solid rgba(0,0,0,.3)}
-.scheme-swatches span{flex:1;display:block}
+.scheme-preview{display:flex;height:48px;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,.12);flex-shrink:0}
+.scheme-preview-rail{width:14px;flex-shrink:0;min-height:100%}
+.scheme-preview-main{flex:1;display:flex;flex-direction:column;min-width:0}
+.scheme-preview-header{height:10px;flex-shrink:0}
+.scheme-preview-panel{flex:1;display:flex;align-items:center;gap:6px;padding:6px 8px;min-height:0}
+.scheme-preview-tile{width:14px;height:14px;border-radius:4px;flex-shrink:0}
+.scheme-preview-accent{flex:1;height:8px;border-radius:999px;min-width:24px}
 .scheme-name{font-size:13px;font-weight:700;color:var(--text)}
 
 /* App directory modal */

@@ -7,38 +7,6 @@ const FRIENDS_ICON_URL = ICON_BASE + 'friends-nav.png'
 const CREATE_MESSAGE_ICON_URL = ICON_BASE + 'create-message.png'
 const ADD_FRIEND_ICON_URL = ICON_BASE + 'add-friend.png'
 
-// Varied demo profiles so you can preview how other users' customizations look.
-const MOCK_PROFILES = {
-  Tanis: { border: { preset: 'gold' }, overlay: 'glow', nameStyle: { id: 'gold' }, nameFont: 'serif', tags: [{ type: 'server', label: 'LAN Party' }, { type: 'custom', label: 'MVP' }] },
-  domotropico: { border: { preset: 'neon' }, overlay: 'ring', nameStyle: { id: 'cyber' }, nameFont: 'mono', tags: [{ type: 'custom', label: 'DEV' }] },
-  BC037138: { border: { preset: 'emerald' }, overlay: 'pulse', nameStyle: { id: 'gradient' }, nameFont: 'condensed' },
-  CHEESYMAC8979: { border: { preset: 'rose' }, overlay: 'sparkle', nameStyle: { id: 'rainbow' }, nameFont: 'rounded', tags: [{ type: 'custom', label: 'GAMER' }] },
-  jengas: { border: { preset: 'dashed' }, overlay: 'none', nameStyle: { id: 'fire' }, nameFont: 'default' },
-  DBot: { border: { preset: 'custom', color: '#a855f7', width: 3, style: 'double' }, overlay: 'glow', nameStyle: { id: 'cyber' }, nameFont: 'mono', tags: [{ type: 'custom', label: 'BOT' }] },
-}
-
-export const MOCK_FRIENDS = [
-  { id: 'f1', name: 'Tanis', status: 'online', avatar: '#5865f2', profile: MOCK_PROFILES.Tanis },
-  { id: 'f2', name: 'domotropico', status: 'idle', avatar: '#3ba55c', activity: 'Windrose', profile: MOCK_PROFILES.domotropico },
-  { id: 'f3', name: 'BC037138', status: 'online', avatar: '#faa61a', profile: MOCK_PROFILES.BC037138 },
-  { id: 'f4', name: 'CHEESYMAC8979', status: 'dnd', avatar: '#eb459e', profile: MOCK_PROFILES.CHEESYMAC8979 },
-  { id: 'f5', name: 'jengas', status: 'offline', avatar: '#747f8d', profile: MOCK_PROFILES.jengas },
-]
-
-export const MOCK_DIRECT_MESSAGES = [
-  { id: 'dm1', name: 'Tanis', status: 'online', avatar: '#5865f2', profile: MOCK_PROFILES.Tanis },
-  { id: 'dm2', name: 'domotropico', status: 'idle', activity: 'Windrose', avatar: '#3ba55c', profile: MOCK_PROFILES.domotropico },
-  { id: 'dm3', name: 'BC037138', status: 'online', avatar: '#faa61a', profile: MOCK_PROFILES.BC037138 },
-  { id: 'dm4', name: 'CHEESYMAC8979', status: 'dnd', avatar: '#eb459e', profile: MOCK_PROFILES.CHEESYMAC8979 },
-  { id: 'dm5', name: 'DBot', status: 'online', avatar: '#5865f2', bot: true, profile: MOCK_PROFILES.DBot },
-]
-
-export const MOCK_GROUP_MESSAGES = [
-  { id: 'g1', name: 'LAN Squad', preview: '3 members', avatar: '#5865f2' },
-  { id: 'g2', name: 'Friday Night', preview: '8 members', avatar: '#3ba55c' },
-  { id: 'g3', name: 'Dev Chat', preview: '5 members', avatar: '#eb459e' },
-]
-
 const NAV_META = {
   friends: { label: 'Friends', icon: FRIENDS_ICON_URL },
   messages: { label: 'Messages', icon: null },
@@ -117,7 +85,7 @@ export default function HomeLeftPanel({
   outgoingFriendRequests = [],
   onCancelOutgoingFriendRequest,
   dmConversations = [],
-  groupConversations = null,
+  groupConversations = [],
   totalUnreadMessages = 0,
   unreadByChatId = {},
   groupUnread = {},
@@ -522,20 +490,15 @@ export default function HomeLeftPanel({
     return a.name.localeCompare(b.name)
   }
 
-  const directMessageList = (() => {
-    const base = dmConversations.length > 0 ? dmConversations : MOCK_DIRECT_MESSAGES
-    return [...base]
-      .map((dm) => ({
-        ...dm,
-        peerUsername: dm.peerUsername || dm.name,
-        unreadCount: getUnread(dm),
-      }))
-      .sort(sortByRecentActivity)
-  })()
+  const directMessageList = [...dmConversations]
+    .map((dm) => ({
+      ...dm,
+      peerUsername: dm.peerUsername || dm.name,
+      unreadCount: getUnread(dm),
+    }))
+    .sort(sortByRecentActivity)
 
-  const groupMessageList = Array.isArray(groupConversations)
-    ? [...groupConversations].sort(sortByRecentActivity)
-    : [...MOCK_GROUP_MESSAGES].sort(sortByRecentActivity)
+  const groupMessageList = [...(groupConversations || [])].sort(sortByRecentActivity)
 
   // All draggable entities (DMs + groups + friends) keyed by id, for manual-ordered sections.
   const allConversations = useMemo(() => {
@@ -732,7 +695,12 @@ export default function HomeLeftPanel({
           >
             <div className="dc-msg-group-label">Direct Messages</div>
             <ul className="dc-dm-list">
-              {conversationsForBucket(UNSORTED).filter((e) => e.kind === 'dm').map(renderEntry)}
+              {(() => {
+                const dms = conversationsForBucket(UNSORTED).filter((e) => e.kind === 'dm')
+                return dms.length === 0
+                  ? <li className="dc-friends-empty">No direct messages yet.</li>
+                  : dms.map(renderEntry)
+              })()}
             </ul>
           </div>
           <div className="dc-msg-group">
