@@ -5628,7 +5628,8 @@ export default function App() {
               )}
             </div>
 
-            {/* Gaming profile — favorite genres + what you're playing lately */}
+            {/* Gaming profile — set during onboarding; not part of the Edit Profile popup */}
+            {!showProfileEditor && (
             <div className="gaming-profile-card">
               <h3 className="profile-settings-section-title">🎮 Gaming Profile</h3>
               <div className="gaming-sub">Favorite genres</div>
@@ -5648,6 +5649,7 @@ export default function App() {
               />
               <div className="gaming-hint">Shown to others on your live-stream cards in Discover.</div>
             </div>
+            )}
 
             {showProfileEditor && (
             <div className="profile-editor-panel">
