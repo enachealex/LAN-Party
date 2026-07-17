@@ -1047,6 +1047,11 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .username-edit-input{flex:1;min-width:0;padding:6px 10px;font-size:14px}
 .username-change-btn{flex:none;padding:7px 14px;border-radius:8px;border:none;background:linear-gradient(90deg,var(--accent-start),var(--accent-end));color:#021022;font-weight:700;font-size:13px;cursor:pointer}
 .username-change-btn:disabled{opacity:.45;cursor:not-allowed}
+
+/* Profile-picture set confirmation */
+.profile-pic-confirm{display:flex;align-items:center;gap:10px;margin:8px 0 4px;font-size:13px;color:#3ba55c}
+.profile-pic-confirm-thumb{width:36px;height:36px;border-radius:8px;object-fit:cover;border:1px solid rgba(255,255,255,.14);background:#0c1015}
+.profile-pic-confirm b{color:var(--text)}
 /* Discover: external streams (Twitch/YouTube/Kik) */
 .discover-head-actions{display:flex;align-items:center;gap:8px}
 .discover-announce{padding:7px 14px;border:none;border-radius:9px;background:linear-gradient(135deg,#9146ff,#e0574d);color:#fff;font-size:12px;font-weight:800;cursor:pointer}

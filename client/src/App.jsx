@@ -1631,6 +1631,7 @@ export default function App() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Upload failed')
       updateProfileDraft({ avatarUrl: data.attachment.url })
+      setToast('Profile picture updated — Save Profile to apply')
     } catch (err) {
       setUploadError(err.message)
     }
@@ -5662,10 +5663,16 @@ export default function App() {
                 type="text"
                 className="profile-text-input"
                 placeholder="…or paste an image URL"
-                onPaste={(e) => { const v = e.clipboardData.getData('text'); if (v) { e.preventDefault(); setAvatarFromUrl(v) } }}
-                onKeyDown={(e) => { if (e.key === 'Enter') { setAvatarFromUrl(e.target.value); e.target.value = '' } }}
+                value={editingProfile.avatarUrl || ''}
+                onChange={(e) => updateProfileDraft({ avatarUrl: e.target.value })}
               />
             </div>
+            {editingProfile.avatarUrl ? (
+              <div className="profile-pic-confirm">
+                <img className="profile-pic-confirm-thumb" src={emojiSrc(editingProfile.avatarUrl)} alt="" onError={(e) => { e.currentTarget.style.visibility = 'hidden' }} />
+                <span>✓ Picture set — click <b>Save Profile</b> to apply it.</span>
+              </div>
+            ) : null}
 
             {/* Border decoration */}
             <h3 className="profile-settings-section-title">Border Decoration</h3>
