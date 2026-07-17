@@ -1,6 +1,6 @@
 {
   "name": "lan-party-desktop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Electron desktop wrapper for the LAN Party communication app",
   "author": "Jump Vault LLC",
@@ -18,7 +18,8 @@
     "files": [
       "main.js",
       "preload.js",
-      "package.json"
+      "package.json",
+      "build/icon.png"
     ],
     "win": {
       "target": "nsis",

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification } = require('electron')
+const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification, Tray, Menu, nativeImage } = require('electron')
 const path = require('path')
 const { autoUpdater } = require('electron-updater')
 
@@ -9,6 +9,43 @@ const APP_URL = process.env.LANPARTY_URL || 'https://lanparty.thejumpvault.com/a
 const APP_ORIGIN = new URL(APP_URL).origin
 
 let mainWindow
+let tray = null
+let isQuitting = false
+let trayTipShown = false
+
+// Hide the window into the system tray (the "taskbar drawer") instead of quitting, so the app keeps
+// running in the background — voice/video calls and chat stay connected while it's hidden.
+function hideToTray() {
+  if (!mainWindow) return
+  mainWindow.hide()
+  if (process.platform === 'win32') mainWindow.setSkipTaskbar(true)
+  if (!trayTipShown && Notification.isSupported()) {
+    trayTipShown = true
+    new Notification({ title: 'LAN Party is still running', body: 'It lives in your tray now — calls and chat keep working. Right-click the tray icon to quit.' }).show()
+  }
+}
+
+function showFromTray() {
+  if (!mainWindow) return
+  if (process.platform === 'win32') mainWindow.setSkipTaskbar(false)
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function createTray() {
+  if (tray) return
+  let img = nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.png'))
+  if (!img.isEmpty()) img = img.resize({ width: 16, height: 16 })
+  tray = new Tray(img)
+  tray.setToolTip('LAN Party')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show LAN Party', click: showFromTray },
+    { type: 'separator' },
+    { label: 'Quit LAN Party', click: () => { isQuitting = true; app.quit() } },
+  ]))
+  tray.on('click', showFromTray)
+  tray.on('double-click', showFromTray)
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -28,6 +65,11 @@ function createWindow() {
 
   mainWindow.loadURL(APP_URL)
   mainWindow.on('closed', () => { mainWindow = null })
+
+  // Closing the window hides it to the tray (keeps calls/chat alive) instead of quitting.
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) { e.preventDefault(); hideToTray() }
+  })
 
   // Keep app + OAuth flows inside the window; send everything else (links people paste in chat,
   // "watch on Twitch/YouTube", etc.) to the user's real browser.
@@ -112,13 +154,18 @@ if (!gotLock) {
   app.whenReady().then(() => {
     configureMedia()
     createWindow()
+    createTray()
     setupAutoUpdates()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      else showFromTray()
     })
   })
 
-  app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit()
-  })
+  // Mark a real quit (tray "Quit", auto-update restart, OS shutdown) so the close handler lets it through.
+  app.on('before-quit', () => { isQuitting = true })
+
+  // Do NOT quit when the window is closed — the app lives in the tray and keeps running so the user
+  // stays in their call. Quitting happens only via the tray menu / auto-update / before-quit.
+  app.on('window-all-closed', () => { /* stay resident in the tray */ })
 }
