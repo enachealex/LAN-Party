@@ -1101,6 +1101,15 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .extviewer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;flex:none}
 .extviewer-title{font-size:13px;font-weight:800;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .extviewer-embed{flex:1;width:100%;border:none;background:#000}
+.extviewer-head-btns{display:flex;align-items:center;gap:6px;flex:none}
+.extviewer-mini-btn{background:transparent;border:none;color:var(--text);font-size:15px;font-weight:800;cursor:pointer;padding:2px 8px;border-radius:6px;line-height:1}
+.extviewer-mini-btn:hover{background:rgba(255,255,255,.12)}
+/* Picture-in-picture: a small, draggable, always-on-top floating player */
+.extviewer-overlay.mini{position:fixed;inset:auto;left:24px;top:90px;width:344px;height:auto;padding:0;background:transparent;display:block;z-index:6100;box-shadow:0 18px 50px rgba(0,0,0,.6);border-radius:12px}
+.extviewer-overlay.mini .extviewer-frame{width:344px;height:auto;border-radius:12px}
+.extviewer-overlay.mini .extviewer-embed{height:194px;flex:none}
+.extviewer-overlay.mini .extviewer-head.drag{cursor:move;user-select:none}
+.extviewer-overlay.mini .extviewer-title{font-size:12px}
 /* Sketch & Guess */
 .sketch-lobby{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:22px;text-align:center}
 .sketch-lobby-title{font-size:22px;font-weight:800;color:var(--text)}

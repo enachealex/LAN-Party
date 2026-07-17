@@ -823,6 +823,9 @@ export default function App() {
   const [flowError, setFlowError] = useState(null)
   const [flowBusy, setFlowBusy] = useState(false)
   const [flowDone, setFlowDone] = useState(null)
+  // Live-stream picture-in-picture: minimized state + draggable position.
+  const [streamMini, setStreamMini] = useState(false)
+  const [streamPos, setStreamPos] = useState({ x: 24, y: 90 })
   // Direction new messages flow: 'bottom' (anchor to bottom, default) or 'top' (fill from top down).
   const [messageFlow, setMessageFlow] = useState('bottom')
   // The user's customizable profile (avatar, decorations, bio, tags, name styling).
@@ -2859,6 +2862,26 @@ export default function App() {
       return null
     }
     return null // Kik has no public embed — announce-only
+  }
+
+  // Shrink the stream viewer into a draggable picture-in-picture in the bottom-right.
+  const minimizeStream = () => {
+    setStreamPos({ x: Math.max(12, window.innerWidth - 356), y: Math.max(70, window.innerHeight - 250) })
+    setStreamMini(true)
+  }
+  // Drag the PiP miniplayer around by its header (keeps the iframe mounted, so playback never stops).
+  const startDragStream = (e) => {
+    if (e.button !== 0) return
+    const startX = e.clientX, startY = e.clientY
+    const origin = { ...streamPos }
+    const W = 344, H = 226
+    const onMove = (ev) => setStreamPos({
+      x: Math.max(0, Math.min(window.innerWidth - W, origin.x + (ev.clientX - startX))),
+      y: Math.max(0, Math.min(window.innerHeight - H, origin.y + (ev.clientY - startY))),
+    })
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
   }
 
   // Activities: start one for the room, relay an event, or end it (all scoped to the voice channel).
@@ -5056,13 +5079,24 @@ export default function App() {
         </div>
         )
       })()}
-      {/* In-app viewer for an external Twitch/YouTube stream */}
+      {/* In-app viewer for an external Twitch/YouTube stream. Clicking outside shrinks it to a
+          draggable picture-in-picture (the iframe stays mounted, so playback never restarts). */}
       {externalViewer && (
-        <div className="extviewer-overlay" onClick={() => setExternalViewer(null)}>
+        <div
+          className={`extviewer-overlay ${streamMini ? 'mini' : ''}`}
+          onClick={() => { if (!streamMini) minimizeStream() }}
+          style={streamMini ? { left: streamPos.x, top: streamPos.y } : undefined}
+        >
           <div className="extviewer-frame" onClick={(e) => e.stopPropagation()}>
-            <div className="extviewer-head">
-              <span className="extviewer-title">🔴 {externalViewer.name} — {externalViewer.title || externalViewer.channel}{externalViewer.game ? ` · 🎮 ${externalViewer.game}` : ''}</span>
-              <button type="button" className="discover-close" onClick={() => setExternalViewer(null)} aria-label="Close viewer">✕</button>
+            <div
+              className={`extviewer-head ${streamMini ? 'drag' : ''}`}
+              onMouseDown={streamMini ? startDragStream : undefined}
+            >
+              <span className="extviewer-title">🔴 {externalViewer.name}{streamMini ? '' : ` — ${externalViewer.title || externalViewer.channel}${externalViewer.game ? ` · 🎮 ${externalViewer.game}` : ''}`}</span>
+              <div className="extviewer-head-btns">
+                <button type="button" className="extviewer-mini-btn" title={streamMini ? 'Expand' : 'Minimize to a movable player'} onClick={(e) => { e.stopPropagation(); streamMini ? setStreamMini(false) : minimizeStream() }}>{streamMini ? '⤢' : '—'}</button>
+                <button type="button" className="discover-close" onClick={(e) => { e.stopPropagation(); setExternalViewer(null); setStreamMini(false) }} aria-label="Close viewer">✕</button>
+              </div>
             </div>
             {externalEmbedUrl(externalViewer) ? (
               <iframe className="extviewer-embed" src={externalEmbedUrl(externalViewer)} allow="autoplay; fullscreen; picture-in-picture" allowFullScreen title="Live stream" />
