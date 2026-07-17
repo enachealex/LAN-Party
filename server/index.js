@@ -780,6 +780,22 @@ async function main() {
     return AVATAR_COLORS[hash];
   }
 
+  // The display-safe profile bits other users need to render someone's avatar (uploaded picture,
+  // border, overlay, name styling) in friend/DM/member lists. Parsed from a user's settings JSON.
+  function displayProfileFromSettings(settingsJson) {
+    let s = {};
+    try { s = JSON.parse(settingsJson || '{}') || {}; } catch { s = {}; }
+    const p = s.profile || {};
+    return {
+      avatarUrl: p.avatarUrl || '',
+      border: p.border || null,
+      overlay: p.overlay || null,
+      nameStyle: p.nameStyle || null,
+      nameFont: p.nameFont || null,
+      tags: Array.isArray(p.tags) ? p.tags : [],
+    };
+  }
+
   function authMiddleware(req, res, next) {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.split(' ')[1];
@@ -964,8 +980,12 @@ async function main() {
       }
       roster = Array.from(seen.values());
     } else {
-      const rows = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
-      roster = rows.map((r) => ({ username: r.username, name: r.username, role: r.role, online: onlineUsers.has(r.username) }));
+      const rows = await db.all(
+        `SELECT sm.username, sm.role, u.settings FROM server_members sm
+         LEFT JOIN users u ON u.username = sm.username WHERE sm.server_id = ?`,
+        serverId
+      );
+      roster = rows.map((r) => ({ username: r.username, name: r.username, role: r.role, online: onlineUsers.has(r.username), profile: displayProfileFromSettings(r.settings) }));
     }
     roster.sort((a, b) => roleRank(a.role) - roleRank(b.role) || (b.online - a.online) || String(a.name).localeCompare(String(b.name)));
     return roster;
@@ -1865,7 +1885,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
     const me = await getUserByUsername(req.user.username);
     if (!me) return res.status(404).json({ error: 'User not found' });
     const rows = await db.all(
-      `SELECT u.id, u.username, COALESCE(u.presence_status, 'offline') AS presence_status
+      `SELECT u.id, u.username, u.settings, COALESCE(u.presence_status, 'offline') AS presence_status
        FROM friendships f
        JOIN users u ON u.id = f.friend_user_id
        WHERE f.user_id = ?
@@ -1877,6 +1897,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       name: r.username,
       status: normalizePresence(r.presence_status),
       avatar: avatarColorForUsername(r.username),
+      profile: displayProfileFromSettings(r.settings),
     }));
     return res.json({ friends });
   });
@@ -2022,7 +2043,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
     const me = await getUserByUsername(req.user.username);
     if (!me) return res.status(404).json({ error: 'User not found' });
     const friends = await db.all(
-      `SELECT u.id, u.username, COALESCE(u.presence_status, 'offline') AS presence_status
+      `SELECT u.id, u.username, u.settings, COALESCE(u.presence_status, 'offline') AS presence_status
        FROM friendships f
        JOIN users u ON u.id = f.friend_user_id
        WHERE f.user_id = ?
@@ -2050,6 +2071,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
         peerUsername: f.username,
         unreadCount: unreadMap.get(String(f.id)) || 0,
         avatar: avatarColorForUsername(f.username),
+        profile: displayProfileFromSettings(f.settings),
         status: normalizePresence(f.presence_status),
         lastMessage: last
           ? { text: last.body || (last.attachmentJson ? 'Sent an attachment' : ''), author: last.senderUsername, createdAt: last.createdAt }
