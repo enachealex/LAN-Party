@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification, Tray, Menu, nativeImage } = require('electron')
+const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification, Tray, Menu, nativeImage, ipcMain } = require('electron')
 const path = require('path')
 const { autoUpdater } = require('electron-updater')
 
@@ -15,10 +15,13 @@ let trayTipShown = false
 
 // Hide the window into the system tray (the "taskbar drawer") instead of quitting, so the app keeps
 // running in the background — voice/video calls and chat stay connected while it's hidden.
+let overlayWindow = null
+
 function hideToTray() {
   if (!mainWindow) return
   mainWindow.hide()
   if (process.platform === 'win32') mainWindow.setSkipTaskbar(true)
+  mainWindow.webContents.send('app:visibility', false) // let the renderer pop video to the overlay
   if (!trayTipShown && Notification.isSupported()) {
     trayTipShown = true
     new Notification({ title: 'LAN Party is still running', body: 'It lives in your tray now — calls and chat keep working. Right-click the tray icon to quit.' }).show()
@@ -30,7 +33,41 @@ function showFromTray() {
   if (process.platform === 'win32') mainWindow.setSkipTaskbar(false)
   mainWindow.show()
   mainWindow.focus()
+  mainWindow.webContents.send('app:visibility', true) // renderer tears the overlay down
 }
+
+// A frameless, transparent, always-on-top window that shows a call's remote video while the main
+// window is hidden — so you can still see others (75% transparent) and drag/resize it out of the way.
+function createOverlayWindow() {
+  if (overlayWindow) return overlayWindow
+  overlayWindow = new BrowserWindow({
+    width: 360, height: 232, minWidth: 200, minHeight: 130,
+    frame: false, transparent: true, resizable: true, alwaysOnTop: true,
+    skipTaskbar: true, hasShadow: false, show: false, fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'overlay-preload.js'),
+      contextIsolation: true, nodeIntegration: false, backgroundThrottling: false,
+    },
+  })
+  overlayWindow.setAlwaysOnTop(true, 'screen-saver')
+  overlayWindow.setVisibleOnAllWorkspaces(true)
+  overlayWindow.loadFile(path.join(__dirname, 'overlay.html'))
+  overlayWindow.on('closed', () => { overlayWindow = null })
+  return overlayWindow
+}
+
+// --- Overlay IPC: relay WebRTC signaling between the main renderer and the overlay renderer ---
+ipcMain.on('overlay:show', () => { createOverlayWindow().show() })
+ipcMain.on('overlay:hide', () => { if (overlayWindow) overlayWindow.hide() })
+ipcMain.on('overlay:close', () => { if (overlayWindow) { overlayWindow.close(); overlayWindow = null } })
+ipcMain.on('overlay:to-overlay', (_e, msg) => { if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.webContents.send('overlay:signal', msg) })
+ipcMain.on('overlay:to-main', (_e, msg) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay:signal', msg) })
+ipcMain.on('overlay:restore', () => { showFromTray() }) // overlay "expand" button → bring the app back
+ipcMain.on('overlay:resize', (_e, { dw, dh } = {}) => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return
+  const [w, h] = overlayWindow.getSize()
+  overlayWindow.setSize(Math.max(200, Math.round(w + (dw || 0))), Math.max(130, Math.round(h + (dh || 0))))
+})
 
 function createTray() {
   if (tray) return

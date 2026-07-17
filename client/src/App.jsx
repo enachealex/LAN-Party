@@ -924,6 +924,11 @@ export default function App() {
   const callRef = useRef(null)
   const callPcRef = useRef(null)
   const callLocalStreamRef = useRef(null)
+  // Desktop transparent video overlay (shown while the app is hidden to the tray during a call).
+  const remoteStreamsRef = useRef({})
+  const callRemoteStreamRef = useRef(null)
+  const overlayPcRef = useRef(null)
+  const overlayActiveRef = useRef(false)
   const [leftNav, setLeftNav] = useState('friends')
   const [selectedServerId, setSelectedServerId] = useState('home')
   // Real servers from the DB (the rail renders these — no more mock tiles).
@@ -1038,6 +1043,55 @@ export default function App() {
     const id = setInterval(() => setCallElapsed(Math.floor((Date.now() - started) / 1000)), 1000)
     return () => clearInterval(id)
   }, [call?.status, call?.startedAt])
+
+  useEffect(() => { remoteStreamsRef.current = remoteStreams }, [remoteStreams])
+  useEffect(() => { callRemoteStreamRef.current = callRemoteStream }, [callRemoteStream])
+
+  // Desktop only: while the window is hidden to the tray during a call that has remote video, pipe
+  // that video into a transparent, always-on-top, draggable/resizable overlay window (via a loopback
+  // WebRTC connection, since MediaStreams can't cross Electron windows directly).
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.desktop || !window.desktop.isElectron || !window.desktop.onVisibility) return
+    const primaryRemoteVideoTrack = () => {
+      const cs = callRemoteStreamRef.current
+      if (cs) { const t = cs.getVideoTracks().find((x) => x.readyState === 'live'); if (t) return t }
+      for (const s of Object.values(remoteStreamsRef.current || {})) {
+        const t = s && s.getVideoTracks && s.getVideoTracks().find((x) => x.readyState === 'live')
+        if (t) return t
+      }
+      return null
+    }
+    const stopOverlay = () => {
+      overlayActiveRef.current = false
+      try { overlayPcRef.current?.close() } catch (_) {}
+      overlayPcRef.current = null
+      try { window.desktop.overlayClose() } catch (_) {}
+    }
+    const buildOffer = async () => {
+      const track = primaryRemoteVideoTrack()
+      if (!track) { stopOverlay(); return }
+      const pc = new RTCPeerConnection({ iceServers: iceConfigRef.current })
+      overlayPcRef.current = pc
+      pc.addTrack(track, new MediaStream([track]))
+      pc.onicecandidate = (e) => { if (e.candidate) window.desktop.overlaySend({ type: 'candidate', candidate: e.candidate }) }
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      window.desktop.overlaySend({ type: 'offer', sdp: pc.localDescription })
+    }
+    const startOverlay = () => {
+      if (overlayActiveRef.current) return
+      if (!primaryRemoteVideoTrack()) return // audio-only or no remote video → nothing to overlay
+      overlayActiveRef.current = true
+      window.desktop.overlayShow() // the overlay page sends { type:'ready' } once loaded
+    }
+    window.desktop.onVisibility((visible) => { if (visible) stopOverlay(); else startOverlay() })
+    window.desktop.onOverlaySignal(async (msg) => {
+      if (!msg) return
+      if (msg.type === 'ready') buildOffer().catch((e) => console.warn('overlay offer failed', e))
+      else if (msg.type === 'answer' && overlayPcRef.current) { try { await overlayPcRef.current.setRemoteDescription(msg.sdp) } catch (_) {} }
+      else if (msg.type === 'candidate' && overlayPcRef.current) { try { await overlayPcRef.current.addIceCandidate(msg.candidate) } catch (_) {} }
+    })
+  }, [])
 
   // Identity of the currently-open chat (channel or home chat).
   const activeChatKey = homeChat ? `home:${homeChat.id}` : `channel:${selectedServerId}:${activeChannel}`
