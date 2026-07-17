@@ -8,6 +8,7 @@ dist/
 server/giphy.key
 server/youtube.key
 server/spotify.key
+server/smtp.key
 desktop/certs/
 
 # Runtime data (user accounts, uploads, sounds, gifs live on the server's disk)

@@ -9,6 +9,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const mailer = require('./email');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const PORT = process.env.PORT || 3000;
@@ -839,8 +840,8 @@ async function main() {
     };
     const hash = bcrypt.hashSync(password, 10);
     await db.run('INSERT INTO users (username, email, password_hash, settings) VALUES (?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings));
-    mockEmails.push({ to: email, subject: 'Welcome to LAN Party', body: `Welcome ${username}!` });
-    console.log('Mock welcome email queued for', email);
+    // Fire-and-forget welcome email (never block or fail registration on email).
+    mailer.sendWelcome(username, email).catch((e) => console.warn('welcome email error', e && e.message));
     return res.json({ success: true });
   });
 
