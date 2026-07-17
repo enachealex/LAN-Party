@@ -813,6 +813,9 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
   // Whether the profile customization controls (picture/border/overlay/name style) are expanded.
   const [showProfileEditor, setShowProfileEditor] = useState(false)
+  // Editable username (in Edit Profile) — changing it reissues the auth token.
+  const [editUsername, setEditUsername] = useState('')
+  const [usernameSaving, setUsernameSaving] = useState(false)
   // Direction new messages flow: 'bottom' (anchor to bottom, default) or 'top' (fill from top down).
   const [messageFlow, setMessageFlow] = useState('bottom')
   // The user's customizable profile (avatar, decorations, bio, tags, name styling).
@@ -1547,7 +1550,38 @@ export default function App() {
     setEditingSettings(defaults)
     setEditingProfile(normalizeProfile(profile))
     setCustomTagInput('')
+    setEditUsername(name || '')
     setShowSettingsPanel(true)
+  }
+
+  // Change username (reissues the token; the socket reconnects with the new identity).
+  const changeUsername = async () => {
+    const next = editUsername.trim()
+    if (!next || next === name || usernameSaving) return
+    setUsernameSaving(true)
+    try {
+      const t = token || localStorage.getItem('lanparty_token')
+      const res = await fetch(`${SERVER_URL}/user/username`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+        body: JSON.stringify({ username: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { setToast(data.error || 'Could not change username'); return }
+      setName(data.username)
+      setToken(data.token)
+      localStorage.setItem('lanparty_token', data.token)
+      localStorage.setItem('lanparty_user', data.username)
+      setEditUsername(data.username)
+      // Reconnect the socket so the server ties this connection to the new username.
+      try { socketRef.current?.disconnect() } catch (_) {}
+      connect(data.username, data.token)
+      setToast('Username updated')
+    } catch (err) {
+      setToast('Could not reach the server')
+    } finally {
+      setUsernameSaving(false)
+    }
   }
 
   const saveSettings = async () => {
@@ -1647,6 +1681,7 @@ export default function App() {
     setEditingProfile(normalizeProfile(profile))
     setEditingSettings((s) => ({ ...(s || {}), gamingProfile: (userSettings && userSettings.gamingProfile) || { genres: [], currentGames: '' } }))
     setCustomTagInput('')
+    setEditUsername(name || '')
     setShowProfileEditor(false)
   }
 
@@ -5745,7 +5780,32 @@ export default function App() {
             {/* Account info */}
             <h3 className="profile-settings-section-title">Account</h3>
             <div className="profile-settings-fields">
-              <div className="profile-settings-field"><span className="profile-settings-label">Username</span><span className="profile-settings-value">{name || 'Guest'}</span></div>
+              <div className="profile-settings-field">
+                <span className="profile-settings-label">Username</span>
+                {showProfileEditor ? (
+                  <span className="username-edit-row">
+                    <input
+                      className="profile-text-input username-edit-input"
+                      value={editUsername}
+                      maxLength={20}
+                      spellCheck={false}
+                      autoCapitalize="none"
+                      onChange={(e) => setEditUsername(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); changeUsername() } }}
+                    />
+                    <button
+                      type="button"
+                      className="username-change-btn"
+                      disabled={usernameSaving || !editUsername.trim() || editUsername.trim() === name}
+                      onClick={changeUsername}
+                    >
+                      {usernameSaving ? 'Saving…' : 'Change'}
+                    </button>
+                  </span>
+                ) : (
+                  <span className="profile-settings-value">{name || 'Guest'}</span>
+                )}
+              </div>
               <div className="profile-settings-field"><span className="profile-settings-label">Email</span><span className="profile-settings-value">{userEmail || '—'}</span></div>
             </div>
 

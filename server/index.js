@@ -926,6 +926,43 @@ async function main() {
     return res.json({ success: true, settings });
   });
 
+  // Change the current user's username. Username is used as a natural key across many tables, so the
+  // rename must cascade in a transaction; then we issue a fresh JWT (it carries the username).
+  app.post('/user/username', authMiddleware, async (req, res) => {
+    const oldUsername = req.user.username;
+    const newUsername = String(req.body?.username || '').trim();
+    if (!newUsername) return res.status(400).json({ error: 'Username is required' });
+    if (newUsername.length < 3 || newUsername.length > 20) return res.status(400).json({ error: 'Username must be 3–20 characters' });
+    if (!/^[A-Za-z0-9_.-]+$/.test(newUsername)) return res.status(400).json({ error: 'Only letters, numbers, and _ . - are allowed' });
+    if (newUsername === oldUsername) return res.status(400).json({ error: 'That is already your username' });
+    const me = await db.get('SELECT id FROM users WHERE username = ?', oldUsername);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    if (await db.get('SELECT id FROM users WHERE username = ?', newUsername)) return res.status(409).json({ error: 'Username already taken' });
+    try {
+      await db.run('BEGIN');
+      // Every table that stores the username as a natural key (IDs-based tables need no change).
+      await db.run('UPDATE users SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_members SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE channel_members SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE channel_reads SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE music_playlists SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE messages SET author = ? WHERE author = ?', newUsername, oldUsername);
+      await db.run('UPDATE messages SET pinned_by = ? WHERE pinned_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE servers SET owner = ? WHERE owner = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_emojis SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE apps SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE gifs SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE sounds SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      await db.run('COMMIT');
+    } catch (e) {
+      await db.run('ROLLBACK').catch(() => {});
+      console.error('username change failed', e);
+      return res.status(409).json({ error: 'Could not change username — it may already be taken' });
+    }
+    const token = jwt.sign({ username: newUsername }, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ success: true, username: newUsername, token });
+  });
+
   // Public profile of any user (for the click-a-member profile card) — only display-safe fields.
   app.get('/users/:username/public', authMiddleware, async (req, res) => {
     const row = await db.get("SELECT username, settings, COALESCE(presence_status,'offline') AS presence_status FROM users WHERE username = ?", req.params.username);
