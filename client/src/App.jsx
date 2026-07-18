@@ -447,7 +447,7 @@ function pinPreview(m) {
   return m.text || '(empty message)'
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones }) {
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
   const [reactionPickerPos, setReactionPickerPos] = useState(null) // { left, top } for the full-library picker
@@ -519,7 +519,7 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
   // Open the action menu as a fixed-position portal anchored to the "..." button,
   // flipping up/left when near the viewport edges so it never gets clipped.
   const MENU_W = 170
-  const MENU_H = 124
+  const MENU_H = 150
   const toggleMenu = () => {
     if (menuOpen) { setMenuOpen(false); return }
     const btn = moreBtnRef.current
@@ -594,6 +594,17 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
           >
             +
           </button>
+          {onReply && (
+            <button
+              type="button"
+              className="msg-more-btn msg-reply-btn"
+              onClick={() => { showToolbar(); onReply(message) }}
+              title="Reply with quote"
+              aria-label="Reply with quote"
+            >
+              ❞
+            </button>
+          )}
           <button
             ref={moreBtnRef}
             type="button"
@@ -620,6 +631,7 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
             onMouseEnter={showToolbar}
             onMouseLeave={hideToolbarSoon}
           >
+            {onReply && <button type="button" role="menuitem" onClick={() => { onReply(message); setMenuOpen(false) }}>Reply</button>}
             {canEdit && <button type="button" role="menuitem" onClick={startEdit}>Edit</button>}
             {collabImage && onCollab && <button type="button" role="menuitem" onClick={handleCollab}>Edit together</button>}
             {onForward && <button type="button" role="menuitem" onClick={() => { onForward(message); setMenuOpen(false) }}>Forward</button>}
@@ -648,6 +660,19 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
           aria-pressed={showTimestamp}
         >
           {!isOutgoing && <div className="msg-author">{message.author}</div>}
+          {Array.isArray(message.quotes) && message.quotes.length > 0 && (
+            <div className="msg-quotes">
+              {message.quotes.map((q, i) => (
+                <div className="msg-quote" key={`${q.id ?? 'q'}-${i}`}>
+                  <div className="msg-quote-head">
+                    <span className="msg-quote-author">{q.author}</span>
+                    {formatMessageTime(q.ts) && <span className="msg-quote-time">{formatMessageTime(q.ts)}</span>}
+                  </div>
+                  <div className="msg-quote-text">{q.text}</div>
+                </div>
+              ))}
+            </div>
+          )}
           {editing ? (
             <div className="msg-edit" onClick={(e) => e.stopPropagation()}>
               <textarea
@@ -857,7 +882,6 @@ export default function App() {
   const [showSettingsPanel, setShowSettingsPanel] = useState(false)
   const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
   // Feedback / bug-report modal (submissions forward to Vaultline via the server's /feedback route).
-  const [showFeedback, setShowFeedback] = useState(false)
   const [feedbackType, setFeedbackType] = useState('feedback') // 'feedback' | 'request' | 'bug'
   const [feedbackTitle, setFeedbackTitle] = useState('')
   const [feedbackMessage, setFeedbackMessage] = useState('')
@@ -1065,6 +1089,8 @@ export default function App() {
   const [newChatGroupName, setNewChatGroupName] = useState('')
   const [pendingFile, setPendingFile] = useState(null)
   const [pendingPreviewUrl, setPendingPreviewUrl] = useState(null)
+  // Messages quoted into the composer (Teams-style reply): [{ id, author, ts, text }].
+  const [pendingQuotes, setPendingQuotes] = useState([])
   const [lightbox, setLightbox] = useState(null) // { items: [...], index }
   const [uploadError, setUploadError] = useState(null)
   const [uploadingFile, setUploadingFile] = useState(false)
@@ -1081,6 +1107,9 @@ export default function App() {
   const pendingUnreadScrollRef = useRef(0)
   // Tracks which chat the scroll position has already been initialized for.
   const scrollInitKeyRef = useRef(null)
+  // Set when the chat changes; cleared once we've scrolled the new chat to the bottom (may be a tick
+  // later, after its messages load). Survives visiting an empty chat in between.
+  const needBottomScrollRef = useRef(true)
   // Whether the view is pinned to the newest message (true = follow new content / late-loading media).
   const stickToBottomRef = useRef(true)
 
@@ -1166,26 +1195,27 @@ export default function App() {
 
   useEffect(() => {
     const list = messagesListRef.current
-    if (!list || activeMessageCount === 0) return
-    const isNewChat = scrollInitKeyRef.current !== activeChatKey
-
-    if (isNewChat) {
-      // First render for this chat: land on the first unread message, or the bottom.
+    if (!list) return
+    // Switching chats owes the new chat a scroll-to-bottom, applied once its messages are present.
+    // Tracking the switch separately (rather than keying off message count) means visiting an EMPTY
+    // chat in between doesn't leave a stale "already scrolled" marker that skips the next chat.
+    if (scrollInitKeyRef.current !== activeChatKey) {
       scrollInitKeyRef.current = activeChatKey
-      const unread = pendingUnreadScrollRef.current
+      needBottomScrollRef.current = true
       pendingUnreadScrollRef.current = 0
-      if (unread > 0 && unread < activeMessageCount) {
-        // Position the first unread message at the top of the viewport.
-        const firstUnreadIndex = activeMessageCount - unread
-        const target = list.children[firstUnreadIndex]
-        if (target) {
-          list.scrollTop = Math.max(0, target.offsetTop - list.offsetTop)
-          stickToBottomRef.current = false // reading from the unread marker, don't follow new media
-          return
-        }
-      }
+      stickToBottomRef.current = true
+    }
+    if (activeMessageCount === 0) return
+
+    if (needBottomScrollRef.current) {
+      // Opening a chat always lands on the newest message (the bottom). The rAF re-pin catches
+      // cases where late layout (avatars/wrapping) grows the list just after this runs.
+      needBottomScrollRef.current = false
       list.scrollTop = list.scrollHeight
       stickToBottomRef.current = true
+      requestAnimationFrame(() => {
+        if (scrollInitKeyRef.current === activeChatKey && stickToBottomRef.current) list.scrollTop = list.scrollHeight
+      })
       return
     }
 
@@ -1692,21 +1722,6 @@ export default function App() {
         locale: typeof navigator !== 'undefined' ? (navigator.language || '') : '',
       }
     } catch (_) { return {} }
-  }
-
-  const openFeedback = () => {
-    setFeedbackType('feedback')
-    setFeedbackTitle('')
-    setFeedbackMessage('')
-    setFeedbackFile(null)
-    setFeedbackResult(null)
-    setFeedbackSubmitting(false)
-    setShowFeedback(true)
-  }
-
-  const closeFeedback = () => {
-    setShowFeedback(false)
-    setFeedbackFile(null)
   }
 
   const submitFeedback = async () => {
@@ -2762,6 +2777,19 @@ export default function App() {
   const onCallEnded = () => { if (callRef.current) teardownCall() }
   const onCallHandledElsewhere = () => { if (callRef.current?.status === 'incoming') teardownCall() }
   const onCallUnavailable = () => { setToast(`${callRef.current?.peer || 'They'} can't be reached`); teardownCall() }
+  // Safety net: an outgoing call that's never answered (peer online but away, or negotiation stalls)
+  // would otherwise ring forever and follow you across every page. Give up after 30s.
+  useEffect(() => {
+    if (!call || (call.status !== 'outgoing' && call.status !== 'connecting')) return
+    const t = setTimeout(() => {
+      const c = callRef.current
+      if (c && (c.status === 'outgoing' || c.status === 'connecting')) {
+        setToast(`${c.peer} didn't answer`)
+        hangUpCall()
+      }
+    }, 30000)
+    return () => clearTimeout(t)
+  }, [call?.status])
   useEffect(() => {
     if (!toast) return
     const t = setTimeout(() => setToast(null), 3200)
@@ -2771,6 +2799,7 @@ export default function App() {
   const joinChannel = (channelId) => {
     if (!socket) return
     setActiveChannel(channelId)
+    setMessages([]) // drop the previous channel's messages so the scroll-to-bottom runs on fresh content
     const serverId = currentServerId()
     socket.emit('joinChannel', { serverId, channelId })
     clearChannelUnread(serverId, channelId)
@@ -2859,7 +2888,8 @@ export default function App() {
     setUploadingFile(true)
     try {
       const attachment = await uploadSelectedFile()
-      socket.emit('message', { serverId: currentServerId(), channelId: activeChannel, text: body, attachment })
+      socket.emit('message', { serverId: currentServerId(), channelId: activeChannel, text: body, attachment, quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined })
+      setPendingQuotes([])
       clearPendingAttachment()
     } catch (err) {
       setUploadError(err.message)
@@ -4008,6 +4038,24 @@ export default function App() {
     setTimeout(() => el.classList.remove('msg-jump-flash'), 1600)
   }
 
+  // ---- Quoted replies (Teams-style) ----
+  // Stage a message as a quote on the next send. Any number of different messages can be
+  // quoted at once, but the same message can't be quoted twice.
+  const quoteMessage = (message) => {
+    if (!message) return
+    if (pendingQuotes.some((q) => String(q.id) === String(message.id))) {
+      setToast("You're already replying to that message")
+      return
+    }
+    if (pendingQuotes.length >= 10) {
+      setToast('You can quote up to 10 messages per reply')
+      return
+    }
+    const text = (message.text || '').slice(0, 300) || (message.attachment ? `📎 ${message.attachment.name || 'attachment'}` : '')
+    setPendingQuotes((prev) => [...prev, { id: message.id, author: message.author, ts: message.ts || message.createdAt || message.created_at || Date.now(), text }])
+  }
+  const removePendingQuote = (id) => setPendingQuotes((prev) => prev.filter((q) => String(q.id) !== String(id)))
+
   // ---- Forwarding: copy a message's content to another channel or DM ----
   const openForward = (message) => setForwardMsg(message)
   const forwardToTarget = async (target) => {
@@ -4143,12 +4191,13 @@ export default function App() {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ toUsername: peerUsername, text: body, attachment }),
+          body: JSON.stringify({ toUsername: peerUsername, text: body, attachment, quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined }),
         })
         const data = await res.json()
         if (!res.ok) throw new Error(data.error || 'Send failed')
         appendHomeMessage(homeChat.id, data.message)
         updateDmConversationPreview(homeChat.id, peerUsername, data.message, 0)
+        setPendingQuotes([])
         clearPendingAttachment()
         loadMessagesData()
       } catch (err) {
@@ -4161,12 +4210,13 @@ export default function App() {
       return
     }
     const chatKey = homeChat.id
-    const msg = { id: `${chatKey}-${Date.now()}`, author: name || 'You', text: body, attachment, ts: Date.now() }
+    const msg = { id: `${chatKey}-${Date.now()}`, author: name || 'You', text: body, attachment, ts: Date.now(), quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined }
     setHomeMessages((prev) => ({
       ...prev,
       [chatKey]: oldestMessagesFirst([...(prev[chatKey] || []), msg]),
     }))
     updateGroupConversationPreview(chatKey, msg)
+    setPendingQuotes([])
     clearPendingAttachment()
     setUploadingFile(false)
   }
@@ -4690,6 +4740,22 @@ export default function App() {
             onClose={() => setShowGifPicker(false)}
           />
         )}
+        {pendingQuotes.length > 0 && (
+          <div className="composer-quotes" aria-label="Replying to">
+            {pendingQuotes.map((q) => (
+              <div className="composer-quote" key={q.id}>
+                <div className="composer-quote-body">
+                  <div className="composer-quote-head">
+                    <span className="composer-quote-author">{q.author}</span>
+                    {formatMessageTime(q.ts) && <span className="composer-quote-time">{formatMessageTime(q.ts)}</span>}
+                  </div>
+                  <div className="composer-quote-text">{q.text}</div>
+                </div>
+                <button type="button" className="composer-quote-remove" onClick={() => removePendingQuote(q.id)} aria-label={`Stop replying to ${q.author}`}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="composer-inner">
           <button type="button" className="attach" onClick={() => fileInputRef.current?.click()} title="Attach file" aria-label="Attach file">
             <PaperclipIcon />
@@ -4764,7 +4830,6 @@ export default function App() {
         onToggleMic={toggleMute}
         onToggleDeafen={toggleDeafen}
         onOpenSettings={() => { setShowStatusMenu(false); openSettings() }}
-        onOpenFeedback={() => { setShowStatusMenu(false); openFeedback() }}
         userStatus={userStatus}
         showStatusMenu={showStatusMenu}
         onToggleStatusMenu={() => setShowStatusMenu((open) => !open)}
@@ -4885,6 +4950,7 @@ export default function App() {
                       setActiveReactionMessageId={setActiveReactionMessageId}
                       quickReactions={quickReactions}
                       skinTones={emojiSkinTones}
+                      onReply={quoteMessage}
                       onOpenMedia={(attachment) => openLightbox(homeChatMessages, attachment)}
                       emojiMap={emojiMap}
                       onSaveEmoji={saveCustomEmojiFromChat}
@@ -4947,6 +5013,7 @@ export default function App() {
                       setActiveReactionMessageId={setActiveReactionMessageId}
                       quickReactions={quickReactions}
                       skinTones={emojiSkinTones}
+                      onReply={quoteMessage}
                       onOpenMedia={(attachment) => openLightbox(messages, attachment)}
                       emojiMap={emojiMap}
                       onSaveEmoji={saveCustomEmojiFromChat}
@@ -5979,103 +6046,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Feedback / feature request / bug report — forwards to Vaultline via the server. */}
-      {showFeedback && (
-        <div className="feedback-overlay" role="dialog" aria-modal="true" aria-labelledby="feedback-title" onMouseDown={(e) => { if (e.target === e.currentTarget) closeFeedback() }}>
-          <div className="feedback-card">
-            <div className="feedback-header">
-              <span id="feedback-title" className="feedback-title">Send feedback</span>
-              <button className="feedback-close" aria-label="Close" onClick={closeFeedback}>✕</button>
-            </div>
-
-            {feedbackResult?.ok ? (
-              <div className="feedback-success">
-                <div className="feedback-success-icon" aria-hidden="true">✓</div>
-                <p className="feedback-success-msg">{feedbackResult.message}</p>
-                <div className="feedback-actions">
-                  <button className="feedback-btn ghost" onClick={() => setFeedbackResult(null)}>Send another</button>
-                  <button className="feedback-btn primary" onClick={closeFeedback}>Done</button>
-                </div>
-              </div>
-            ) : (
-              <>
-                <div className="feedback-types" role="radiogroup" aria-label="Type">
-                  {[{ id: 'feedback', label: 'Feedback', icon: '💬' }, { id: 'request', label: 'Feature request', icon: '✨' }, { id: 'bug', label: 'Bug report', icon: '🐞' }].map((t) => (
-                    <button
-                      key={t.id}
-                      type="button"
-                      role="radio"
-                      aria-checked={feedbackType === t.id}
-                      className={`feedback-type-btn${feedbackType === t.id ? ' active' : ''}`}
-                      onClick={() => setFeedbackType(t.id)}
-                    >
-                      <span aria-hidden="true">{t.icon}</span> {t.label}
-                    </button>
-                  ))}
-                </div>
-
-                <label className="feedback-label" htmlFor="feedback-subject">Subject <span className="feedback-optional">(optional)</span></label>
-                <input
-                  id="feedback-subject"
-                  className="feedback-input"
-                  type="text"
-                  maxLength={160}
-                  placeholder={feedbackType === 'bug' ? 'e.g. Save button does nothing on mobile' : 'Short summary'}
-                  value={feedbackTitle}
-                  onChange={(e) => setFeedbackTitle(e.target.value)}
-                />
-
-                <label className="feedback-label" htmlFor="feedback-message">{feedbackType === 'bug' ? 'What happened?' : 'Your message'}</label>
-                <textarea
-                  id="feedback-message"
-                  className="feedback-textarea"
-                  rows={5}
-                  maxLength={8000}
-                  autoFocus
-                  placeholder={feedbackType === 'bug' ? 'Describe the bug, and the steps to reproduce it…' : feedbackType === 'request' ? 'Describe the feature you’d like to see…' : 'Tell us what you think…'}
-                  value={feedbackMessage}
-                  onChange={(e) => setFeedbackMessage(e.target.value)}
-                />
-
-                <div className="feedback-attach-row">
-                  {feedbackPreview ? (
-                    <div className="feedback-thumb">
-                      <img src={feedbackPreview} alt="Screenshot preview" />
-                      <button type="button" className="feedback-thumb-remove" aria-label="Remove screenshot" onClick={() => { setFeedbackFile(null); if (feedbackFileInputRef.current) feedbackFileInputRef.current.value = '' }}>✕</button>
-                    </div>
-                  ) : (
-                    <button type="button" className="feedback-attach-btn" onClick={() => feedbackFileInputRef.current?.click()}>
-                      📎 Attach screenshot
-                    </button>
-                  )}
-                  <input
-                    ref={feedbackFileInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="file-input"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0]
-                      if (f && f.size > 15 * 1024 * 1024) { setFeedbackResult({ ok: false, message: 'Screenshot must be under 15 MB.' }); if (e.target) e.target.value = ''; return }
-                      setFeedbackFile(f || null)
-                    }}
-                  />
-                </div>
-
-                <p className="feedback-note">We’ll include your username and basic device info (browser/OS) to help us investigate.</p>
-                {feedbackResult && !feedbackResult.ok && <p className="feedback-error">{feedbackResult.message}</p>}
-
-                <div className="feedback-actions">
-                  <button className="feedback-btn ghost" onClick={closeFeedback} disabled={feedbackSubmitting}>Cancel</button>
-                  <button className="feedback-btn primary" onClick={submitFeedback} disabled={feedbackSubmitting || !feedbackMessage.trim()}>
-                    {feedbackSubmitting ? 'Sending…' : 'Submit'}
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Direct friend call: incoming ring, or the in-call bar (remote audio plays via RemoteMedia) */}
       {call && (
         <>
@@ -6196,6 +6166,7 @@ export default function App() {
           <button type="button" role="tab" aria-selected={settingsTab === 'profile'} className={`profile-settings-tab${settingsTab === 'profile' ? ' active' : ''}`} onClick={() => setSettingsTab('profile')}>Profile</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'appearance'} className={`profile-settings-tab${settingsTab === 'appearance' ? ' active' : ''}`} onClick={() => setSettingsTab('appearance')}>Appearance</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'messages'} className={`profile-settings-tab${settingsTab === 'messages' ? ' active' : ''}`} onClick={() => setSettingsTab('messages')}>Messages</button>
+          <button type="button" role="tab" aria-selected={settingsTab === 'feedback'} className={`profile-settings-tab${settingsTab === 'feedback' ? ' active' : ''}`} onClick={() => { setFeedbackResult(null); setFeedbackSubmitting(false); setSettingsTab('feedback') }}>Feedback</button>
         </div>
         )}
         <div className="profile-settings-body" ref={settingsBodyRef}>
@@ -6533,6 +6504,89 @@ export default function App() {
                 onPick={(emoji) => { setQuickReactionAt(editingQuickReaction.index, emoji); setEditingQuickReaction(null) }}
                 onClose={() => setEditingQuickReaction(null)}
               />
+            )}
+          </section>
+          )}
+          {settingsTab === 'feedback' && (
+          <section className="profile-settings-section">
+            <h3 className="profile-settings-section-title">Send Feedback</h3>
+            <p className="profile-settings-note">Share feedback, request a feature, or report a bug — it goes straight to our tracker.</p>
+            {feedbackResult?.ok ? (
+              <div className="feedback-success">
+                <div className="feedback-success-icon" aria-hidden="true">✓</div>
+                <p className="feedback-success-msg">{feedbackResult.message}</p>
+                <div className="feedback-actions">
+                  <button className="feedback-btn ghost" onClick={() => setFeedbackResult(null)}>Send another</button>
+                  <button className="feedback-btn primary" onClick={() => setShowSettingsPanel(false)}>Done</button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="feedback-types" role="radiogroup" aria-label="Type">
+                  {[{ id: 'feedback', label: 'Feedback', icon: '💬' }, { id: 'request', label: 'Feature request', icon: '✨' }, { id: 'bug', label: 'Bug report', icon: '🐞' }].map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={feedbackType === t.id}
+                      className={`feedback-type-btn${feedbackType === t.id ? ' active' : ''}`}
+                      onClick={() => setFeedbackType(t.id)}
+                    >
+                      <span aria-hidden="true">{t.icon}</span> {t.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="feedback-label" htmlFor="feedback-subject">Subject <span className="feedback-optional">(optional)</span></label>
+                <input
+                  id="feedback-subject"
+                  className="feedback-input"
+                  type="text"
+                  maxLength={160}
+                  placeholder={feedbackType === 'bug' ? 'e.g. Save button does nothing on mobile' : 'Short summary'}
+                  value={feedbackTitle}
+                  onChange={(e) => setFeedbackTitle(e.target.value)}
+                />
+                <label className="feedback-label" htmlFor="feedback-message">{feedbackType === 'bug' ? 'What happened?' : 'Your message'}</label>
+                <textarea
+                  id="feedback-message"
+                  className="feedback-textarea"
+                  rows={5}
+                  maxLength={8000}
+                  placeholder={feedbackType === 'bug' ? 'Describe the bug, and the steps to reproduce it…' : feedbackType === 'request' ? 'Describe the feature you’d like to see…' : 'Tell us what you think…'}
+                  value={feedbackMessage}
+                  onChange={(e) => setFeedbackMessage(e.target.value)}
+                />
+                <div className="feedback-attach-row">
+                  {feedbackPreview ? (
+                    <div className="feedback-thumb">
+                      <img src={feedbackPreview} alt="Screenshot preview" />
+                      <button type="button" className="feedback-thumb-remove" aria-label="Remove screenshot" onClick={() => { setFeedbackFile(null); if (feedbackFileInputRef.current) feedbackFileInputRef.current.value = '' }}>✕</button>
+                    </div>
+                  ) : (
+                    <button type="button" className="feedback-attach-btn" onClick={() => feedbackFileInputRef.current?.click()}>
+                      📎 Attach screenshot
+                    </button>
+                  )}
+                  <input
+                    ref={feedbackFileInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="file-input"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f && f.size > 15 * 1024 * 1024) { setFeedbackResult({ ok: false, message: 'Screenshot must be under 15 MB.' }); if (e.target) e.target.value = ''; return }
+                      setFeedbackFile(f || null)
+                    }}
+                  />
+                </div>
+                <p className="feedback-note">We’ll include your username and basic device info (browser/OS) to help us investigate.</p>
+                {feedbackResult && !feedbackResult.ok && <p className="feedback-error">{feedbackResult.message}</p>}
+                <div className="feedback-actions">
+                  <button className="feedback-btn primary" onClick={submitFeedback} disabled={feedbackSubmitting || !feedbackMessage.trim()}>
+                    {feedbackSubmitting ? 'Sending…' : 'Submit'}
+                  </button>
+                </div>
+              </>
             )}
           </section>
           )}

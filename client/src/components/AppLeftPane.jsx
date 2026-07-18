@@ -137,7 +137,6 @@ export default function AppLeftPane({
   onToggleMic,
   onToggleDeafen,
   onOpenSettings,
-  onOpenFeedback,
   userStatus = 'available',
   showStatusMenu = false,
   onToggleStatusMenu,
@@ -429,11 +428,6 @@ export default function AppLeftPane({
             </span>
           </button>
           <div className="dc-user-controls">
-            <button type="button" className="dc-control-btn dc-feedback-btn" title="Send feedback / report a bug" aria-label="Send feedback or report a bug" onClick={onOpenFeedback}>
-              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
-                <path fill="currentColor" d="M12 3c-4.97 0-9 3.13-9 7 0 1.9.98 3.62 2.56 4.88-.14 1.32-.68 2.52-1.46 3.4-.2.22-.05.58.25.55 1.9-.2 3.4-.86 4.44-1.62.98.26 2.04.39 3.21.39 4.97 0 9-3.13 9-7s-4.03-7-9-7Zm-3 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm3 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm3 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/>
-              </svg>
-            </button>
             <button type="button" className="dc-control-btn" title="Profile / Settings" onClick={onOpenSettings}>
               <img src={SETTINGS_ICON_URL} alt="" className="dc-control-icon dc-settings-icon" draggable={false} />
             </button>

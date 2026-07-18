@@ -366,6 +366,17 @@ async function main() {
   } catch (err) {
     /* column already exists */
   }
+  // Quoted replies (Teams-style): JSON array [{ id, author, ts, text }] per message.
+  try {
+    await db.run(`ALTER TABLE messages ADD COLUMN quotes_json TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
+  try {
+    await db.run(`ALTER TABLE direct_messages ADD COLUMN quotes_json TEXT`);
+  } catch (err) {
+    /* column already exists */
+  }
   // Pinned channel messages: pinned_at (ms, NULL = not pinned) + who pinned it.
   try {
     await db.run(`ALTER TABLE messages ADD COLUMN pinned_at INTEGER`);
@@ -658,6 +669,35 @@ async function main() {
     return out;
   }
 
+  // Quoted replies on a message: sanitize client-supplied quotes on write. Each quote is a
+  // snapshot { id, author, ts, text } of the message being replied to; capped and de-duplicated
+  // (the same message can't be quoted twice in one reply).
+  function sanitizeQuotes(quotes) {
+    if (!Array.isArray(quotes)) return null;
+    const out = [];
+    const seen = new Set();
+    for (const q of quotes.slice(0, 10)) {
+      if (!q || typeof q !== 'object') continue;
+      const id = q.id != null ? String(q.id).slice(0, 64) : null;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const author = typeof q.author === 'string' ? q.author.slice(0, 64) : '';
+      const text = typeof q.text === 'string' ? q.text.slice(0, 300) : '';
+      if (!author && !text) continue;
+      out.push({ id, author, ts: Number.isFinite(q.ts) ? q.ts : null, text });
+    }
+    return out.length ? out : null;
+  }
+  function parseQuotes(value) {
+    if (!value) return null;
+    try {
+      const arr = JSON.parse(value);
+      return Array.isArray(arr) && arr.length ? arr : null;
+    } catch {
+      return null;
+    }
+  }
+
   function mapMessageRow(row, forUsername) {
     return {
       id: row.id,
@@ -666,6 +706,7 @@ async function main() {
       ts: row.ts,
       attachment: parseAttachment(row.attachment_json),
       reactions: formatReactions(parseReactions(row.reactions_json), forUsername),
+      quotes: parseQuotes(row.quotes_json),
       pinnedAt: row.pinned_at || null,
       pinnedBy: row.pinned_by || null,
     };
@@ -674,7 +715,7 @@ async function main() {
   // Pinned messages of a channel, newest pin first (so pins[0] is what the pinned bar shows).
   async function channelPins(serverId, channelId, forUsername) {
     const rows = await db.all(
-      'SELECT id, author, text, ts, attachment_json, reactions_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
+      'SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
       serverId, channelId
     );
     return (rows || []).map((m) => mapMessageRow(m, forUsername));
@@ -2291,7 +2332,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       await emitDmUnreadUpdate(me.username);
     }
     const rows = await db.all(
-      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, s.username AS author
+      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, s.username AS author
        FROM direct_messages dm
        JOIN users s ON s.id = dm.sender_id
        WHERE (dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)
@@ -2340,16 +2381,18 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       return res.status(403).json({ error: 'You can only message friends' });
     }
     const createdAt = Date.now();
+    const cleanQuotes = sanitizeQuotes(req.body?.quotes);
     const insertResult = await db.run(
-      'INSERT INTO direct_messages (sender_id, recipient_id, body, created_at, read_at, attachment_json) VALUES (?, ?, ?, ?, NULL, ?)',
+      'INSERT INTO direct_messages (sender_id, recipient_id, body, created_at, read_at, attachment_json, quotes_json) VALUES (?, ?, ?, ?, NULL, ?, ?)',
       me.id,
       peer.id,
       body,
       createdAt,
-      attachment ? JSON.stringify(attachment) : null
+      attachment ? JSON.stringify(attachment) : null,
+      cleanQuotes ? JSON.stringify(cleanQuotes) : null
     );
     const row = await db.get(
-      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, s.username AS author
+      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, s.username AS author
        FROM direct_messages dm
        JOIN users s ON s.id = dm.sender_id
        WHERE dm.id = ?`,
@@ -2497,7 +2540,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
       const messagesByChannel = {};
       for (const ch of channels) {
-        const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
+        const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
         messagesByChannel[ch.id] = msgs.map((m) => mapMessageRow(m, req.user.username));
       }
       result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
@@ -2543,7 +2586,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       if (firstText) {
         socket.join(`channel:${serverId}:${firstText.id}`);
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
         socket.emit('messages:init', { serverId, channelId: firstText.id, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
         await markChannelRead(socketUser, serverId, firstText.id); // history was just shown
       } else {
@@ -2563,7 +2606,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       socket.join(`channel:${serverId}:${channelId}`);
       socket.emit('channel:joined', { serverId, channelId });
       if (ch.type === 'text') {
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
         socket.emit('messages:init', { serverId, channelId, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
         socket.emit('pins:updated', { serverId, channelId, pins: await channelPins(serverId, channelId, socketUser) });
       }
@@ -2580,7 +2623,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       await markChannelRead(socketUser, serverId, channelId);
     });
 
-    socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment } = {}) => {
+    socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment, quotes } = {}) => {
       // Refuse writes to channels the user can't see (belongs to server + private-access check).
       const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       if (!ch) return;
@@ -2590,9 +2633,10 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);
       if (!body && !fileAttachment) return;
+      const cleanQuotes = sanitizeQuotes(quotes);
       const ts = Date.now();
-      await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json) VALUES (?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null);
-      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json FROM messages WHERE rowid = last_insert_rowid()');
+      await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null, cleanQuotes ? JSON.stringify(cleanQuotes) : null);
+      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json FROM messages WHERE rowid = last_insert_rowid()');
       // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
       io.to(`channel:${serverId}:${channelId}`).emit('message', { ...mapMessageRow(msgRow), serverId, channelId });
       await emitUnreadBump(serverId, channelId, ch.privacy, author, body);

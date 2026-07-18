@@ -24,6 +24,9 @@ export default function GifPicker({
   const [gridWidth, setGridWidth] = useState(320)
   // Right-click context menu on a custom GIF: { id, x, y }.
   const [gifMenu, setGifMenu] = useState(null)
+  // Name tooltip shown after dwelling on a Giphy GIF: { text, left, top } relative to the picker.
+  const [gifTooltip, setGifTooltip] = useState(null)
+  const tooltipTimerRef = useRef(null)
 
   // Close on outside click / Esc.
   useEffect(() => {
@@ -64,6 +67,55 @@ export default function GifPicker({
     if (section !== 'giphy' || giphyConfigured !== true) return
     const el = giphyGridWrapRef.current
     if (el && el.clientWidth) setGridWidth(el.clientWidth)
+  }, [section, giphyConfigured])
+
+  // After dwelling on a Giphy GIF for ~2s, show its name as a small tooltip — the only hover
+  // affordance on the grid (the Giphy attribution overlay is disabled). Delegated listeners on
+  // the grid wrapper; the name comes from the alt text the Grid puts on each GIF's <img>.
+  useEffect(() => {
+    if (section !== 'giphy' || giphyConfigured !== true) return
+    const wrap = giphyGridWrapRef.current
+    const root = rootRef.current
+    if (!wrap || !root) return
+    const hide = () => {
+      if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current)
+      tooltipTimerRef.current = null
+      setGifTooltip(null)
+    }
+    const sameCell = (e, cell) => e.relatedTarget instanceof Node && cell.contains(e.relatedTarget)
+    const onOver = (e) => {
+      const cell = e.target.closest('.giphy-gif')
+      if (!cell || sameCell(e, cell)) return
+      hide()
+      tooltipTimerRef.current = setTimeout(() => {
+        const text = (cell.querySelector('img')?.alt || '').trim()
+        if (!text) return
+        const cr = cell.getBoundingClientRect()
+        const rr = root.getBoundingClientRect()
+        // Center under the cell, clamped so the tooltip (max-width 200) stays inside the picker;
+        // flip above the cell when there's no room below.
+        const left = Math.max(108, Math.min(cr.left - rr.left + cr.width / 2, rr.width - 108))
+        const below = cr.bottom - rr.top + 6
+        const top = below + 28 > rr.height ? cr.top - rr.top - 30 : below
+        setGifTooltip({ text, left, top })
+      }, 2000)
+    }
+    const onOut = (e) => {
+      const cell = e.target.closest('.giphy-gif')
+      if (cell && !sameCell(e, cell)) hide()
+    }
+    const scroller = root.querySelector('.emoji-picker-scroll')
+    wrap.addEventListener('mouseover', onOver)
+    wrap.addEventListener('mouseout', onOut)
+    wrap.addEventListener('mousedown', hide)
+    scroller?.addEventListener('scroll', hide)
+    return () => {
+      wrap.removeEventListener('mouseover', onOver)
+      wrap.removeEventListener('mouseout', onOut)
+      wrap.removeEventListener('mousedown', hide)
+      scroller?.removeEventListener('scroll', hide)
+      hide()
+    }
   }, [section, giphyConfigured])
 
   // Fetch through our server proxy (keeps the API key server-side). Memoized per query so
@@ -118,7 +170,7 @@ export default function GifPicker({
                     gutter={6}
                     fetchGifs={fetchGiphyGifs}
                     noLink
-                    hideAttribution={false}
+                    hideAttribution
                     onGifClick={(gif, e) => {
                       e.preventDefault()
                       const url = gif.images?.original?.url || gif.images?.downsized_medium?.url || ''
@@ -169,6 +221,10 @@ export default function GifPicker({
         <div className="emoji-context-menu" style={{ left: gifMenu.x, top: gifMenu.y }} role="menu">
           <button type="button" className="danger" onClick={deleteFromMenu}>Remove GIF</button>
         </div>
+      )}
+
+      {gifTooltip && (
+        <div className="gif-name-tooltip" style={{ left: gifTooltip.left, top: gifTooltip.top }} role="tooltip">{gifTooltip.text}</div>
       )}
 
       <input ref={gifUploadRef} type="file" accept="image/gif,image/*" className="file-input" onChange={handleGifUpload} />
