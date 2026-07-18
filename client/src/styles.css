@@ -511,6 +511,7 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .gif-custom-head{display:flex;align-items:center;gap:8px;margin:6px 0 8px}
 .gif-custom-head .gif-search{flex:1;width:auto;margin:0}
 .giphy-grid-wrap{margin-top:2px}
+.gif-name-tooltip{position:absolute;transform:translateX(-50%);max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:#13202c;border:1px solid rgba(255,255,255,.14);border-radius:7px;padding:4px 8px;font-size:11px;color:var(--text);box-shadow:0 6px 18px rgba(0,0,0,.45);pointer-events:none;z-index:5}
 .giphy-attribution{font-size:10px;color:var(--muted);text-align:center;padding:6px 0 2px;letter-spacing:.5px;text-transform:uppercase}
 .sb-name-count{font-weight:600;color:var(--muted);font-size:11px;margin-left:6px}
 
@@ -1065,6 +1066,9 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .invite-title strong{color:#edf3fb}
 .invite-close{background:transparent;border:none;color:#8ea0b2;font-size:15px;cursor:pointer;padding:4px;line-height:1;border-radius:6px}
 .invite-close:hover{color:#edf3fb;background:rgba(255,255,255,.08)}
+.invite-search{width:100%;box-sizing:border-box;padding:9px 12px;margin-bottom:8px;border-radius:9px;background:#0c1015;border:1px solid rgba(255,255,255,.14);color:#edf3fb;font-size:14px;font-family:inherit}
+.invite-search::placeholder{color:#6f8092}
+.invite-search:focus{outline:none;border-color:var(--accent-start)}
 /* Sized to show ~4.5 rows before scrolling (so a half-row peeks to hint there's more), then a
    themed thin scrollbar. Content-height (not flex:1) so a short list never shows a phantom bar. */
 .invite-list{list-style:none;margin:0;padding:0;overflow-y:auto;display:flex;flex-direction:column;gap:2px;max-height:236px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.22) transparent}

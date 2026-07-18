@@ -870,6 +870,7 @@ export default function App() {
   const [inviteMembers, setInviteMembers] = useState(new Set()) // usernames already in the server
   const [inviteBusy, setInviteBusy] = useState(new Set()) // usernames currently being invited
   const [inviteLoadingMembers, setInviteLoadingMembers] = useState(false)
+  const [inviteQuery, setInviteQuery] = useState('') // filter the friends list in the invite modal
   // Whether the profile customization controls (picture/border/overlay/name style) are expanded.
   const [showProfileEditor, setShowProfileEditor] = useState(false)
   // Editable username (in Edit Profile) — changing it reissues the auth token.
@@ -2604,6 +2605,7 @@ export default function App() {
     setInviteModal({ serverId, serverName: nm })
     setInviteMembers(new Set())
     setInviteBusy(new Set())
+    setInviteQuery('')
     setInviteLoadingMembers(true)
     try {
       const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/members`)
@@ -5925,30 +5927,49 @@ export default function App() {
 
             {friends.length === 0 ? (
               <div className="invite-empty">You don’t have any friends yet. Add friends first, then invite them here.</div>
-            ) : (
-              <ul className="invite-list">
-                {friends.map((f) => {
-                  const uname = f.name
-                  const already = inviteMembers.has(uname)
-                  const busy = inviteBusy.has(uname)
-                  return (
-                    <li key={f.id || uname} className="invite-row">
-                      <div className="invite-row-main">
-                        <ProfileAvatar name={uname} profile={f.profile || {}} size={34} resolveSrc={emojiSrc} />
-                        <span className="invite-row-name" style={f.profile ? nameStyleToCss(f.profile.nameStyle, f.profile.nameFont) : undefined}>{uname}</span>
-                      </div>
-                      {already ? (
-                        <span className="invite-added" title="Already in this server">✓ In server</span>
-                      ) : (
-                        <button className="invite-add-btn" disabled={busy} onClick={() => inviteFriendToServer(uname)}>
-                          {busy ? 'Adding…' : 'Add'}
-                        </button>
-                      )}
-                    </li>
-                  )
-                })}
-              </ul>
-            )}
+            ) : (() => {
+              const q = inviteQuery.trim().toLowerCase()
+              const shown = q ? friends.filter((f) => f.name.toLowerCase().includes(q)) : friends
+              return (
+                <>
+                  <input
+                    className="invite-search"
+                    type="text"
+                    value={inviteQuery}
+                    onChange={(e) => setInviteQuery(e.target.value)}
+                    placeholder="Search friends…"
+                    aria-label="Search friends"
+                    autoFocus
+                  />
+                  {shown.length === 0 ? (
+                    <div className="invite-empty">No friends match “{inviteQuery.trim()}”.</div>
+                  ) : (
+                    <ul className="invite-list">
+                      {shown.map((f) => {
+                        const uname = f.name
+                        const already = inviteMembers.has(uname)
+                        const busy = inviteBusy.has(uname)
+                        return (
+                          <li key={f.id || uname} className="invite-row">
+                            <div className="invite-row-main">
+                              <ProfileAvatar name={uname} profile={f.profile || {}} size={34} resolveSrc={emojiSrc} />
+                              <span className="invite-row-name" style={f.profile ? nameStyleToCss(f.profile.nameStyle, f.profile.nameFont) : undefined}>{uname}</span>
+                            </div>
+                            {already ? (
+                              <span className="invite-added" title="Already in this server">✓ In server</span>
+                            ) : (
+                              <button className="invite-add-btn" disabled={busy} onClick={() => inviteFriendToServer(uname)}>
+                                {busy ? 'Adding…' : 'Add'}
+                              </button>
+                            )}
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  )}
+                </>
+              )
+            })()}
             {inviteLoadingMembers && <div className="invite-loading">Checking who’s already in…</div>}
 
             <div className="invite-actions">
