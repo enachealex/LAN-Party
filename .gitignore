@@ -9,6 +9,7 @@ server/giphy.key
 server/youtube.key
 server/spotify.key
 server/smtp.key
+server/vaultline.key
 desktop/certs/
 
 # Runtime data (user accounts, uploads, sounds, gifs live on the server's disk)

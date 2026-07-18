@@ -14,6 +14,7 @@ import AddFriendModal from './components/AddFriendModal'
 import NewChatModal from './components/NewChatModal'
 import EmojiPicker from './components/EmojiPicker'
 import GifPicker from './components/GifPicker'
+import ReactionPicker, { REACTION_PICKER_W, REACTION_PICKER_H } from './components/ReactionPicker'
 import Soundboard from './components/Soundboard'
 import CollabCanvas from './components/CollabCanvas'
 import ActivityPanel, { ACTIVITY_TYPES } from './components/Activities'
@@ -29,6 +30,8 @@ import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
 // same origin (the server serves the client), so it "just works" behind one domain. Override with
 // VITE_SERVER_URL at build time to point at a separate API host.
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? (import.meta.env.DEV ? 'http://localhost:3000' : '')
+// Reported in feedback/bug diagnostics. Override at build time with VITE_APP_VERSION.
+const APP_VERSION = import.meta.env.VITE_APP_VERSION || '1.2.0'
 const VOICE_TILES_PER_PAGE = 8 // max participant tiles per gallery page before paging kicks in
 const MAX_FILE_SIZE = 100 * 1024 * 1024
 const MESSAGE_REACTIONS = ['👍', '❤️', '😂', '😮', '🙏']
@@ -444,14 +447,16 @@ function pinPreview(m) {
   return m.text || '(empty message)'
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, isPinned }) {
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
+  const [reactionPickerPos, setReactionPickerPos] = useState(null) // { left, top } for the full-library picker
   const [showTimestamp, setShowTimestamp] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editText, setEditText] = useState('')
   const closeToolbarTimer = useRef(null)
   const moreBtnRef = useRef(null)
+  const moreReactionsBtnRef = useRef(null)
   const isOutgoing = message.author === currentUser
   const isToolbarActive = String(activeReactionMessageId) === String(message.id)
   const reactions = message.reactions || {}
@@ -530,6 +535,26 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
     setMenuOpen(true)
   }
 
+  // Open the full emoji library as a fixed-position portal anchored to the "+" toolbar button,
+  // clamped to the viewport (flips above/below like the action menu).
+  const toggleReactionPicker = () => {
+    if (reactionPickerPos) { setReactionPickerPos(null); return }
+    const btn = moreReactionsBtnRef.current
+    if (!btn) return
+    const r = btn.getBoundingClientRect()
+    const margin = 8
+    let left = isOutgoing ? r.right - REACTION_PICKER_W : r.left
+    left = Math.max(margin, Math.min(left, window.innerWidth - REACTION_PICKER_W - margin))
+    const top = (r.bottom + REACTION_PICKER_H + margin > window.innerHeight)
+      ? Math.max(margin, r.top - REACTION_PICKER_H - 4) // flip above when not enough room below
+      : r.bottom + 4
+    setReactionPickerPos({ left, top })
+  }
+  const pickReaction = (emoji) => {
+    onReact?.(message.id, emoji)
+    setReactionPickerPos(null)
+  }
+
   // Right-click anywhere on the message (incl. an image) opens the action menu at the cursor.
   const openContextMenu = (event) => {
     event.preventDefault()
@@ -553,11 +578,22 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
         }}
       >
         <div className="msg-teams-toolbar" role="toolbar" aria-label="Message reactions" onMouseEnter={showToolbar}>
-          {MESSAGE_REACTIONS.map((emoji) => (
+          {quickReactions.map((emoji) => (
             <button key={emoji} type="button" className="msg-reaction-btn" onClick={() => onReact?.(message.id, emoji)} aria-label={`React with ${emoji}`}>
               {emoji}
             </button>
           ))}
+          <button
+            ref={moreReactionsBtnRef}
+            type="button"
+            className="msg-more-btn msg-more-reactions-btn"
+            onMouseDown={(e) => e.stopPropagation() /* keep the picker's outside-mousedown close from firing before this toggle */}
+            onClick={() => { showToolbar(); toggleReactionPicker() }}
+            aria-label="More reactions"
+            aria-expanded={Boolean(reactionPickerPos)}
+          >
+            +
+          </button>
           <button
             ref={moreBtnRef}
             type="button"
@@ -568,6 +604,14 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
             ...
           </button>
         </div>
+        {reactionPickerPos && (
+          <ReactionPicker
+            pos={reactionPickerPos}
+            skinTones={skinTones}
+            onPick={pickReaction}
+            onClose={() => setReactionPickerPos(null)}
+          />
+        )}
         {menuOpen && menuPos && createPortal(
           <div
             className="msg-action-menu"
@@ -812,6 +856,15 @@ export default function App() {
   const [publicApps, setPublicApps] = useState([])
   const [showSettingsPanel, setShowSettingsPanel] = useState(false)
   const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
+  // Feedback / bug-report modal (submissions forward to Vaultline via the server's /feedback route).
+  const [showFeedback, setShowFeedback] = useState(false)
+  const [feedbackType, setFeedbackType] = useState('feedback') // 'feedback' | 'request' | 'bug'
+  const [feedbackTitle, setFeedbackTitle] = useState('')
+  const [feedbackMessage, setFeedbackMessage] = useState('')
+  const [feedbackFile, setFeedbackFile] = useState(null)
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
+  const [feedbackResult, setFeedbackResult] = useState(null) // { ok, key?, message }
+  const feedbackFileInputRef = useRef(null)
   // Whether the profile customization controls (picture/border/overlay/name style) are expanded.
   const [showProfileEditor, setShowProfileEditor] = useState(false)
   // Editable username (in Edit Profile) — changing it reissues the auth token.
@@ -830,6 +883,10 @@ export default function App() {
   const [streamSize, setStreamSize] = useState({ w: 344, h: 226 })
   // Direction new messages flow: 'bottom' (anchor to bottom, default) or 'top' (fill from top down).
   const [messageFlow, setMessageFlow] = useState('bottom')
+  // The user's quick-reaction emojis shown in the message hover toolbar (customizable in Settings).
+  const [quickReactions, setQuickReactions] = useState(MESSAGE_REACTIONS)
+  // Which quick-reaction slot is being edited in Settings: { index, left, top } or null.
+  const [editingQuickReaction, setEditingQuickReaction] = useState(null)
   // The user's customizable profile (avatar, decorations, bio, tags, name styling).
   const [profile, setProfile] = useState(() => normalizeProfile())
   // Draft profile being edited in the settings modal (committed on Save).
@@ -838,6 +895,8 @@ export default function App() {
   const profileAvatarInputRef = useRef(null)
   const [userSettings, setUserSettings] = useState(null)
   const [editingSettings, setEditingSettings] = useState(null)
+  // Scrollable body of the settings modal, so save/cancel can return the view to the top.
+  const settingsBodyRef = useRef(null)
   const [token, setToken] = useState(null)
   // Authentication state
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -1614,6 +1673,72 @@ export default function App() {
     }
   }
 
+  // Snapshot of the runtime environment attached to each feedback/bug report to help triage.
+  const collectDiagnostics = () => {
+    try {
+      return {
+        appVersion: APP_VERSION,
+        desktopApp: !!(typeof window !== 'undefined' && window.desktop && window.desktop.isElectron),
+        platform: (typeof window !== 'undefined' && window.desktop && window.desktop.platform) || (typeof navigator !== 'undefined' ? navigator.platform : ''),
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+        viewport: typeof window !== 'undefined' ? `${window.innerWidth}x${window.innerHeight}` : '',
+        screen: typeof window !== 'undefined' && window.screen ? `${window.screen.width}x${window.screen.height}` : '',
+        locale: typeof navigator !== 'undefined' ? (navigator.language || '') : '',
+      }
+    } catch (_) { return {} }
+  }
+
+  const openFeedback = () => {
+    setFeedbackType('feedback')
+    setFeedbackTitle('')
+    setFeedbackMessage('')
+    setFeedbackFile(null)
+    setFeedbackResult(null)
+    setFeedbackSubmitting(false)
+    setShowFeedback(true)
+  }
+
+  const closeFeedback = () => {
+    setShowFeedback(false)
+    setFeedbackFile(null)
+  }
+
+  const submitFeedback = async () => {
+    const msg = feedbackMessage.trim()
+    if (!msg) { setFeedbackResult({ ok: false, message: 'Please describe your feedback first.' }); return }
+    setFeedbackSubmitting(true)
+    setFeedbackResult(null)
+    try {
+      const t = token || localStorage.getItem('token')
+      const fd = new FormData()
+      fd.append('type', feedbackType)
+      if (feedbackTitle.trim()) fd.append('title', feedbackTitle.trim())
+      fd.append('message', msg)
+      fd.append('diagnostics', JSON.stringify(collectDiagnostics()))
+      if (feedbackFile) fd.append('screenshot', feedbackFile)
+      const res = await fetch(`${SERVER_URL}/feedback`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.ok) {
+        setFeedbackResult({ ok: true, key: data.key || null, message: data.key ? `Thanks! Your report was filed as ${data.key}.` : 'Thanks! Your report was received.' })
+        setFeedbackMessage('')
+        setFeedbackTitle('')
+        setFeedbackFile(null)
+      } else if (data && data.saved) {
+        setFeedbackResult({ ok: true, message: 'Thanks! Your report was saved and will be delivered shortly.' })
+      } else {
+        setFeedbackResult({ ok: false, message: (data && data.error) || 'Could not submit right now. Please try again.' })
+      }
+    } catch (_) {
+      setFeedbackResult({ ok: false, message: 'Network error. Please try again.' })
+    } finally {
+      setFeedbackSubmitting(false)
+    }
+  }
+
+  // Object URL for the attached screenshot preview; revoked when it changes / unmounts.
+  const feedbackPreview = useMemo(() => (feedbackFile ? URL.createObjectURL(feedbackFile) : null), [feedbackFile])
+  useEffect(() => () => { if (feedbackPreview) URL.revokeObjectURL(feedbackPreview) }, [feedbackPreview])
+
   const openSettings = () => {
     const root = getComputedStyle(document.documentElement)
     const defaults = userSettings || {
@@ -1685,6 +1810,33 @@ export default function App() {
     patchUserSettings({ messageFlow: flow })
   }
 
+  // Replace one quick-reaction slot (from Settings). If the picked emoji already sits in
+  // another slot, swap the two so the set stays free of duplicates.
+  const setQuickReactionAt = (index, emoji) => {
+    setQuickReactions((prev) => {
+      const next = [...prev]
+      const existing = next.indexOf(emoji)
+      if (existing !== -1 && existing !== index) next[existing] = next[index]
+      next[index] = emoji
+      patchUserSettings({ quickReactions: next })
+      return next
+    })
+  }
+  const resetQuickReactions = () => {
+    setQuickReactions(MESSAGE_REACTIONS)
+    patchUserSettings({ quickReactions: MESSAGE_REACTIONS })
+  }
+  // Open the reaction picker anchored to a quick-reaction slot in Settings.
+  const openQuickReactionEditor = (index, event) => {
+    const r = event.currentTarget.getBoundingClientRect()
+    const margin = 8
+    const left = Math.max(margin, Math.min(r.left, window.innerWidth - REACTION_PICKER_W - margin))
+    const top = (r.bottom + REACTION_PICKER_H + margin > window.innerHeight)
+      ? Math.max(margin, r.top - REACTION_PICKER_H - 4)
+      : r.bottom + 4
+    setEditingQuickReaction({ index, left, top })
+  }
+
   // ---- Gaming profile (genres + games played lately), edited alongside profile settings ----
   const editingGaming = (editingSettings && editingSettings.gamingProfile) || { genres: [], currentGames: '' }
   const updateGamingProfile = (patch) => setEditingSettings((s) => ({ ...(s || {}), gamingProfile: { ...((s && s.gamingProfile) || {}), ...patch, updatedAt: Date.now() } }))
@@ -1745,6 +1897,22 @@ export default function App() {
 
   // Commit the edited profile: live state + persisted settings (including the gaming profile,
   // which lives in editingSettings). Refresh userSettings so Discover emits use fresh genres.
+  // Whether the profile draft (or gaming profile draft) differs from what's saved. Drives the
+  // floating Save/Cancel bar in the settings modal. `updatedAt` is excluded from the gaming
+  // comparison because every edit stamps it.
+  const gamingSignature = (g) => JSON.stringify({ genres: g?.genres || [], currentGames: g?.currentGames || '' })
+  const profileDirty = useMemo(() => {
+    if (!editingProfile) return false
+    return (
+      JSON.stringify(normalizeProfile(editingProfile)) !== JSON.stringify(normalizeProfile(profile)) ||
+      gamingSignature(editingSettings?.gamingProfile) !== gamingSignature(userSettings?.gamingProfile)
+    )
+  }, [editingProfile, profile, editingSettings, userSettings])
+
+  // Instant jump (not smooth): the exit from editor mode re-renders/collapses the form, which
+  // cancels an in-flight smooth scroll and strands it partway.
+  const scrollSettingsToTop = () => { if (settingsBodyRef.current) settingsBodyRef.current.scrollTop = 0 }
+
   const saveProfile = () => {
     const normalized = normalizeProfile(editingProfile)
     setProfile(normalized)
@@ -1754,6 +1922,7 @@ export default function App() {
     setUserSettings((prev) => ({ ...(prev || {}), ...patch }))
     setShowProfileEditor(false)
     setToast('Profile saved')
+    scrollSettingsToTop()
   }
 
   // Discard in-progress profile edits and leave Edit Profile mode (nothing is persisted until Save).
@@ -1763,6 +1932,7 @@ export default function App() {
     setCustomTagInput('')
     setEditUsername(name || '')
     setShowProfileEditor(false)
+    scrollSettingsToTop()
   }
 
   // Apply a preset color scheme: update live CSS vars, local state, and persist (merging so
@@ -1900,6 +2070,9 @@ export default function App() {
     if (Array.isArray(settings.customEmojis)) setCustomEmojis(settings.customEmojis)
     if (settings.emojiSkinTones && typeof settings.emojiSkinTones === 'object') setEmojiSkinTones(settings.emojiSkinTones)
     if (settings.messageFlow === 'top' || settings.messageFlow === 'bottom') setMessageFlow(settings.messageFlow)
+    if (Array.isArray(settings.quickReactions) && settings.quickReactions.length > 0 && settings.quickReactions.every((e) => typeof e === 'string' && e)) {
+      setQuickReactions(settings.quickReactions.slice(0, MESSAGE_REACTIONS.length))
+    }
     if (settings.profile && typeof settings.profile === 'object') setProfile(normalizeProfile(settings.profile))
   }
 
@@ -4552,6 +4725,7 @@ export default function App() {
         onToggleMic={toggleMute}
         onToggleDeafen={toggleDeafen}
         onOpenSettings={() => { setShowStatusMenu(false); openSettings() }}
+        onOpenFeedback={() => { setShowStatusMenu(false); openFeedback() }}
         userStatus={userStatus}
         showStatusMenu={showStatusMenu}
         onToggleStatusMenu={() => setShowStatusMenu((open) => !open)}
@@ -4670,6 +4844,8 @@ export default function App() {
                       onCollab={startCollab}
                       activeReactionMessageId={activeReactionMessageId}
                       setActiveReactionMessageId={setActiveReactionMessageId}
+                      quickReactions={quickReactions}
+                      skinTones={emojiSkinTones}
                       onOpenMedia={(attachment) => openLightbox(homeChatMessages, attachment)}
                       emojiMap={emojiMap}
                       onSaveEmoji={saveCustomEmojiFromChat}
@@ -4730,6 +4906,8 @@ export default function App() {
                       onCollab={startCollab}
                       activeReactionMessageId={activeReactionMessageId}
                       setActiveReactionMessageId={setActiveReactionMessageId}
+                      quickReactions={quickReactions}
+                      skinTones={emojiSkinTones}
                       onOpenMedia={(attachment) => openLightbox(messages, attachment)}
                       emojiMap={emojiMap}
                       onSaveEmoji={saveCustomEmojiFromChat}
@@ -5699,6 +5877,103 @@ export default function App() {
         </div>
       )}
 
+      {/* Feedback / feature request / bug report — forwards to Vaultline via the server. */}
+      {showFeedback && (
+        <div className="feedback-overlay" role="dialog" aria-modal="true" aria-labelledby="feedback-title" onMouseDown={(e) => { if (e.target === e.currentTarget) closeFeedback() }}>
+          <div className="feedback-card">
+            <div className="feedback-header">
+              <span id="feedback-title" className="feedback-title">Send feedback</span>
+              <button className="feedback-close" aria-label="Close" onClick={closeFeedback}>✕</button>
+            </div>
+
+            {feedbackResult?.ok ? (
+              <div className="feedback-success">
+                <div className="feedback-success-icon" aria-hidden="true">✓</div>
+                <p className="feedback-success-msg">{feedbackResult.message}</p>
+                <div className="feedback-actions">
+                  <button className="feedback-btn ghost" onClick={() => setFeedbackResult(null)}>Send another</button>
+                  <button className="feedback-btn primary" onClick={closeFeedback}>Done</button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="feedback-types" role="radiogroup" aria-label="Type">
+                  {[{ id: 'feedback', label: 'Feedback', icon: '💬' }, { id: 'request', label: 'Feature request', icon: '✨' }, { id: 'bug', label: 'Bug report', icon: '🐞' }].map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={feedbackType === t.id}
+                      className={`feedback-type-btn${feedbackType === t.id ? ' active' : ''}`}
+                      onClick={() => setFeedbackType(t.id)}
+                    >
+                      <span aria-hidden="true">{t.icon}</span> {t.label}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="feedback-label" htmlFor="feedback-subject">Subject <span className="feedback-optional">(optional)</span></label>
+                <input
+                  id="feedback-subject"
+                  className="feedback-input"
+                  type="text"
+                  maxLength={160}
+                  placeholder={feedbackType === 'bug' ? 'e.g. Save button does nothing on mobile' : 'Short summary'}
+                  value={feedbackTitle}
+                  onChange={(e) => setFeedbackTitle(e.target.value)}
+                />
+
+                <label className="feedback-label" htmlFor="feedback-message">{feedbackType === 'bug' ? 'What happened?' : 'Your message'}</label>
+                <textarea
+                  id="feedback-message"
+                  className="feedback-textarea"
+                  rows={5}
+                  maxLength={8000}
+                  autoFocus
+                  placeholder={feedbackType === 'bug' ? 'Describe the bug, and the steps to reproduce it…' : feedbackType === 'request' ? 'Describe the feature you’d like to see…' : 'Tell us what you think…'}
+                  value={feedbackMessage}
+                  onChange={(e) => setFeedbackMessage(e.target.value)}
+                />
+
+                <div className="feedback-attach-row">
+                  {feedbackPreview ? (
+                    <div className="feedback-thumb">
+                      <img src={feedbackPreview} alt="Screenshot preview" />
+                      <button type="button" className="feedback-thumb-remove" aria-label="Remove screenshot" onClick={() => { setFeedbackFile(null); if (feedbackFileInputRef.current) feedbackFileInputRef.current.value = '' }}>✕</button>
+                    </div>
+                  ) : (
+                    <button type="button" className="feedback-attach-btn" onClick={() => feedbackFileInputRef.current?.click()}>
+                      📎 Attach screenshot
+                    </button>
+                  )}
+                  <input
+                    ref={feedbackFileInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="file-input"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f && f.size > 15 * 1024 * 1024) { setFeedbackResult({ ok: false, message: 'Screenshot must be under 15 MB.' }); if (e.target) e.target.value = ''; return }
+                      setFeedbackFile(f || null)
+                    }}
+                  />
+                </div>
+
+                <p className="feedback-note">We’ll include your username and basic device info (browser/OS) to help us investigate.</p>
+                {feedbackResult && !feedbackResult.ok && <p className="feedback-error">{feedbackResult.message}</p>}
+
+                <div className="feedback-actions">
+                  <button className="feedback-btn ghost" onClick={closeFeedback} disabled={feedbackSubmitting}>Cancel</button>
+                  <button className="feedback-btn primary" onClick={submitFeedback} disabled={feedbackSubmitting || !feedbackMessage.trim()}>
+                    {feedbackSubmitting ? 'Sending…' : 'Submit'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Direct friend call: incoming ring, or the in-call bar (remote audio plays via RemoteMedia) */}
       {call && (
         <>
@@ -5821,7 +6096,7 @@ export default function App() {
           <button type="button" role="tab" aria-selected={settingsTab === 'messages'} className={`profile-settings-tab${settingsTab === 'messages' ? ' active' : ''}`} onClick={() => setSettingsTab('messages')}>Messages</button>
         </div>
         )}
-        <div className="profile-settings-body">
+        <div className="profile-settings-body" ref={settingsBodyRef}>
           {settingsTab === 'profile' && editingProfile && (
           <section className="profile-settings-section">
             {/* Live preview */}
@@ -6050,12 +6325,15 @@ export default function App() {
               {isAuthenticated && (
                 <button type="button" className="profile-settings-signout" onClick={() => { setShowSettingsPanel(false); setShowSignOutConfirm(true) }}>Sign out</button>
               )}
-              <div className="profile-settings-actions-right">
-                {showProfileEditor && (
-                  <button type="button" className="profile-cancel-btn" onClick={cancelProfileEdit}>Cancel</button>
-                )}
-                <button type="button" className="connect-btn profile-save-btn" onClick={saveProfile}>Save Profile</button>
-              </div>
+              {/* Hidden while the floating unsaved-changes bar is up so there's only one Save/Cancel pair. */}
+              {!profileDirty && (
+                <div className="profile-settings-actions-right">
+                  {showProfileEditor && (
+                    <button type="button" className="profile-cancel-btn" onClick={cancelProfileEdit}>Cancel</button>
+                  )}
+                  <button type="button" className="connect-btn profile-save-btn" onClick={saveProfile}>Save Profile</button>
+                </div>
+              )}
             </div>
           </section>
           )}
@@ -6126,9 +6404,48 @@ export default function App() {
                 <span className="msg-flow-desc">Messages fill from the top down, then scroll up.</span>
               </button>
             </div>
+            <h3 className="profile-settings-section-title" style={{ marginTop: 24 }}>Quick Reactions</h3>
+            <p className="profile-settings-note">These emojis appear when you hover a message. Click one to swap it for a different emoji.</p>
+            <div className="quick-reactions-row">
+              {quickReactions.map((emoji, index) => (
+                <button
+                  key={`${emoji}-${index}`}
+                  type="button"
+                  className={`quick-reaction-slot${editingQuickReaction?.index === index ? ' editing' : ''}`}
+                  onMouseDown={(e) => e.stopPropagation() /* keep the picker's outside-mousedown close from firing before this toggle */}
+                  onClick={(e) => { editingQuickReaction?.index === index ? setEditingQuickReaction(null) : openQuickReactionEditor(index, e) }}
+                  title="Click to change"
+                  aria-label={`Change quick reaction ${index + 1} (currently ${emoji})`}
+                >
+                  {emoji}
+                </button>
+              ))}
+              <button type="button" className="quick-reactions-reset" onClick={resetQuickReactions} disabled={quickReactions.join() === MESSAGE_REACTIONS.join()}>
+                Reset to defaults
+              </button>
+            </div>
+            {editingQuickReaction && (
+              <ReactionPicker
+                pos={editingQuickReaction}
+                skinTones={emojiSkinTones}
+                onPick={(emoji) => { setQuickReactionAt(editingQuickReaction.index, emoji); setEditingQuickReaction(null) }}
+                onClose={() => setEditingQuickReaction(null)}
+              />
+            )}
           </section>
           )}
         </div>
+        {/* Floating Save/Cancel bar: pinned below the scrollable body whenever the profile draft
+            has unsaved changes, so saving never requires scrolling to the bottom of the form. */}
+        {settingsTab === 'profile' && profileDirty && (
+          <div className="profile-unsaved-bar" role="region" aria-label="Unsaved changes">
+            <span className="profile-unsaved-text">You have unsaved changes</span>
+            <div className="profile-unsaved-actions">
+              <button type="button" className="profile-cancel-btn" onClick={cancelProfileEdit}>Cancel</button>
+              <button type="button" className="connect-btn profile-save-btn" onClick={saveProfile}>Save Profile</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

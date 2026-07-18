@@ -11,6 +11,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('./email');
+const vaultline = require('./vaultline');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const PORT = process.env.PORT || 3000;
@@ -50,6 +51,10 @@ async function main() {
   // Lives on the data volume (the big files are pushed here out-of-band), NOT swept by cleanup.
   const downloadsDir = path.join(DATA_DIR, 'downloads');
   fs.mkdirSync(downloadsDir, { recursive: true });
+  // Screenshots attached to feedback/bug reports. Persistent (outside /uploads) so the links we hand
+  // to Vaultline don't 404 after the 7-day upload sweep.
+  const feedbackDir = path.join(DATA_DIR, 'feedback-media');
+  fs.mkdirSync(feedbackDir, { recursive: true });
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -84,6 +89,19 @@ async function main() {
       },
     }),
     limits: { fileSize: MAX_UPLOAD_SIZE },
+  });
+
+  // Screenshots on feedback/bug reports — images only, capped at 15 MB, stored persistently.
+  const feedbackUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, feedbackDir),
+      filename: (_req, file, cb) => {
+        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
+      },
+    }),
+    limits: { fileSize: 15 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => cb(null, /^image\//.test(file.mimetype || '')),
   });
 
   // Uploaded files are named `<timestamp>-<rand>-<name>`; derive the upload time from the name.
@@ -134,6 +152,8 @@ async function main() {
   app.use('/sounds', express.static(soundsDir, { redirect: false }));
   // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
+  // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
+  app.use('/feedback-media', express.static(feedbackDir, { redirect: false }));
   // Static images used by the landing page (app screenshots). Committed with the repo.
   app.use('/landing-assets', express.static(path.join(__dirname, 'landing-assets'), { redirect: false }));
   // Serve the built client (single-origin hosting) UNDER /app; a landing page sits at /.
@@ -290,6 +310,23 @@ async function main() {
     user_id INTEGER,
     purpose TEXT,
     expires_at INTEGER
+  )`);
+  // Audit trail for user-submitted feedback / bug reports. Every submission is stored here (so it's
+  // never lost if Vaultline is down), then forwarded to Vaultline; status tracks the outcome.
+  await db.exec(`CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT,
+    email TEXT,
+    type TEXT,
+    title TEXT,
+    message TEXT,
+    diagnostics TEXT,
+    screenshot_url TEXT,
+    status TEXT,
+    issue_key TEXT,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    sent_at INTEGER
   )`);
   try {
     await db.run(`ALTER TABLE messages ADD COLUMN attachment_json TEXT`);
@@ -2354,6 +2391,89 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
           type: req.file.mimetype || 'application/octet-stream',
         },
       });
+    });
+  });
+
+  // Submit user feedback / feature request / bug report. Stored locally (audit trail + safety net if
+  // the upstream is down) and forwarded to Vaultline, which turns it into a ticket. The Vaultline API
+  // key stays on the server; the client only ever calls this endpoint. Bugs -> /reports (high prio),
+  // feedback + feature requests -> /feedback (Vaultline has no separate "requests" endpoint).
+  const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || 'https://lanparty.thejumpvault.com').replace(/\/$/, '');
+  const FEEDBACK_LABELS = { feedback: 'Feedback', request: 'Feature request', bug: 'Bug report' };
+  app.post('/feedback', authMiddleware, (req, res) => {
+    feedbackUpload.single('screenshot')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Screenshot is larger than 15 MB' });
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      try {
+        const username = req.user.username;
+        const type = String(req.body.type || 'feedback').toLowerCase();
+        if (!FEEDBACK_LABELS[type]) return res.status(400).json({ error: 'Invalid feedback type' });
+
+        const rawMessage = String(req.body.message || '').trim();
+        if (!rawMessage) return res.status(400).json({ error: 'Message is required' });
+        if (rawMessage.length > 8000) return res.status(400).json({ error: 'Message is too long (max 8000 characters)' });
+        let userTitle = String(req.body.title || '').trim().slice(0, 160);
+
+        const userRow = await db.get('SELECT email FROM users WHERE username = ?', username);
+        const email = userRow && userRow.email;
+        if (!email) return res.status(400).json({ error: 'Your account has no email on file' });
+
+        // Parse client diagnostics (best-effort; never trust it for anything security-sensitive).
+        let diag = {};
+        try { diag = JSON.parse(req.body.diagnostics || '{}') || {}; } catch (_) { /* ignore malformed */ }
+
+        const screenshotUrl = req.file ? `${PUBLIC_APP_URL}/feedback-media/${req.file.filename}` : null;
+
+        // Fold everything Vaultline has no dedicated field for (diagnostics + screenshot link) into the
+        // message body, which Vaultline renders as HTML on the ticket.
+        const meta = [];
+        meta.push(`Submitted by ${username} (${email}) via LAN Party`);
+        if (diag.appVersion || diag.desktopApp != null) {
+          meta.push(`App: LAN Party ${diag.desktopApp ? 'desktop' : 'web'}${diag.appVersion ? ` v${diag.appVersion}` : ''}`);
+        }
+        if (diag.platform) meta.push(`Platform: ${diag.platform}`);
+        if (diag.userAgent) meta.push(`Browser: ${diag.userAgent}`);
+        if (diag.viewport) meta.push(`Viewport: ${diag.viewport}${diag.screen ? ` · Screen ${diag.screen}` : ''}`);
+        if (diag.locale) meta.push(`Locale: ${diag.locale}`);
+        if (screenshotUrl) meta.push(`Screenshot: ${screenshotUrl}`);
+
+        let message = `${rawMessage}\n\n—— ${FEEDBACK_LABELS[type]} · submitted via LAN Party ——\n${meta.join('\n')}`;
+        if (message.length > 10000) message = message.slice(0, 9990) + '…';
+
+        // Feature requests share Vaultline's feedback endpoint, so mark them in the title/summary.
+        let title = userTitle || null;
+        if (type === 'request') title = userTitle ? `Feature request: ${userTitle}` : 'Feature request';
+
+        const now = Date.now();
+        const ins = await db.run(
+          `INSERT INTO feedback (username, email, type, title, message, diagnostics, screenshot_url, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+          username, email, type, title, rawMessage, JSON.stringify(diag), screenshotUrl, now
+        );
+        const rowId = ins.lastID;
+
+        if (!vaultline.isConfigured()) {
+          // No upstream key here (e.g. local dev). Keep the stored copy and tell the client it's queued.
+          await db.run(`UPDATE feedback SET status = 'queued' WHERE id = ?`, rowId);
+          return res.json({ ok: true, queued: true, key: null });
+        }
+
+        try {
+          const result = await vaultline.submit({ type, username, email, message, title });
+          await db.run(`UPDATE feedback SET status = 'sent', issue_key = ?, sent_at = ? WHERE id = ?`, result.key, Date.now(), rowId);
+          return res.json({ ok: true, key: result.key });
+        } catch (sendErr) {
+          console.error('[feedback] forward to Vaultline failed:', sendErr.message);
+          await db.run(`UPDATE feedback SET status = 'failed', error = ? WHERE id = ?`, sendErr.message, rowId);
+          // The submission is safely stored; surface a soft failure so the user knows it was received.
+          return res.status(502).json({ ok: false, saved: true, error: 'Could not reach the feedback service, but your report was saved.' });
+        }
+      } catch (e) {
+        console.error('[feedback] error:', e);
+        return res.status(500).json({ error: 'Server error' });
+      }
     });
   });
 

@@ -368,6 +368,17 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .msg-reaction-btn,.msg-more-btn{width:26px;height:24px;border:none;border-radius:4px;background:transparent;color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;line-height:1;padding:0}
 .msg-reaction-btn:hover,.msg-more-btn:hover{background:rgba(255,255,255,.08)}
 .msg-more-btn{font-size:15px;font-weight:700;letter-spacing:1px;padding-bottom:4px}
+.msg-more-reactions-btn{font-size:17px;font-weight:600;padding-bottom:2px;letter-spacing:0}
+/* Full-library reaction popover (portal). Sits above the settings modal (z 9150) too. */
+.reaction-picker{position:fixed;width:320px;height:300px;display:flex;flex-direction:column;background:#0d1722;border:1px solid rgba(255,255,255,.12);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5);overflow:hidden;z-index:9200}
+.reaction-picker .emoji-picker-scroll{padding-top:0}
+.quick-reactions-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.quick-reaction-slot{width:40px;height:40px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.04);font-size:22px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
+.quick-reaction-slot:hover{background:rgba(255,255,255,.1);border-color:var(--accent-end)}
+.quick-reaction-slot.editing{border-color:var(--accent-end);outline:2px solid var(--accent-end)}
+.quick-reactions-reset{margin-left:4px;border:1px solid rgba(255,255,255,.14);background:transparent;color:var(--muted);border-radius:8px;padding:8px 12px;font-size:12px;font-weight:600;cursor:pointer}
+.quick-reactions-reset:hover:not(:disabled){background:rgba(255,255,255,.08);color:var(--text)}
+.quick-reactions-reset:disabled{opacity:.45;cursor:default}
 .msg-action-menu{position:fixed;width:170px;padding:6px 0;background:#fff;color:#242424;border:1px solid #e1dfdd;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.24);z-index:1300}
 .msg-action-menu button{display:block;width:100%;padding:8px 12px;border:none;background:transparent;color:#242424;text-align:left;font-size:13px;cursor:pointer}
 .msg-action-menu button:hover{background:#f3f2f1}
@@ -486,7 +497,7 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .emoji-context-menu button.danger:hover{background:rgba(242,63,67,.2);color:#ffb4b4}
 
 /* GIF picker (standalone board opened from the GIF composer button) */
-.gif-toggle-label{font-size:10px;font-weight:800;letter-spacing:.04em;line-height:1;border:1.5px solid currentColor;border-radius:5px;padding:2px 3px}
+.gif-toggle-label{font-size:11px;font-weight:800;letter-spacing:.04em;line-height:1;border:1.5px solid currentColor;border-radius:6px;padding:6px 3px}
 .gif-picker .emoji-picker-scroll{padding-top:8px}
 .gif-search{display:block;width:100%;box-sizing:border-box;border:1px solid rgba(255,255,255,.12);background:#07111a;color:var(--text);border-radius:8px;padding:8px 10px;font-size:13px;outline:none;margin:6px 0 8px}
 .gif-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding-top:4px}
@@ -580,6 +591,11 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .profile-settings-header{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid rgba(255,255,255,0.06)}
 .profile-settings-header h2{margin:0;font-size:30px;font-weight:700;color:var(--text)}
 .profile-settings-body{overflow:auto;padding:16px 20px 20px}
+/* Floating unsaved-changes bar: a flex sibling below the scrollable body, so it stays in view
+   without covering the form's last fields. */
+.profile-unsaved-bar{flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 16px 16px;padding:10px 12px 10px 16px;background:#0b141d;border:1px solid rgba(255,255,255,.16);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+.profile-unsaved-text{font-size:13px;font-weight:600;color:var(--muted)}
+.profile-unsaved-actions{display:flex;align-items:center;gap:8px}
 .profile-settings-section{margin-bottom:20px}
 .profile-settings-section:last-child{margin-bottom:0}
 .profile-settings-section-title{margin:0 0 12px;font-size:16px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
@@ -1002,6 +1018,44 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .prompt-btn.primary:hover{filter:brightness(1.06)}
 .prompt-btn.ghost{background:transparent;color:#b7c4d4;border-color:rgba(255,255,255,.16)}
 .prompt-btn.ghost:hover{border-color:rgba(255,255,255,.32);color:#edf3fb}
+
+/* Feedback / bug-report modal */
+.dc-feedback-btn svg{display:block}
+.feedback-overlay{position:fixed;inset:0;z-index:6200;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(6,8,12,.72);backdrop-filter:blur(4px)}
+.feedback-card{width:100%;max-width:460px;background:#12161c;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:20px 22px 18px;box-shadow:0 24px 64px rgba(0,0,0,.55);color:#edf3fb}
+.feedback-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.feedback-title{font-size:17px;font-weight:800}
+.feedback-close{background:transparent;border:none;color:#8ea0b2;font-size:16px;cursor:pointer;padding:4px;line-height:1;border-radius:6px}
+.feedback-close:hover{color:#edf3fb;background:rgba(255,255,255,.08)}
+.feedback-types{display:flex;gap:8px;margin-bottom:16px}
+.feedback-type-btn{flex:1;padding:9px 6px;border-radius:9px;background:#0c1015;border:1px solid rgba(255,255,255,.12);color:#b7c4d4;font-size:12.5px;font-weight:700;cursor:pointer;white-space:nowrap;transition:border-color .12s,color .12s,background .12s}
+.feedback-type-btn:hover{border-color:rgba(255,255,255,.28);color:#edf3fb}
+.feedback-type-btn.active{background:linear-gradient(135deg,rgba(43,195,255,.16),rgba(11,134,255,.12));border-color:var(--accent-start);color:#edf3fb}
+.feedback-label{display:block;font-size:12px;font-weight:700;letter-spacing:.02em;color:#9fb0bf;margin:0 0 6px}
+.feedback-optional{font-weight:600;color:#6f8092}
+.feedback-input,.feedback-textarea{width:100%;box-sizing:border-box;padding:11px 13px;border-radius:9px;background:#0c1015;border:1px solid rgba(255,255,255,.14);color:#edf3fb;font-size:14.5px;font-family:inherit;margin-bottom:14px}
+.feedback-input:focus,.feedback-textarea:focus{outline:none;border-color:var(--accent-start)}
+.feedback-textarea{resize:vertical;min-height:96px;line-height:1.45}
+.feedback-attach-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.feedback-attach-btn{padding:9px 14px;border-radius:8px;background:#0c1015;border:1px dashed rgba(255,255,255,.24);color:#b7c4d4;font-size:13px;font-weight:600;cursor:pointer}
+.feedback-attach-btn:hover{border-color:var(--accent-start);color:#edf3fb}
+.feedback-thumb{position:relative;display:inline-block}
+.feedback-thumb img{max-height:72px;max-width:160px;border-radius:8px;border:1px solid rgba(255,255,255,.16);display:block}
+.feedback-thumb-remove{position:absolute;top:-8px;right:-8px;width:22px;height:22px;border-radius:50%;background:#1c2530;border:1px solid rgba(255,255,255,.24);color:#edf3fb;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.feedback-thumb-remove:hover{background:#b0392f;border-color:#b0392f}
+.feedback-note{font-size:11.5px;color:#6f8092;margin:0 0 6px;line-height:1.4}
+.feedback-error{font-size:13px;color:#ff8a7a;margin:6px 0 0;font-weight:600}
+.feedback-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
+.feedback-btn{padding:9px 22px;border-radius:8px;font-weight:700;font-size:14px;cursor:pointer;border:1px solid transparent}
+.feedback-btn.primary{background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#04121f}
+.feedback-btn.primary:hover{filter:brightness(1.06)}
+.feedback-btn.primary:disabled{opacity:.5;cursor:default;filter:none}
+.feedback-btn.ghost{background:transparent;color:#b7c4d4;border-color:rgba(255,255,255,.16)}
+.feedback-btn.ghost:hover{border-color:rgba(255,255,255,.32);color:#edf3fb}
+.feedback-success{text-align:center;padding:14px 4px 6px}
+.feedback-success-icon{width:52px;height:52px;margin:0 auto 14px;border-radius:50%;background:linear-gradient(135deg,#1f9d55,#2bc36f);color:#04121f;font-size:26px;font-weight:900;display:flex;align-items:center;justify-content:center}
+.feedback-success-msg{font-size:15px;color:#e6eef7;margin:0 0 6px;line-height:1.5}
+.feedback-success .feedback-actions{justify-content:center;margin-top:18px}
 
 /* Direct friend calls: DM-header call button, incoming ring overlay, in-call bar */
 .call-btn{padding:7px 14px;border-radius:8px;border:1px solid rgba(255,255,255,.16);background:transparent;color:var(--text);font-size:13px;font-weight:800;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
