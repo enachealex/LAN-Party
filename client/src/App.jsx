@@ -865,6 +865,11 @@ export default function App() {
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
   const [feedbackResult, setFeedbackResult] = useState(null) // { ok, key?, message }
   const feedbackFileInputRef = useRef(null)
+  // Invite-friends-to-server modal.
+  const [inviteModal, setInviteModal] = useState(null) // { serverId, serverName } | null
+  const [inviteMembers, setInviteMembers] = useState(new Set()) // usernames already in the server
+  const [inviteBusy, setInviteBusy] = useState(new Set()) // usernames currently being invited
+  const [inviteLoadingMembers, setInviteLoadingMembers] = useState(false)
   // Whether the profile customization controls (picture/border/overlay/name style) are expanded.
   const [showProfileEditor, setShowProfileEditor] = useState(false)
   // Editable username (in Edit Profile) — changing it reissues the auth token.
@@ -2592,12 +2597,44 @@ export default function App() {
   }
 
   // ---- Membership management (invite / leave / kick / roles) ----
-  const inviteToServer = async (serverId) => {
-    const uname = ((await askPrompt({ title: 'Invite to server', label: 'Username', placeholder: 'their exact username', submitLabel: 'Invite' })) || '').trim()
-    if (!uname) return
-    const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/invite`, { method: 'POST', body: JSON.stringify({ username: uname }) })
-    if (res.ok) setToast(`Invited ${uname}`)
-    else alert((await res.json()).error || 'Invite failed')
+  // Open the invite dialog for a server and load its current members (so friends already in show a ✓).
+  const openServerInvite = async (serverId, serverName) => {
+    if (!serverId || serverId === 'home' || serverId === 'demo') return
+    const nm = serverName || serversList.find((s) => s.id === serverId)?.name || 'this server'
+    setInviteModal({ serverId, serverName: nm })
+    setInviteMembers(new Set())
+    setInviteBusy(new Set())
+    setInviteLoadingMembers(true)
+    try {
+      const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/members`)
+      if (res.ok) {
+        const data = await res.json()
+        setInviteMembers(new Set((data.members || []).map((m) => m.username)))
+      }
+    } catch (_) { /* leave empty; server still rejects dupes */ }
+    finally { setInviteLoadingMembers(false) }
+  }
+
+  // Invite one friend (by username) to the currently-open invite dialog's server.
+  const inviteFriendToServer = async (username) => {
+    if (!inviteModal || !username) return
+    setInviteBusy((prev) => new Set(prev).add(username))
+    try {
+      const res = await authedFetch(`/servers/${encodeURIComponent(inviteModal.serverId)}/invite`, { method: 'POST', body: JSON.stringify({ username }) })
+      if (res.ok) {
+        setInviteMembers((prev) => new Set(prev).add(username))
+        setToast(`Invited ${username}`)
+      } else {
+        const err = (await res.json().catch(() => ({}))).error || 'Invite failed'
+        // If they're somehow already in, reflect it; otherwise surface the error.
+        if (/already a member/i.test(err)) setInviteMembers((prev) => new Set(prev).add(username))
+        else setToast(err)
+      }
+    } catch (_) {
+      setToast('Invite failed')
+    } finally {
+      setInviteBusy((prev) => { const n = new Set(prev); n.delete(username); return n })
+    }
   }
   const leaveServer = async (serverId, serverName2) => {
     if (!window.confirm(`Leave "${serverName2}"? You'll need a new invite to rejoin.`)) return
@@ -4780,7 +4817,7 @@ export default function App() {
         myRole={serverState?.myRole || 'member'}
         serverOwner={serverState?.server?.owner || null}
         currentUsername={name}
-        onInviteServer={inviteToServer}
+        onInviteServer={openServerInvite}
         onLeaveServer={leaveServer}
         onKickMember={kickMember}
         onSetMemberRole={setMemberRole}
@@ -5513,7 +5550,7 @@ export default function App() {
           <div>{isHomeView ? `${homeChat?.name || 'Group'} Members` : 'Server Members'} — {membersPanelUsers.length}</div>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             {!isHomeView && (serverState?.myRole === 'owner' || serverState?.myRole === 'admin') && currentServerId() !== 'demo' && (
-              <button className="members-invite-btn" title="Invite people" onClick={() => inviteToServer(currentServerId())}>+ Invite</button>
+              <button className="members-invite-btn" title="Invite people" onClick={() => openServerInvite(currentServerId(), serverState?.server?.name)}>+ Invite</button>
             )}
             <button className="members-close" onClick={() => setShowMembersPanel(false)}>✕</button>
           </div>
@@ -5872,6 +5909,50 @@ export default function App() {
             <div className="prompt-actions">
               <button className="prompt-btn ghost" onClick={() => resolvePrompt(null)}>Cancel</button>
               <button className="prompt-btn primary" onClick={() => resolvePrompt(promptValue)}>{promptModal.submitLabel}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Invite friends to a server — friends already in the server show a ✓ instead of Add. */}
+      {inviteModal && (
+        <div className="invite-overlay" role="dialog" aria-modal="true" aria-labelledby="invite-title" onMouseDown={(e) => { if (e.target === e.currentTarget) setInviteModal(null) }}>
+          <div className="invite-card">
+            <div className="invite-header">
+              <span id="invite-title" className="invite-title">Invite friends to <strong>{inviteModal.serverName}</strong></span>
+              <button className="invite-close" aria-label="Close" onClick={() => setInviteModal(null)}>✕</button>
+            </div>
+
+            {friends.length === 0 ? (
+              <div className="invite-empty">You don’t have any friends yet. Add friends first, then invite them here.</div>
+            ) : (
+              <ul className="invite-list">
+                {friends.map((f) => {
+                  const uname = f.name
+                  const already = inviteMembers.has(uname)
+                  const busy = inviteBusy.has(uname)
+                  return (
+                    <li key={f.id || uname} className="invite-row">
+                      <div className="invite-row-main">
+                        <ProfileAvatar name={uname} profile={f.profile || {}} size={34} resolveSrc={emojiSrc} />
+                        <span className="invite-row-name" style={f.profile ? nameStyleToCss(f.profile.nameStyle, f.profile.nameFont) : undefined}>{uname}</span>
+                      </div>
+                      {already ? (
+                        <span className="invite-added" title="Already in this server">✓ In server</span>
+                      ) : (
+                        <button className="invite-add-btn" disabled={busy} onClick={() => inviteFriendToServer(uname)}>
+                          {busy ? 'Adding…' : 'Add'}
+                        </button>
+                      )}
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+            {inviteLoadingMembers && <div className="invite-loading">Checking who’s already in…</div>}
+
+            <div className="invite-actions">
+              <button className="feedback-btn primary" onClick={() => setInviteModal(null)}>Done</button>
             </div>
           </div>
         </div>

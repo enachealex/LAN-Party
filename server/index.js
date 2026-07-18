@@ -1406,6 +1406,17 @@ async function main() {
   });
 
   // --- Membership management: invite, kick, roles, leave ---
+  // Current members of a server (any member may read) — used by the invite dialog to mark which
+  // friends are already in.
+  app.get('/servers/:serverId/members', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    const srv = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (!(await isMember(serverId, req.user.username))) return res.status(403).json({ error: 'Not a member' });
+    const members = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
+    return res.json({ members });
+  });
+
   // Invite a user by username (owner/admin) → they become a member; their rail refreshes.
   app.post('/servers/:serverId/invite', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;

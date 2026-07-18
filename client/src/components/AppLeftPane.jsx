@@ -468,7 +468,7 @@ export default function AppLeftPane({
             if (staff && !isDemo) {
               items.push(
                 <button key="rename" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameServer?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename server</button>,
-                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id) }}>➕ Invite people</button>
+                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id, ctxMenu.name) }}>➕ Invite people</button>
               )
             }
             if (role !== 'owner' && !isDemo) {
