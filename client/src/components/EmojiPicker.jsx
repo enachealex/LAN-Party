@@ -1,5 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Grid } from '@giphy/react-components'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { EMOJI_GROUPS, SKIN_TONES, applySkinTone } from '../emojiData'
 
 // Icon shown in the shortcut strip for each standard group (first representative emoji).
@@ -19,39 +18,24 @@ const GROUP_ICON = {
 export default function EmojiPicker({
   personalEmojis = [],
   serverEmojiGroups = [],
-  gifs = [],
   skinTones = {},
   onSelectEmoji,
   onSelectCustom,
-  onSelectGif,
-  onFetchGiphy,
-  onGiphyStatus,
   onSetSkinTone,
   onUploadPersonal,
   onUploadServer,
-  onUploadGif,
   onDeletePersonal,
   onDeleteServer,
-  onDeleteGif,
   resolveSrc = (u) => u,
   onClose,
 }) {
   const rootRef = useRef(null)
   const scrollRef = useRef(null)
   const uploadRef = useRef(null)
-  const gifUploadRef = useRef(null)
   const sectionRefs = useRef({})
   // Upload target: { scope: 'personal' } or { scope: 'server', serverId }.
   const uploadTargetRef = useRef({ scope: 'personal' })
-  const [tab, setTab] = useState('emoji') // 'emoji' | 'personal' | 'server' | 'gif'
-  const [gifQuery, setGifQuery] = useState('')
-  // GIF tab has two sections: 'giphy' (search the Giphy library) and 'custom' (uploaded library).
-  const [gifSection, setGifSection] = useState('giphy')
-  const [giphyQuery, setGiphyQuery] = useState('')
-  const [debouncedGiphyQuery, setDebouncedGiphyQuery] = useState('')
-  const [giphyConfigured, setGiphyConfigured] = useState(null) // null = unknown, true/false once checked
-  const [gridWidth, setGridWidth] = useState(320)
-  const giphyGridWrapRef = useRef(null)
+  const [tab, setTab] = useState('emoji') // 'emoji' | 'personal' | 'server'
   // Right-click skin-tone menu: { base, x, y } anchored to the clicked emoji.
   const [toneMenu, setToneMenu] = useState(null)
   // Right-click context menu on a custom emoji: { name, scope, serverId, x, y }.
@@ -129,57 +113,11 @@ export default function EmojiPicker({
     const rect = rootRef.current.getBoundingClientRect()
     setCustomMenu({ name, scope, serverId, x: e.clientX - rect.left, y: e.clientY - rect.top })
   }
-  const openGifMenu = (e, id) => {
-    e.preventDefault()
-    const rect = rootRef.current.getBoundingClientRect()
-    setCustomMenu({ scope: 'gif', id, x: e.clientX - rect.left, y: e.clientY - rect.top })
-  }
   const deleteFromMenu = () => {
     if (!customMenu) return
-    if (customMenu.scope === 'gif') onDeleteGif?.(customMenu.id)
-    else if (customMenu.scope === 'server') onDeleteServer?.(customMenu.serverId, customMenu.name)
+    if (customMenu.scope === 'server') onDeleteServer?.(customMenu.serverId, customMenu.name)
     else onDeletePersonal?.(customMenu.name)
     setCustomMenu(null)
-  }
-
-  // GIF tab helpers.
-  const filteredGifs = useMemo(() => {
-    const q = gifQuery.trim().toLowerCase()
-    if (!q) return gifs
-    return gifs.filter((g) => (g.name || '').toLowerCase().includes(q))
-  }, [gifs, gifQuery])
-
-  // Debounce the Giphy search box (drives the <Grid> remount + fetch).
-  useEffect(() => {
-    const handle = setTimeout(() => setDebouncedGiphyQuery(giphyQuery.trim()), 400)
-    return () => clearTimeout(handle)
-  }, [giphyQuery])
-
-  // Check whether Giphy is configured (has a server-side key) when the section is first opened.
-  useEffect(() => {
-    if (tab !== 'gif' || gifSection !== 'giphy' || giphyConfigured !== null || !onGiphyStatus) return
-    let cancelled = false
-    onGiphyStatus().then((ok) => { if (!cancelled) setGiphyConfigured(!!ok) })
-    return () => { cancelled = true }
-  }, [tab, gifSection, giphyConfigured, onGiphyStatus])
-
-  // Size the Giphy Grid to its container width.
-  useEffect(() => {
-    if (tab !== 'gif' || gifSection !== 'giphy' || giphyConfigured !== true) return
-    const el = giphyGridWrapRef.current
-    if (el && el.clientWidth) setGridWidth(el.clientWidth)
-  }, [tab, gifSection, giphyConfigured])
-
-  // Fetch through our server proxy (keeps the API key server-side). Memoized per query so
-  // the Grid only refetches on a new search, not on unrelated re-renders.
-  const fetchGiphyGifs = useCallback(
-    (offset) => onFetchGiphy?.(debouncedGiphyQuery, offset),
-    [onFetchGiphy, debouncedGiphyQuery]
-  )
-  const handleGifUpload = (event) => {
-    const file = event.target.files?.[0]
-    if (file) onUploadGif?.(file, (file.name || 'gif').replace(/\.[^.]+$/, ''))
-    if (event.target) event.target.value = ''
   }
 
   const scrollToSection = (id) => {
@@ -221,7 +159,6 @@ export default function EmojiPicker({
         <button type="button" role="tab" aria-selected={tab === 'emoji'} className={`emoji-tab${tab === 'emoji' ? ' active' : ''}`} onClick={() => setTab('emoji')}>Emoji</button>
         <button type="button" role="tab" aria-selected={tab === 'personal'} className={`emoji-tab${tab === 'personal' ? ' active' : ''}`} onClick={() => setTab('personal')}>Personal</button>
         <button type="button" role="tab" aria-selected={tab === 'server'} className={`emoji-tab${tab === 'server' ? ' active' : ''}`} onClick={() => setTab('server')}>Server</button>
-        <button type="button" role="tab" aria-selected={tab === 'gif'} className={`emoji-tab${tab === 'gif' ? ' active' : ''}`} onClick={() => setTab('gif')}>GIF</button>
       </div>
 
       {shortcuts.length > 0 && (
@@ -279,80 +216,6 @@ export default function EmojiPicker({
               ))
         )}
 
-        {tab === 'gif' && (
-          <div className="emoji-group">
-            <div className="gif-sections">
-              <button type="button" className={`gif-section-tab${gifSection === 'giphy' ? ' active' : ''}`} onClick={() => setGifSection('giphy')}>Giphy</button>
-              <button type="button" className={`gif-section-tab${gifSection === 'custom' ? ' active' : ''}`} onClick={() => setGifSection('custom')}>Custom</button>
-            </div>
-
-            {gifSection === 'giphy' && (
-              <>
-                <input
-                  className="gif-search"
-                  placeholder="Search Giphy"
-                  value={giphyQuery}
-                  onChange={(e) => setGiphyQuery(e.target.value)}
-                />
-                {giphyConfigured === false ? (
-                  <div className="emoji-empty">Giphy isn't configured yet. Add a Giphy API key on the server to enable it.</div>
-                ) : giphyConfigured === null ? (
-                  <div className="emoji-empty">Loading…</div>
-                ) : (
-                  <div className="giphy-grid-wrap" ref={giphyGridWrapRef}>
-                    <Grid
-                      key={debouncedGiphyQuery}
-                      width={gridWidth}
-                      columns={3}
-                      gutter={6}
-                      fetchGifs={fetchGiphyGifs}
-                      noLink
-                      hideAttribution={false}
-                      onGifClick={(gif, e) => {
-                        e.preventDefault()
-                        const url = gif.images?.original?.url || gif.images?.downsized_medium?.url || ''
-                        onSelectGif?.({ url, name: gif.title || 'gif', type: 'image/gif' })
-                      }}
-                    />
-                    <div className="giphy-attribution">Powered by GIPHY</div>
-                  </div>
-                )}
-              </>
-            )}
-
-            {gifSection === 'custom' && (
-              <>
-                <div className="gif-custom-head">
-                  <input
-                    className="gif-search"
-                    placeholder="Search your GIFs"
-                    value={gifQuery}
-                    onChange={(e) => setGifQuery(e.target.value)}
-                  />
-                  <button type="button" className="emoji-upload-btn" title="Add a GIF to the library" aria-label="Add a GIF" onClick={() => gifUploadRef.current?.click()}>+</button>
-                </div>
-                {filteredGifs.length === 0 ? (
-                  <div className="emoji-empty">{gifs.length === 0 ? 'No GIFs yet. Click + to add one to the shared library.' : 'No GIFs match your search.'}</div>
-                ) : (
-                  <div className="gif-grid">
-                    {filteredGifs.map((g) => (
-                      <button
-                        key={g.id}
-                        type="button"
-                        className="gif-cell"
-                        title={`${g.name || 'GIF'} — right-click to remove`}
-                        onClick={() => onSelectGif?.(g)}
-                        onContextMenu={(e) => openGifMenu(e, g.id)}
-                      >
-                        <img src={resolveSrc(g.url)} alt={g.name || 'GIF'} loading="lazy" />
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
       </div>
 
       {toneMenu && (
@@ -367,7 +230,7 @@ export default function EmojiPicker({
 
       {customMenu && (
         <div className="emoji-context-menu" style={{ left: customMenu.x, top: customMenu.y }} role="menu">
-          <button type="button" className="danger" onClick={deleteFromMenu}>{customMenu.scope === 'gif' ? 'Remove GIF' : 'Delete emoji'}</button>
+          <button type="button" className="danger" onClick={deleteFromMenu}>Delete emoji</button>
         </div>
       )}
 
@@ -401,7 +264,6 @@ export default function EmojiPicker({
       )}
 
       <input ref={uploadRef} type="file" accept="image/*" className="file-input" onChange={handleUpload} />
-      <input ref={gifUploadRef} type="file" accept="image/gif,image/*" className="file-input" onChange={handleGifUpload} />
     </div>
   )
 }

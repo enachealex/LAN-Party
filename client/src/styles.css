@@ -485,7 +485,9 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .emoji-context-menu button:hover{background:rgba(255,255,255,.1)}
 .emoji-context-menu button.danger:hover{background:rgba(242,63,67,.2);color:#ffb4b4}
 
-/* GIF tab (inside the emoji board) */
+/* GIF picker (standalone board opened from the GIF composer button) */
+.gif-toggle-label{font-size:10px;font-weight:800;letter-spacing:.04em;line-height:1;border:1.5px solid currentColor;border-radius:5px;padding:2px 3px}
+.gif-picker .emoji-picker-scroll{padding-top:8px}
 .gif-search{display:block;width:100%;box-sizing:border-box;border:1px solid rgba(255,255,255,.12);background:#07111a;color:var(--text);border-radius:8px;padding:8px 10px;font-size:13px;outline:none;margin:6px 0 8px}
 .gif-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding-top:4px}
 .gif-cell{position:relative;width:100%;aspect-ratio:1;border:1px solid rgba(255,255,255,.08);background:#000;border-radius:8px;overflow:hidden;cursor:pointer;padding:0}
@@ -1110,6 +1112,21 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .extviewer-overlay.mini .extviewer-embed{flex:1;height:auto}
 .extviewer-overlay.mini .extviewer-head.drag{cursor:move;user-select:none}
 .extviewer-overlay.mini .extviewer-title{font-size:12px}
+
+/* Transparent call-video overlay window (Electron, loaded via /app/?overlay=1) */
+.overlay-mode,.overlay-mode #root{background:transparent !important;height:100%;overflow:hidden}
+.calloverlay{position:absolute;inset:0}
+.calloverlay-vid{width:100%;height:100%;object-fit:cover;opacity:.28;display:block;border-radius:10px;background:transparent}
+.calloverlay.solid .calloverlay-vid{opacity:1}
+.calloverlay-ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.6);font-size:12px}
+.calloverlay-bar{position:absolute;top:0;left:0;right:0;height:26px;display:flex;align-items:center;justify-content:space-between;padding:0 6px;-webkit-app-region:drag;background:linear-gradient(rgba(10,6,4,.75),rgba(10,6,4,0));opacity:0;transition:opacity .15s;border-radius:10px 10px 0 0}
+.calloverlay:hover .calloverlay-bar{opacity:1}
+.calloverlay-title{color:#fff;font-size:11px;font-weight:800}
+.calloverlay-btns{display:flex;gap:4px;-webkit-app-region:no-drag}
+.calloverlay-btn{border:none;background:rgba(0,0,0,.5);color:#fff;width:20px;height:20px;border-radius:5px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;line-height:1}
+.calloverlay-btn:hover{background:rgba(0,0,0,.8)}
+.calloverlay-btn.close:hover{background:#e0574d}
+.calloverlay-resize{position:absolute;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;z-index:5;background:linear-gradient(135deg,transparent 45%,rgba(255,255,255,.6) 45%,rgba(255,255,255,.6) 55%,transparent 55%,transparent 72%,rgba(255,255,255,.6) 72%,rgba(255,255,255,.6) 82%,transparent 82%)}
 .extviewer-resize{position:absolute;right:2px;bottom:2px;width:16px;height:16px;cursor:nwse-resize;z-index:3;background:linear-gradient(135deg,transparent 45%,rgba(255,255,255,.55) 45%,rgba(255,255,255,.55) 55%,transparent 55%,transparent 70%,rgba(255,255,255,.55) 70%,rgba(255,255,255,.55) 80%,transparent 80%);border-radius:0 0 10px 0}
 /* Sketch & Guess */
 .sketch-lobby{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:22px;text-align:center}

@@ -13,6 +13,7 @@ import AppLeftPane from './components/AppLeftPane'
 import AddFriendModal from './components/AddFriendModal'
 import NewChatModal from './components/NewChatModal'
 import EmojiPicker from './components/EmojiPicker'
+import GifPicker from './components/GifPicker'
 import Soundboard from './components/Soundboard'
 import CollabCanvas from './components/CollabCanvas'
 import ActivityPanel, { ACTIVITY_TYPES } from './components/Activities'
@@ -980,6 +981,7 @@ export default function App() {
   const [groupUnread, setGroupUnread] = useState({})
   // Emoji picker: open state, the user's custom emojis, and per-emoji skin-tone choices.
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
+  const [showGifPicker, setShowGifPicker] = useState(false)
   const [customEmojis, setCustomEmojis] = useState([]) // personal: [{ name, url }]
   const [emojiSkinTones, setEmojiSkinTones] = useState({}) // { '👍': 'dark', ... }
   const [serverEmojis, setServerEmojis] = useState({}) // { [serverId]: [{ name, url }] }
@@ -2640,6 +2642,7 @@ export default function App() {
     const body = text.trim()
     setText('')
     setShowEmojiPicker(false)
+    setShowGifPicker(false)
     setUploadError(null)
     setUploadingFile(true)
     try {
@@ -3907,6 +3910,7 @@ export default function App() {
     const body = text.trim()
     setText('')
     setShowEmojiPicker(false)
+    setShowGifPicker(false)
     setUploadError(null)
     setUploadingFile(true)
     let attachment = null
@@ -4187,6 +4191,7 @@ export default function App() {
   const sendGif = async (gif) => {
     if (!gif?.url) return
     setShowEmojiPicker(false)
+    setShowGifPicker(false)
     const isLocal = gif.url.startsWith('/gifs/') || gif.url.startsWith('/uploads/')
     const attachment = isLocal ? { url: gif.url, name: gif.name || 'gif', type: gif.type || 'image/gif', size: 0 } : null
     const body = isLocal ? '' : gif.url
@@ -4449,29 +4454,38 @@ export default function App() {
           <EmojiPicker
             personalEmojis={customEmojis}
             serverEmojiGroups={serverEmojiGroups}
-            gifs={gifLibrary}
             skinTones={emojiSkinTones}
             resolveSrc={emojiSrc}
             onSelectEmoji={handleSelectEmoji}
             onSelectCustom={handleSelectCustomEmoji}
-            onSelectGif={sendGif}
-            onFetchGiphy={fetchGiphy}
-            onGiphyStatus={giphyStatus}
             onSetSkinTone={handleSetEmojiSkinTone}
             onUploadPersonal={handleUploadCustomEmoji}
             onUploadServer={handleUploadServerEmoji}
-            onUploadGif={uploadGif}
             onDeletePersonal={deletePersonalEmoji}
             onDeleteServer={deleteServerEmoji}
-            onDeleteGif={deleteGif}
             onClose={() => setShowEmojiPicker(false)}
+          />
+        )}
+        {showGifPicker && (
+          <GifPicker
+            gifs={gifLibrary}
+            resolveSrc={emojiSrc}
+            onSelectGif={sendGif}
+            onFetchGiphy={fetchGiphy}
+            onGiphyStatus={giphyStatus}
+            onUploadGif={uploadGif}
+            onDeleteGif={deleteGif}
+            onClose={() => setShowGifPicker(false)}
           />
         )}
         <div className="composer-inner">
           <button type="button" className="attach" onClick={() => fileInputRef.current?.click()} title="Attach file" aria-label="Attach file">
             <PaperclipIcon />
           </button>
-          <button type="button" className="attach emoji-toggle" onClick={() => { setShowEmojiPicker((open) => { if (!open) { loadServerEmojis(currentServerId()); loadGifs(); } return !open }) }} title="Emoji & GIF" aria-label="Emoji & GIF" aria-expanded={showEmojiPicker}>
+          <button type="button" className="attach gif-toggle" onClick={() => { setShowEmojiPicker(false); setShowGifPicker((open) => { if (!open) loadGifs(); return !open }) }} title="GIF" aria-label="GIF" aria-expanded={showGifPicker}>
+            <span className="gif-toggle-label">GIF</span>
+          </button>
+          <button type="button" className="attach emoji-toggle" onClick={() => { setShowGifPicker(false); setShowEmojiPicker((open) => { if (!open) loadServerEmojis(currentServerId()); return !open }) }} title="Emoji" aria-label="Emoji" aria-expanded={showEmojiPicker}>
             <span style={{fontSize:22,lineHeight:1}}>😊</span>
           </button>
           <input
