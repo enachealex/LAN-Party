@@ -12,6 +12,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('./email');
 const vaultline = require('./vaultline');
+const { feedbackInput, inviteInput, validate } = require('./validation');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const PORT = process.env.PORT || 3000;
@@ -1465,8 +1466,9 @@ async function main() {
     const srv = await db.get('SELECT id, name FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
     if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can invite' });
-    const target = String((req.body || {}).username || '').trim();
-    if (!target) return res.status(400).json({ error: 'Username required' });
+    const invite = validate(inviteInput, req.body);
+    if (!invite.ok) return res.status(400).json({ error: invite.error });
+    const target = invite.data.username;
     const user = await db.get('SELECT username FROM users WHERE username = ?', target);
     if (!user) return res.status(404).json({ error: `No user named "${target}"` });
     if (await isMember(serverId, target)) return res.status(400).json({ error: `${target} is already a member` });
@@ -2462,13 +2464,10 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
       }
       try {
         const username = req.user.username;
-        const type = String(req.body.type || 'feedback').toLowerCase();
-        if (!FEEDBACK_LABELS[type]) return res.status(400).json({ error: 'Invalid feedback type' });
-
-        const rawMessage = String(req.body.message || '').trim();
-        if (!rawMessage) return res.status(400).json({ error: 'Message is required' });
-        if (rawMessage.length > 8000) return res.status(400).json({ error: 'Message is too long (max 8000 characters)' });
-        let userTitle = String(req.body.title || '').trim().slice(0, 160);
+        const input = validate(feedbackInput, req.body);
+        if (!input.ok) return res.status(400).json({ error: input.error });
+        const { type, message: rawMessage } = input.data;
+        const userTitle = input.data.title || '';
 
         const userRow = await db.get('SELECT email FROM users WHERE username = ?', username);
         const email = userRow && userRow.email;
@@ -2625,10 +2624,12 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
 
     socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment, quotes } = {}) => {
       // Refuse writes to channels the user can't see (belongs to server + private-access check).
+      // Rejections are answered with message:error (echoing the text) instead of a silent drop,
+      // so a client with a stale server/channel pairing can recover the message and resync.
       const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
-      if (!ch) return;
+      if (!ch) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'unknown-channel' }); return; }
       const myRole = await roleOf(serverId, socketUser);
-      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) return;
+      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'no-access' }); return; }
       const author = clients[socket.id]?.name || 'Anon';
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);

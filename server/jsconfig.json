@@ -1,0 +1,18 @@
+{
+  "//": "Type-checks plain JS with no build step and no runtime change. checkJs is false so files opt in individually with a `// @ts-check` comment — new/refactored files get checked, legacy ones stay quiet until converted. Run: npm run check",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "lib": ["ES2022"],
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["**/*.js"],
+  "exclude": ["node_modules", "landing-assets"]
+}
