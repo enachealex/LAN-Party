@@ -189,6 +189,7 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .dc-context-menu button{display:block;width:100%;padding:8px 12px;border:none;border-radius:4px;background:transparent;color:#dbdee1;font-size:14px;text-align:left;cursor:pointer}
 .dc-context-menu button:hover{background:#404249;color:#fff}
 .dc-context-menu-label{padding:4px 12px 6px;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#949ba4}
+.dc-context-menu-sep{height:1px;margin:4px 6px;background:#1e1f22}
 .dc-context-menu .dc-context-menu-accent{color:#2bc3ff}
 .dc-context-menu .dc-context-menu-accent:hover{background:#2bc3ff;color:#021022}
 .dc-add-friend-btn img{width:24px;height:24px;border-radius:50%;object-fit:cover;display:block}

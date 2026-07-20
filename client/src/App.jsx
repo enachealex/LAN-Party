@@ -1404,6 +1404,21 @@ export default function App() {
             }
           }
         } catch (err) { console.warn('Auto-sync failed', err) }
+        // Hydrate the selected server from the saved view BEFORE connecting. The socket's
+        // 'connect' handler reads selectedServerIdRef to pick which server to join; on a fresh
+        // reload the ref is still 'home' (restoreSavedView runs later, after two fetches), so
+        // without this the socket joined 'demo' while the UI restored another server — its
+        // channel id then failed the server-side gate and sends vanished silently.
+        const savedView = readSavedViewState()
+        if (
+          savedView && (!savedView.username || savedView.username === data.user.username) &&
+          savedView.selectedServerId && savedView.selectedServerId !== 'home' &&
+          !/^s[1-5]$/.test(savedView.selectedServerId) // legacy mock ids — restoreSavedView migrates these
+        ) {
+          selectedServerIdRef.current = savedView.selectedServerId
+          setSelectedServerId(savedView.selectedServerId)
+          if (savedView.activeChannel) setActiveChannel(savedView.activeChannel)
+        }
         connect(data.user.username, t)
         const [loadedFriends, loadedConversations] = await Promise.all([
           loadFriendsData(t),
@@ -1532,7 +1547,15 @@ export default function App() {
     if (saved.selectedServerId) {
       // Migrate old mock rail ids (s1..s5) from previous versions: s1 was LAN Party ('demo').
       const sid = saved.selectedServerId
-      setSelectedServerId(/^s[2-5]$/.test(sid) ? 'home' : (sid === 's1' ? 'demo' : sid))
+      const migrated = /^s[2-5]$/.test(sid) ? 'home' : (sid === 's1' ? 'demo' : sid)
+      setSelectedServerId(migrated)
+      // Re-room the socket into the restored channel. The connect-time join lands us in the
+      // server's FIRST text channel; if the user was viewing a different one, joinChannel
+      // switches the room and refetches that channel's history + pins, keeping the send
+      // target and the socket's rooms in agreement. (Buffered by socket.io if not yet connected.)
+      if (migrated !== 'home' && saved.activeChannel) {
+        socketRef.current?.emit('joinChannel', { serverId: migrated, channelId: saved.activeChannel })
+      }
     }
 
     const savedChat = saved.homeChat
@@ -2176,14 +2199,34 @@ export default function App() {
     })
     // messages:init is `{ serverId, channelId, messages }` (older array shape still accepted).
     s.on('messages:init', (payload) => {
+      // Ignore history for a server we're no longer viewing (e.g. a stale join racing a
+      // restored view) so it can't clobber the current channel's list.
+      if (payload && !Array.isArray(payload) && payload.serverId) {
+        const viewServer = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
+        if (payload.serverId !== viewServer) return
+      }
       const msgs = Array.isArray(payload) ? payload : (payload && payload.messages) || []
       setMessages(oldestMessagesFirst(msgs))
     })
     s.on('channel:joined', ({ serverId, channelId } = {}) => {
       if (!channelId) return
+      // Same staleness guard as messages:init: a late join answer for another server must not
+      // overwrite the restored channel (that mismatch made sends fail the server's gate).
+      if (serverId) {
+        const viewServer = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
+        if (serverId !== viewServer) return
+      }
       setActiveChannel(channelId)
       setChannelPins([]) // cleared until the fresh pins:updated for this channel arrives
       clearChannelUnread(serverId || selectedServerIdRef.current, channelId)
+    })
+    // A channel send was rejected (stale server/channel pairing — e.g. mid-resync). Surface it,
+    // put the text back so nothing is lost, and re-join the current view to resync rooms.
+    s.on('message:error', ({ text: failedText } = {}) => {
+      setToast("Couldn't send — resynced with the server. Please try again.")
+      if (failedText) setText((cur) => cur || failedText)
+      const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
+      s.emit('join', { serverId: sid, name: userName || name })
     })
     // Pinned-message list for a channel changed (or arrived on join).
     s.on('pins:updated', ({ serverId, channelId, pins } = {}) => {
@@ -4843,8 +4886,8 @@ export default function App() {
         onSelectGroup={handleSelectGroup}
         selectedGroupId={selectedGroupId}
         onCreateMessage={openNewChatModal}
-        onFriendVoiceChat={() => openPreJoin('voice1')}
-        onFriendViewProfile={() => openSettings()}
+        onFriendVoiceChat={(friend) => startCall(friend?.peerUsername || friend?.name, false)}
+        onViewProfile={(person) => openMemberProfile(person?.peerUsername || person?.name)}
         friends={friends}
         pendingFriendRequests={pendingFriendRequests}
         pendingFriendCount={pendingFriendCount}
@@ -4914,7 +4957,7 @@ export default function App() {
                         }
                       }}>Download App</button>
                     )}
-                    {homeChat?.peerUsername && !call && (
+                    {showHomeChat && homeChat?.peerUsername && !call && (
                       <button className="call-btn" title={`Call ${homeChat.peerUsername}`} onClick={() => startCall(homeChat.peerUsername, false)}>
                         <span aria-hidden>📞</span> Call
                       </button>

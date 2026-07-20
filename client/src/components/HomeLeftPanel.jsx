@@ -75,7 +75,7 @@ export default function HomeLeftPanel({
   selectedGroupId,
   onCreateMessage,
   onFriendVoiceChat,
-  onFriendViewProfile,
+  onViewProfile,
   friends = [],
   pendingFriendRequests = [],
   pendingFriendCount = 0,
@@ -98,7 +98,6 @@ export default function HomeLeftPanel({
   const [search, setSearch] = useState('')
   const [searchFocused, setSearchFocused] = useState(false)
   const searchWrapRef = useRef(null)
-  const [contextMenu, setContextMenu] = useState(null)
   // Right-click "Move to section" menu for DMs/groups: { kind:'dm'|'group', id, name, x, y }.
   const [dmMenu, setDmMenu] = useState(null)
   // User-created message sections and which conversation goes in which section.
@@ -142,13 +141,6 @@ export default function HomeLeftPanel({
   }
 
   useEffect(() => {
-    if (!contextMenu) return undefined
-    const close = () => setContextMenu(null)
-    document.addEventListener('mousedown', close)
-    return () => document.removeEventListener('mousedown', close)
-  }, [contextMenu])
-
-  useEffect(() => {
     if (!dmMenu) return undefined
     const close = () => setDmMenu(null)
     document.addEventListener('mousedown', close)
@@ -162,7 +154,9 @@ export default function HomeLeftPanel({
   const openDmMenu = (e, kind, item) => {
     e.preventDefault()
     e.stopPropagation()
-    setDmMenu({ kind, id: item.id, name: item.name, x: e.clientX, y: e.clientY })
+    // `item` is kept so friend rows can offer Send Message / Voice Chat alongside the
+    // section actions (both need the whole friend, not just its id).
+    setDmMenu({ kind, id: item.id, name: item.name, item, x: e.clientX, y: e.clientY })
   }
 
   const UNSORTED = '__unsorted'
@@ -792,6 +786,35 @@ export default function HomeLeftPanel({
           role="menu"
           onMouseDown={(e) => e.stopPropagation()}
         >
+          {dmMenu.kind === 'friend' && (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { onSelectFriend?.(dmMenu.item); setDmMenu(null) }}
+              >
+                Send Message
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { onFriendVoiceChat?.(dmMenu.item); setDmMenu(null) }}
+              >
+                Voice Chat
+              </button>
+            </>
+          )}
+          {/* Profiles are per-person, so groups (no single peer) don't get this item. */}
+          {(dmMenu.kind === 'friend' || dmMenu.kind === 'dm') && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => { onViewProfile?.(dmMenu.item); setDmMenu(null) }}
+            >
+              View Profile
+            </button>
+          )}
+          {dmMenu.kind !== 'group' && <div className="dc-context-menu-sep" />}
           <div className="dc-context-menu-label">Move to section</div>
           {dmSections.map((section) => (
             <button
@@ -814,35 +837,6 @@ export default function HomeLeftPanel({
         </div>
       )}
 
-      {contextMenu && (
-        <div
-          className="dc-context-menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          role="menu"
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              onFriendViewProfile?.(contextMenu.friend)
-              setContextMenu(null)
-            }}
-          >
-            View Profile
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              onFriendVoiceChat?.(contextMenu.friend)
-              setContextMenu(null)
-            }}
-          >
-            Voice Chat
-          </button>
-        </div>
-      )}
     </>
   )
 }

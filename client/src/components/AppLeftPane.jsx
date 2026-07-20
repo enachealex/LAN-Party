@@ -151,7 +151,7 @@ export default function AppLeftPane({
   selectedGroupId,
   onCreateMessage,
   onFriendVoiceChat,
-  onFriendViewProfile,
+  onViewProfile,
   friends = [],
   pendingFriendRequests = [],
   pendingFriendCount = 0,
@@ -379,7 +379,7 @@ export default function AppLeftPane({
               selectedGroupId={selectedGroupId}
               onCreateMessage={onCreateMessage}
               onFriendVoiceChat={onFriendVoiceChat}
-              onFriendViewProfile={onFriendViewProfile}
+              onViewProfile={onViewProfile}
               friends={friends}
               pendingFriendRequests={pendingFriendRequests}
               pendingFriendCount={pendingFriendCount}
