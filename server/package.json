@@ -5,7 +5,9 @@
   "license": "MIT",
   "scripts": {
     "start": "node index.js",
-    "check": "tsc -p jsconfig.json"
+    "check": "tsc -p jsconfig.json",
+    "test": "node --test \"test/*.test.js\"",
+    "verify": "npm run check && npm test"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
