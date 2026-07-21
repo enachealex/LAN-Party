@@ -1,0 +1,19 @@
+{
+  "//": "Type-checks only (noEmit) — Vite's esbuild does the actual transpile, so this never touches the build or deploy. allowJs lets .tsx files import the existing .jsx modules; checkJs stays off so legacy files aren't flooded with errors. Convert files to .ts/.tsx as they're touched — new components should be .tsx. Run: npm run check",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "types": ["vite/client"]
+  },
+  "include": ["src"]
+}

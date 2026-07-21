@@ -1,10 +1,20 @@
-import React from 'react'
-import { BORDER_PRESETS } from '../profileData'
+import type { CSSProperties } from 'react'
+import { BORDER_PRESETS, type Profile } from '../profileData'
+
+interface ProfileAvatarProps {
+  name?: string
+  profile?: Profile
+  /** Pixel diameter of the avatar. */
+  size?: number
+  /** Background behind the fallback initial. */
+  color?: string
+  /** Makes relative /uploads urls absolute. */
+  resolveSrc?: (url: string) => string
+}
 
 // Renders a user avatar with optional uploaded image, border decoration, and an
-// animated overlay. Falls back to the name initial. `resolveSrc` makes relative
-// /uploads urls absolute. `size` is the pixel diameter.
-export default function ProfileAvatar({ name = '?', profile = {}, size = 56, color = 'var(--left-tile-bg)', resolveSrc = (u) => u }) {
+// animated overlay. Falls back to the name initial.
+export default function ProfileAvatar({ name = '?', profile = {}, size = 56, color = 'var(--left-tile-bg)', resolveSrc = (u) => u }: ProfileAvatarProps) {
   const initial = (name || '?').slice(0, 1).toUpperCase()
   const overlay = profile.overlay && profile.overlay !== 'none' ? profile.overlay : null
 
@@ -18,8 +28,8 @@ export default function ProfileAvatar({ name = '?', profile = {}, size = 56, col
 
   const src = profile.avatarUrl ? resolveSrc(profile.avatarUrl) : ''
 
-  const wrapStyle = { width: size, height: size }
-  const innerStyle = {
+  const wrapStyle: CSSProperties = { width: size, height: size }
+  const innerStyle: CSSProperties = {
     borderColor,
     borderWidth,
     borderStyle: borderWidth ? borderStyle : 'none',
