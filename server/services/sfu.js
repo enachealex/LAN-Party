@@ -136,11 +136,15 @@ function createSfu({ io }) {
   function bindSocket(socket, roomOf) {
     const fail = (cb, msg) => { if (typeof cb === 'function') cb({ error: msg }) };
 
-    // Capability probe + router caps. Answering null (not an error) = "use the mesh".
-    socket.on('sfu:caps', async (_payload, cb) => {
+    // Capability probe + router caps. Answering null (not an error) = "use the mesh". The client
+    // probes with an explicit room BEFORE emitting voice:join, so its mode is settled before any
+    // mesh signaling (voice:peers) can arrive; every later handler still requires real membership.
+    socket.on('sfu:caps', async (payload, cb) => {
       if (typeof cb !== 'function') return;
       if (!enabled()) return cb(null);
-      const roomName = roomOf(socket);
+      const explicit = payload && payload.serverId && payload.channelId
+        ? `voice:${payload.serverId}:${payload.channelId}` : null;
+      const roomName = explicit || roomOf(socket);
       if (!roomName) return cb(null);
       try {
         const room = await getRoom(roomName);

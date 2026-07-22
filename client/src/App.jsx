@@ -25,6 +25,7 @@ import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
 import { normalizeProfile, nameStyleToCss, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
+import { SfuSession } from './sfu'
 
 // API/socket origin. In dev, talk to the local server; in a production build, default to the
 // same origin (the server serves the client), so it "just works" behind one domain. Override with
@@ -836,6 +837,9 @@ export default function App() {
   const [text, setText] = useState('')
   const [localStream, setLocalStream] = useState(null)
   const peersRef = useRef({})
+  // Active SFU session for the joined voice room (null = P2P mesh mode). When set, the mesh
+  // handlers (voice:peers / voice:signal) stand down and all media flows through the server.
+  const sfuRef = useRef(null)
   const [remoteStreams, setRemoteStreams] = useState({})
   const [inVoice, setInVoice] = useState(false)
   const [videoOn, setVideoOn] = useState(false) // is the local camera on
@@ -2319,14 +2323,15 @@ export default function App() {
     // triggers onnegotiationneeded, which sends the offer. Existing peers answer via voice:signal.
     s.on('voice:peers', (peers) => {
       setPeerNames((prev) => ({ ...prev, ...Object.fromEntries(peers.map((p) => [p.id, p.name])) }))
-      for (const p of peers) createPeer(p.id)
+      // In SFU mode media comes via consumers, not P2P connections — no mesh peers.
+      if (!sfuRef.current) { for (const p of peers) createPeer(p.id) }
       setInVoice(true)
     })
     s.on('voice:peer-joined', ({ id, name: peerName }) => {
       // The newcomer offers to us; we create our peer when their offer arrives (handleSignal).
       if (id) setPeerNames((prev) => ({ ...prev, [id]: peerName }))
     })
-    s.on('voice:signal', ({ from, signal }) => { handleSignal(from, signal) })
+    s.on('voice:signal', ({ from, signal }) => { if (!sfuRef.current) handleSignal(from, signal) })
     // Direct 1:1 friend calls
     s.on('call:incoming', ({ from, fromSocket, video }) => onCallIncoming(from, fromSocket, video))
     s.on('call:accepted', ({ from, fromSocket }) => onCallAccepted(from, fromSocket))
@@ -3041,7 +3046,33 @@ export default function App() {
     setVoiceRailTarget(selectedServerId === 'home' ? 'home' : selectedServerId)
     setVoiceChannelId(channelId)
     setInVoice(true)
+    // SFU-first: probe the server BEFORE joining so the mode is settled when voice:peers arrives.
+    // A null answer (SFU off / old server) means the mesh path below runs exactly as before.
+    let sfuSession = null
+    try {
+      sfuSession = await SfuSession.create(socket, { serverId: callServerId, channelId }, {
+        onPeerStream: (peerId, stream) => setRemoteStreams((prev) => ({ ...prev, [peerId]: stream })),
+        onPeerGone: (peerId) => setRemoteStreams((prev) => { const c = { ...prev }; delete c[peerId]; return c }),
+      })
+    } catch (err) { console.warn('SFU probe failed — using mesh', err) }
+    sfuRef.current = sfuSession
     socket.emit('voice:join', { serverId: callServerId, channelId })
+    if (sfuSession) {
+      try {
+        await sfuSession.connect()
+        const audioTrack = localStreamRef.current?.getAudioTracks()[0]
+        if (audioTrack) await sfuSession.produceAudio(audioTrack)
+        const videoTrack = localStreamRef.current?.getVideoTracks()[0]
+        if (videoTrack) await sfuSession.setVideoTrack(videoTrack)
+      } catch (err) {
+        // SFU handshake failed after we already skipped mesh setup: drop the session and re-join so
+        // the server resends voice:peers, which now takes the mesh path (sfuRef is null again).
+        console.warn('SFU connect failed — falling back to mesh', err)
+        try { sfuSession.close() } catch (e) { /* already closed */ }
+        sfuRef.current = null
+        socket.emit('voice:join', { serverId: callServerId, channelId })
+      }
+    }
     if (opts.camOn && outputTrackRef.current) emitStreamState(true, false, channelId) // announce our camera for Watch/Discover
   }
 
@@ -3284,6 +3315,14 @@ export default function App() {
     const ls = localStreamRef.current
     if (!ls) return
     const old = ls.getVideoTracks()[0]
+    if (sfuRef.current) {
+      // SFU mode: one video producer — replaceTrack for swaps (camera↔screen), close for off.
+      sfuRef.current.setVideoTrack(newTrack || null).catch((err) => console.warn('SFU video update failed', err))
+      if (old && old !== newTrack) { old.stop(); ls.removeTrack(old) }
+      if (newTrack && !ls.getVideoTracks().includes(newTrack)) ls.addTrack(newTrack)
+      setLocalStream(new MediaStream(ls.getTracks()))
+      return
+    }
     if (old) {
       Object.values(peersRef.current).forEach(({ pc }) => {
         const sender = pc.getSenders().find((s) => s.track === old)
@@ -3300,6 +3339,7 @@ export default function App() {
 
   // Cap the outgoing video bitrate on every peer's video sender (used for screen-share quality).
   const applyVideoBitrate = (bitrate) => {
+    if (sfuRef.current) { sfuRef.current.setVideoBitrate(bitrate); return }
     Object.values(peersRef.current).forEach(({ pc }) => {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video')
       if (!sender) return
@@ -3673,6 +3713,8 @@ export default function App() {
     // Never let a bad emit block the local teardown — always tear the call down.
     const chId = typeof voiceChannelId === 'string' ? voiceChannelId : 'voice1'
     try { socket?.emit('voice:leave', { serverId: voiceServerIdRef.current, channelId: chId }) } catch (err) { console.warn('voice:leave emit failed', err) }
+    try { sfuRef.current?.close() } catch (err) { /* already closed */ }
+    sfuRef.current = null
     Object.keys(peersRef.current).forEach(removePeer)
     peersRef.current = {}
     setRemoteStreams({})
