@@ -215,6 +215,18 @@ export default function AppLeftPane({
     e.preventDefault()
     setCtxMenu({ x: Math.min(e.clientX, window.innerWidth - 180), y: Math.min(e.clientY, window.innerHeight - 110), ...item })
   }
+  // Close the status dropdown (Available/Busy/…) on an outside click or Escape. The menu + its
+  // trigger button live inside userPanelRef, so clicking the trigger just toggles (its own handler)
+  // rather than double-firing here.
+  const userPanelRef = useRef(null)
+  useEffect(() => {
+    if (!showStatusMenu) return
+    const close = (e) => { if (!userPanelRef.current || !userPanelRef.current.contains(e.target)) onToggleStatusMenu?.() }
+    const onKey = (e) => { if (e.key === 'Escape') onToggleStatusMenu?.() }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', onKey) }
+  }, [showStatusMenu, onToggleStatusMenu])
   const dcLeftRef = useRef(null)
   const voiceTileRef = useRef(null)
   const [voiceControlsHover, setVoiceControlsHover] = useState(false)
@@ -397,7 +409,7 @@ export default function AppLeftPane({
           )}
         </div>
 
-        <div className="dc-user-panel">
+        <div className="dc-user-panel" ref={userPanelRef}>
           {showStatusMenu && (
             <div className="dc-status-menu" role="menu" aria-label="Set status">
               {STATUS_OPTIONS.map((opt) => (

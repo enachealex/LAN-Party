@@ -1092,7 +1092,10 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .invite-search:focus{outline:none;border-color:var(--accent-start)}
 /* Sized to show ~4.5 rows before scrolling (so a half-row peeks to hint there's more), then a
    themed thin scrollbar. Content-height (not flex:1) so a short list never shows a phantom bar. */
-.invite-list{list-style:none;margin:0;padding:0;overflow-y:auto;display:flex;flex-direction:column;gap:2px;max-height:236px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.22) transparent}
+/* overflow-x is explicitly hidden: with only overflow-y set, x computes to auto too, and content at
+   the width boundary triggers a horizontal↔vertical scrollbar feedback loop (the "scrollbar keeps
+   going in and out" flicker). min-height keeps a short list roomy; max-height (≈8 rows) then scrolls. */
+.invite-list{list-style:none;margin:0;padding:0;overflow-x:hidden;overflow-y:auto;display:flex;flex-direction:column;gap:2px;min-height:132px;max-height:min(58vh,412px);scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.22) transparent}
 .invite-list::-webkit-scrollbar{width:10px}
 .invite-list::-webkit-scrollbar-button{width:0;height:0;display:none}
 .invite-list::-webkit-scrollbar-track{background:transparent}
@@ -1106,7 +1109,7 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .invite-add-btn:hover{filter:brightness(1.06)}
 .invite-add-btn:disabled{opacity:.6;cursor:default;filter:none}
 .invite-added{display:inline-flex;align-items:center;gap:4px;font-size:12.5px;font-weight:700;color:#2bc36f;flex-shrink:0}
-.invite-empty{padding:18px 8px;text-align:center;color:#8ea0b2;font-size:14px;line-height:1.5}
+.invite-empty{min-height:132px;display:flex;align-items:center;justify-content:center;padding:18px 12px;text-align:center;color:#8ea0b2;font-size:14px;line-height:1.5}
 .invite-loading{padding:8px 4px 0;text-align:center;color:#6f8092;font-size:12px}
 .invite-actions{display:flex;justify-content:flex-end;margin-top:14px}
 
