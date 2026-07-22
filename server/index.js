@@ -16,6 +16,7 @@ const { feedbackInput, inviteInput, validate } = require('./validation');
 const { migrate } = require('./db/schema');
 const { createActivities } = require('./services/activities');
 const { createMessages } = require('./services/messages');
+const { createSfu } = require('./services/sfu');
 const { registerMediaRoutes } = require('./routes/media');
 const { registerAuthRoutes } = require('./routes/auth');
 const { registerSocialRoutes } = require('./routes/social');
@@ -715,9 +716,16 @@ async function main() {
     return res.json({ servers: result });
   });
 
+  // SFU (mediasoup) for voice rooms — feature-detected by clients via sfu:caps; when disabled or
+  // unsupported they fall back to the P2P mesh. Media flows on its own port, not the tunnel.
+  const sfu = createSfu({ io });
+
   // Socket.IO handlers
   io.on('connection', (socket) => {
     console.log('socket connected', socket.id);
+    // The voice room this socket currently occupies (sockets join at most one voice room).
+    const voiceRoomOf = (s) => { for (const r of s.rooms) if (r.startsWith('voice:')) return r; return null; };
+    sfu.bindSocket(socket, voiceRoomOf);
     // try to read token from handshake
     const token = socket.handshake.auth && socket.handshake.auth.token;
     let socketUser = null;
@@ -988,6 +996,7 @@ async function main() {
       const room = `voice:${serverId}:${channelId}`;
       socket.leave(room);
       socket.to(room).emit('voice:peer-left', { id: socket.id });
+      sfu.removePeer(room, socket.id); // close their SFU transports + notify consumers
       if (liveStreams[socket.id]) { delete liveStreams[socket.id]; broadcastDiscover(); }
       if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size === 0) delete activities[room];
     });
@@ -1034,6 +1043,7 @@ async function main() {
       for (const room of socket.rooms) {
         if (room.startsWith('voice:')) {
           socket.to(room).emit('voice:peer-left', { id: socket.id });
+          sfu.removePeer(room, socket.id);
           // If this socket is the last one in the room, drop its activity.
           if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size <= 1) delete activities[room];
         }
