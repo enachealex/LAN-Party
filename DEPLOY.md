@@ -116,12 +116,28 @@ Set on the pm2 process (see `pm2 env <id>`); most have key-file fallbacks.
      `hostname → http://127.0.0.1:5280`, run under pm2. No inbound firewall holes needed.
    - Classic reverse proxy: nginx + certbot per `deploy/nginx.conf.example` (forwards WebSocket
      upgrade, 100 MB uploads).
-5. Voice/video across networks needs TURN: coturn per `deploy/turnserver.conf.example`
-   (UDP/TCP 3478 + relay range), then set the `TURN_*` vars. Media is **peer-to-peer** — it never
-   transits the app server or the tunnel.
-6. Music playback needs `yt-dlp` on PATH.
+5. Music playback needs `yt-dlp` on PATH.
+
+## Voice/video
+
+Two paths, chosen automatically per join:
+
+- **SFU (mediasoup)** — preferred. Each participant uploads their tracks once and the server fans
+  them out (O(n) per client), so rooms scale well past the mesh's limit. Media flows over **one
+  port, `SFU_PORT` (default 40000, UDP+TCP), NOT the Cloudflare tunnel** — straight to the host.
+  - `SFU_ANNOUNCED_IPS` must list the address(es) clients should send media to. **Prod pins it to
+    `192.168.1.2`** (the SBC's LAN IP) in `ecosystem.config.cjs` — do NOT rely on auto-detect, which
+    would also advertise the unreachable Docker bridge IPs (172.x).
+  - **LAN clients work with zero setup.** **Remote clients** additionally need: (a) the public IP
+    added to `SFU_ANNOUNCED_IPS`, and (b) UDP **and** TCP port 40000 forwarded on the router to the
+    SBC. Until then, remote users transparently fall back to the mesh.
+  - `mediasoup` is a native module — `npm install` on the host before restart (it ships a prebuilt
+    x86_64 binary; needs python3+make+g++ only if it must build). If it's missing or fails, or you
+    set `SFU_DISABLED=1`, the app runs fine and every client uses the mesh.
+- **P2P mesh** — the fallback (and what old/other-network clients use). TURN makes it work across
+  NATs: coturn per `deploy/turnserver.conf.example` (UDP/TCP 3478 + relay range), then set the
+  `TURN_*` vars. Media is peer-to-peer, never transiting the app server or tunnel.
 
 ## Scale notes
 
-- Voice/video is a **P2P mesh** — fine for a handful of people per room; bigger rooms need an SFU.
 - SQLite + local disk = single host by design. For HA you'd move to Postgres + object storage.
