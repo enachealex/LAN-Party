@@ -1,102 +1,127 @@
-# Deploying to lanparty.thejumpvault.com
+# Deploying LAN Party
 
-The app is a **Node (Express + Socket.IO + SQLite) server** that also **serves the built React client**, so everything runs on **one origin** behind an HTTPS reverse proxy. This guide targets your own VPS.
-
-> **HTTPS is mandatory.** Camera, microphone, screen share (`getUserMedia`/`getDisplayMedia`) and the PWA service worker only work in a secure context. Serve the site over `https://` (steps below).
-
----
-
-## 0. DNS
-Point an A/AAAA record for `lanparty.thejumpvault.com` at your VPS's public IP. (If the subdomain answers with a 403/default page before the app is wired up, that's just the web server's placeholder — the nginx step below points it at the app.)
+This documents the **actual production setup** for lanparty.thejumpvault.com, plus a short appendix
+for standing up a fresh host. The app is one Node (Express + Socket.IO + SQLite) server that also
+serves the built React client — everything on one origin.
 
 ---
 
-## 1. Environment variables
+## How production actually runs
 
-| Var | Required | Purpose |
-| --- | --- | --- |
-| `JWT_SECRET` | **yes** | Long random string used to sign login tokens. Changing it logs everyone out. |
-| `PORT` | no (3000) | Port the Node server listens on (behind nginx). |
-| `DATA_DIR` | recommended | Folder for `data.sqlite` + `uploads/` `gifs/` `sounds/`. Put this on a **persistent** disk/volume. |
-| `CLIENT_DIST` | auto | Path to the built client. Set by the Dockerfile; for bare Node it defaults to `../client/dist`. |
-| `CLIENT_ORIGIN` | recommended | Allowed origin(s) for CORS/WebSockets, e.g. `https://lanparty.thejumpvault.com`. Defaults to `*`. |
-| `STUN_URLS` | no | Comma-separated STUN URLs (default `stun:stun.l.google.com:19302`). |
-| `TURN_URLS` | **for reliable calls** | Comma-separated TURN URLs, e.g. `turn:lanparty.thejumpvault.com:3478,turns:lanparty.thejumpvault.com:5349`. |
-| `TURN_USERNAME` / `TURN_CREDENTIAL` | with TURN | TURN credentials. |
-| `GIPHY_API_KEY` | no | Enables the Giphy tab (or drop a `server/giphy.key` file). |
-| `YOUTUBE_API_KEY` | for Music | Enables Music activity search (or drop a `server/youtube.key` file). Playback also needs `yt-dlp` on PATH — the Dockerfile installs it. |
-| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | for Spotify | Enables the Spotify tab in Music (or drop a `server/spotify.key` JSON file). Register `https://lanparty.thejumpvault.com/callback` as a Redirect URI in the Spotify Developer Dashboard. |
-| `SPOTIFY_REDIRECT_URI` | no | Override the OAuth redirect (defaults to this server's origin + `/callback`). |
+| Piece | Reality |
+|---|---|
+| Host | A home-LAN SBC (`aenache2015`), **not** a cloud VPS |
+| App | pm2 process **`lan-party`**, bare Node (`node index.js`), **PORT 5280** |
+| Repo on host | `/mnt/retroboard-data/lan-party` |
+| Public access | A **Cloudflare tunnel** (pm2 `lanparty-tunnel`) maps `lanparty.thejumpvault.com` → `127.0.0.1:5280`. No nginx, no certbot, no inbound ports — the tunnel is an *outbound* connection, which also means "site up" ≠ "host reachable over SSH" |
+| Data | `DATA_DIR=/mnt/retroboard-data/lan-party/data` (SQLite DB + uploads/gifs/sounds/downloads/feedback-media) |
+| Client | Built **on the dev machine** and shipped as `client/dist` — the host does not build (its `client/node_modules` has no vite) |
+| Landing / app | Landing page at `/`, app at `/app` (client built with `VITE_BASE=/app/`) |
+| Desktop feed | electron-updater generic feed at `/downloads/` (serves `DATA_DIR/downloads`) |
+| Secrets | Gitignored key files next to the server: `giphy.key`, `youtube.key`, `spotify.key`, `smtp.key`, `vaultline.key` — or the matching env vars |
 
-Generate a secret: `openssl rand -hex 32`.
+## Routine deploy (web changes)
 
----
-
-## 2A. Run with Docker (recommended)
+Run the gate first, from `server/`:
 
 ```bash
-git clone <your repo> && cd "Communication Tool gpt-free"
-printf 'JWT_SECRET=%s\nCLIENT_ORIGIN=https://lanparty.thejumpvault.com\n' "$(openssl rand -hex 32)" > .env
-# (add TURN_URLS / TURN_USERNAME / TURN_CREDENTIAL to .env once TURN is set up — step 4)
-docker compose up -d --build
+npm run verify        # typecheck + full test suite (~5s). Do not deploy red.
 ```
-The app now listens on `127.0.0.1:3000`. Data persists in the `appdata` Docker volume.
 
-## 2B. Run with bare Node + pm2 (alternative)
+**Client-only change** (no `server/*.js` touched) — no restart, nobody gets disconnected:
 
 ```bash
-# build the client (served by the server)
-cd client && npm ci && VITE_BASE=/ npm run build && cd ..
-# run the server
-cd server && npm ci --omit=dev
-DATA_DIR=/var/lib/lanparty CLIENT_ORIGIN=https://lanparty.thejumpvault.com \
-JWT_SECRET=$(openssl rand -hex 32) pm2 start index.js --name lanparty
-pm2 save && pm2 startup   # run the printed command to survive reboots
+# dev machine — PowerShell builds because Git Bash mangles VITE_BASE=/app/ into a Windows path
+$env:VITE_BASE='/app/'; cd client; npm run build
+
+# ship the dist (from client/dist, Git Bash)
+MSYS_NO_PATHCONV=1 tar -czf - . | ssh retroboard \
+  'D=/mnt/retroboard-data/lan-party/client/dist; rm -rf "$D"/*; mkdir -p "$D"; tar -C "$D" -xzf -'
+
+ssh retroboard 'cd /mnt/retroboard-data/lan-party && git pull --ff-only origin main'
 ```
+
+**Server change** — pull, then restart (restart drops live call/voice sockets, so prefer quiet hours):
+
+```bash
+ssh retroboard 'cd /mnt/retroboard-data/lan-party && git pull --ff-only origin main && pm2 restart lan-party --update-env'
+```
+
+**New server runtime dependency** — the host does NOT reinstall deps on deploy; a new `require`
+will crash on restart unless you install first, and order matters:
+
+```bash
+ssh retroboard 'cd /mnt/retroboard-data/lan-party && git pull --ff-only origin main \
+  && cd server && npm install --omit=dev && node -e "require(\"the-new-dep\")" \
+  && pm2 restart lan-party --update-env'
+# if the install fails, do NOT restart — the running process keeps serving the old code
+```
+
+**Schema change** — add a **new** named migration to `server/db/schema.js` `MIGRATIONS` (never edit
+a shipped one; use the `addColumn()` helper for columns). Migrations run once at boot and are
+recorded in `schema_migrations`. Back up first:
+
+```bash
+ssh retroboard 'cd /mnt/retroboard-data/lan-party && cp data/data.sqlite data/data.sqlite.bak-$(date +%Y%m%d-%H%M%S)'
+```
+
+## Desktop installer release (shell changes only)
+
+The Windows app is a thin Electron shell around the live site — web changes reach installed apps on
+reload with **no release**. Only changes under `desktop/` need one:
+
+```bash
+cd desktop && npm run build     # → dist/LAN-Party-Setup.exe + latest.yml + .blockmap
+# upload the .exe and .blockmap BEFORE latest.yml (the feed must never point at a missing file)
+scp dist/LAN-Party-Setup.exe dist/LAN-Party-Setup.exe.blockmap retroboard:/mnt/retroboard-data/lan-party/data/downloads/
+scp dist/latest.yml retroboard:/mnt/retroboard-data/lan-party/data/downloads/
+```
+
+Installed apps auto-update on next startup check.
+
+## Verify after deploying
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://lanparty.thejumpvault.com/        # 200
+curl -s https://lanparty.thejumpvault.com/app/ | grep -oE 'assets/index-[^"]*\.js' # new hash?
+ssh retroboard 'pm2 logs lan-party --err --lines 5 --nostream'                     # no new errors
+```
+
+## Environment variables
+
+Set on the pm2 process (see `pm2 env <id>`); most have key-file fallbacks.
+
+| Var | Prod value / purpose |
+|---|---|
+| `JWT_SECRET` | required — signing key for logins (rotating logs everyone out) |
+| `PORT` | 5280 |
+| `DATA_DIR` | `/mnt/retroboard-data/lan-party/data` |
+| `CLIENT_DIST` | `/mnt/retroboard-data/lan-party/client/dist` |
+| `CLIENT_ORIGIN` | `https://lanparty.thejumpvault.com` |
+| `STUN_URLS` / `TURN_URLS` / `TURN_USERNAME` / `TURN_CREDENTIAL` | WebRTC ICE served to clients via `/webrtc/ice` — rotating needs no client rebuild |
+| `GIPHY_API_KEY` / `YOUTUBE_API_KEY` / `SPOTIFY_CLIENT_ID`+`SECRET` | optional integrations (or `server/*.key` files) |
+| `VAULTLINE_API_KEY` / `VAULTLINE_API_BASE` | feedback forwarding (prod uses `server/vaultline.key` → loopback `http://127.0.0.1:4100`) |
+| SMTP: `SMTP_HOST/PORT/USER/PASS/FROM/SECURE` | transactional email (prod uses `server/smtp.key`) |
 
 ---
 
-## 3. nginx + HTTPS
+## Appendix: fresh host from scratch
 
-```bash
-sudo cp deploy/nginx.conf.example /etc/nginx/sites-available/lanparty
-sudo ln -s /etc/nginx/sites-available/lanparty /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d lanparty.thejumpvault.com   # adds the 443 block + auto-renew
-```
-The nginx config already forwards the **WebSocket upgrade** (needed for voice signalling/chat) and allows **100 MB uploads**.
-
----
-
-## 4. TURN server (so calls connect across networks)
-
-Voice/video uses a peer-to-peer mesh. STUN alone fails behind many home routers, so run **coturn**:
-
-```bash
-sudo apt-get install -y coturn
-sudo sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn
-sudo cp deploy/turnserver.conf.example /etc/turnserver.conf   # edit YOUR_PUBLIC_IP + the secret
-sudo systemctl enable --now coturn
-```
-Open UDP/TCP **3478** and **5349**, plus UDP **49152–65535**, in your firewall/security group. Then set in the app's env:
-```
-TURN_URLS=turn:lanparty.thejumpvault.com:3478,turns:lanparty.thejumpvault.com:5349
-TURN_USERNAME=lanparty
-TURN_CREDENTIAL=<the secret from turnserver.conf>
-```
-Restart the app. The client fetches these from `/webrtc/ice`, so no rebuild is needed to rotate them.
-
-Prefer not to self-host TURN? Use a managed service (Cloudflare Calls, Twilio, Metered) and just fill in the `TURN_*` vars.
-
----
-
-## 5. Verify
-- `https://lanparty.thejumpvault.com` loads the app (padlock = valid TLS).
-- Register/login works; refresh keeps you signed in.
-- Two people on **different networks** can join a voice channel and hear/see each other (this is the TURN test).
-- Upload a file, use GIFs/soundboard, start an Activity — all persist across a redeploy (thanks to `DATA_DIR`).
+1. Clone; `cd server && npm install --omit=dev`.
+2. Build the client somewhere with dev deps: `VITE_BASE=/app/ npm run build` in `client/`.
+3. Run: `DATA_DIR=... JWT_SECRET=$(openssl rand -hex 32) PORT=5280 pm2 start index.js --name lan-party`
+   then `pm2 save && pm2 startup`.
+4. Expose it (either):
+   - **Cloudflare tunnel** (what prod does): `cloudflared tunnel` with an ingress rule
+     `hostname → http://127.0.0.1:5280`, run under pm2. No inbound firewall holes needed.
+   - Classic reverse proxy: nginx + certbot per `deploy/nginx.conf.example` (forwards WebSocket
+     upgrade, 100 MB uploads).
+5. Voice/video across networks needs TURN: coturn per `deploy/turnserver.conf.example`
+   (UDP/TCP 3478 + relay range), then set the `TURN_*` vars. Media is **peer-to-peer** — it never
+   transits the app server or the tunnel.
+6. Music playback needs `yt-dlp` on PATH.
 
 ## Scale notes
-- The WebRTC mesh is designed for **small calls** (a handful of people each). It's not an SFU; very large calls would need one.
-- SQLite + local disk = single server. Fine for this scale; for HA you'd move to Postgres + object storage.
+
+- Voice/video is a **P2P mesh** — fine for a handful of people per room; bigger rooms need an SFU.
+- SQLite + local disk = single host by design. For HA you'd move to Postgres + object storage.
