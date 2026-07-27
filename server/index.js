@@ -65,6 +65,10 @@ async function main() {
   // to Vaultline don't 404 after the 7-day upload sweep.
   const feedbackDir = path.join(DATA_DIR, 'feedback-media');
   fs.mkdirSync(feedbackDir, { recursive: true });
+  // Uploaded, LAN-Party-hosted mini-apps (one subfolder per app). Persistent (outside /uploads),
+  // served sandboxed below so their JS can't touch the LAN Party session.
+  const appBundlesDir = path.join(DATA_DIR, 'app-bundles');
+  fs.mkdirSync(appBundlesDir, { recursive: true });
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -113,6 +117,10 @@ async function main() {
     limits: { fileSize: 15 * 1024 * 1024 },
     fileFilter: (_req, file, cb) => cb(null, /^image\//.test(file.mimetype || '')),
   });
+
+  // Mini-app bundle uploads (a single .html or a .zip). In memory so the extractor can validate the
+  // archive before anything touches disk; capped at 15 MB compressed.
+  const bundleUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
   // Uploaded files are named `<timestamp>-<rand>-<name>`; derive the upload time from the name.
   function uploadTimestampFromName(filename) {
@@ -164,6 +172,19 @@ async function main() {
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
   app.use('/feedback-media', express.static(feedbackDir, { redirect: false }));
+  // Uploaded mini-apps. The CSP `sandbox` directive (WITHOUT allow-same-origin) forces every bundle
+  // document into an OPAQUE origin — so its JS can't read LAN Party cookies/localStorage or call the
+  // API with the user's session, whether it's loaded in the embed iframe OR opened directly. This
+  // header is the core isolation for running user-uploaded code on our own origin.
+  app.use('/app-bundles', (req, res, next) => {
+    res.setHeader('Content-Security-Policy', "sandbox allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
+  }, express.static(appBundlesDir, { redirect: false, index: 'index.html', dotfiles: 'ignore' }));
+  // Terminal for this mount: a missing/deleted bundle must 404 here rather than fall through to the
+  // SPA catch-all (which would serve the client shell for a bundle path — misleading, and it would
+  // mask a bundle's broken asset references).
+  app.use('/app-bundles', (req, res) => res.status(404).type('txt').send('Not found'));
   // Static images used by the landing page (app screenshots). Committed with the repo.
   app.use('/landing-assets', express.static(path.join(__dirname, 'landing-assets'), { redirect: false }));
   // Serve the built client (single-origin hosting) UNDER /app; a landing page sits at /.
@@ -590,7 +611,7 @@ async function main() {
   registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir });
 
   // Giphy / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });

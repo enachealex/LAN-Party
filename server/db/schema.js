@@ -183,6 +183,15 @@ const MIGRATIONS = [
       await addColumn(db, 'messages', 'pinned_by', 'TEXT');
     },
   },
+  {
+    // Apps can be an external link (kind='link', the original behaviour) or an uploaded, LAN-Party-
+    // hosted bundle (kind='bundle') whose files live in DATA_DIR/app-bundles/<bundle_dir>.
+    name: '0003_app_bundles',
+    up: async (db) => {
+      await addColumn(db, 'apps', 'kind', `TEXT DEFAULT 'link'`);
+      await addColumn(db, 'apps', 'bundle_dir', 'TEXT');
+    },
+  },
 ];
 
 /**

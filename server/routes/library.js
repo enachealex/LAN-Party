@@ -3,9 +3,11 @@
 // source files, persistent for gifs/sounds), injected along with their directories.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { extractBundle } = require('../services/appBundles');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -55,13 +57,18 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   });
 
   // --- Public app directory ---
-  // List all public apps (newest first).
-  app.get('/apps', authMiddleware, async (req, res) => {
-    const rows = await db.all('SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt FROM apps ORDER BY created_at DESC');
-    return res.json({ apps: rows });
-  });
+  // A 'link' app keeps its external url; a 'bundle' app is LAN-Party-hosted, so its url is the
+  // internal sandboxed path. `embeddable` tells the client it can be shown in the in-app viewer.
+  async function listApps() {
+    const rows = await db.all("SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt, COALESCE(kind, 'link') AS kind, bundle_dir AS bundleDir FROM apps ORDER BY created_at DESC");
+    return rows.map((r) => {
+      const isBundle = r.kind === 'bundle' && r.bundleDir;
+      const { bundleDir, ...rest } = r;
+      return { ...rest, url: isBundle ? `/app-bundles/${bundleDir}/` : r.url, embeddable: !!isBundle };
+    });
+  }
 
-  // Publish a new app to the public directory.
+  // Publish a link-style app (external URL) to the public directory.
   app.post('/apps', authMiddleware, async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!name) return res.status(400).json({ error: 'App name is required' });
@@ -69,23 +76,63 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
     const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     const iconUrl = typeof req.body?.iconUrl === 'string' && req.body.iconUrl.startsWith('/uploads/') ? req.body.iconUrl : '';
     await db.run(
-      'INSERT INTO apps (name, description, url, icon_url, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'link')",
       name.slice(0, 80), description, url, iconUrl, req.user.username, Date.now()
     );
-    const apps = await db.all('SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt FROM apps ORDER BY created_at DESC');
-    return res.json({ success: true, apps });
+    return res.json({ success: true, apps: await listApps() });
   });
 
-  // Remove an app from the directory — only the user who uploaded it may remove it.
+  app.get('/apps', authMiddleware, async (req, res) => {
+    return res.json({ apps: await listApps() });
+  });
+
+  // Upload a self-contained mini-app (single .html or a .zip). The server extracts it into a private
+  // per-app folder and serves it sandboxed at /app-bundles/<dir>/ — so it embeds in the in-app viewer.
+  app.post('/apps/bundle', authMiddleware, (req, res) => {
+    bundleUpload.single('bundle')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Bundle is larger than 15 MB' });
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      if (!req.file) return res.status(400).json({ error: 'Missing bundle file' });
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      if (!name) return res.status(400).json({ error: 'App name is required' });
+      const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 500) : '';
+      const iconUrl = typeof req.body?.iconUrl === 'string' && req.body.iconUrl.startsWith('/uploads/') ? req.body.iconUrl : '';
+      const dir = `${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
+      const destDir = path.join(appBundlesDir, dir);
+      try {
+        extractBundle(req.file, destDir); // throws on unsafe/invalid archive; requires an index.html
+      } catch (e) {
+        try { fs.rmSync(destDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        return res.status(400).json({ error: e.message || 'Could not process the bundle' });
+      }
+      await db.run(
+        "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind, bundle_dir) VALUES (?, ?, '', ?, ?, ?, 'bundle', ?)",
+        name.slice(0, 80), description, iconUrl, req.user.username, Date.now(), dir
+      );
+      return res.json({ success: true, apps: await listApps() });
+    });
+  });
+
+  // Remove an app — only its uploader may. For bundles, delete the hosted files too.
   app.delete('/apps/:id', authMiddleware, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid app id' });
-    const row = await db.get('SELECT created_by FROM apps WHERE id = ?', id);
+    const row = await db.get('SELECT created_by, kind, bundle_dir FROM apps WHERE id = ?', id);
     if (!row) return res.status(404).json({ error: 'App not found' });
     if (row.created_by !== req.user.username) return res.status(403).json({ error: 'You can only remove apps you uploaded' });
     await db.run('DELETE FROM apps WHERE id = ?', id);
-    const apps = await db.all('SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt FROM apps ORDER BY created_at DESC');
-    return res.json({ success: true, apps });
+    if (row.kind === 'bundle' && row.bundle_dir) {
+      // Resolve + confirm the target stays strictly inside appBundlesDir before recursive delete.
+      const target = path.resolve(appBundlesDir, row.bundle_dir);
+      const rel = path.relative(appBundlesDir, target);
+      const contained = !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+      if (contained) {
+        try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+      }
+    }
+    return res.json({ success: true, apps: await listApps() });
   });
 
   // --- Shared GIF library ---

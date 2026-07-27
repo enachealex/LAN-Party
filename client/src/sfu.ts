@@ -42,6 +42,8 @@ export class SfuSession {
   private callbacks: SfuCallbacks
   private closed = false
   private cleanupSocketHandlers: () => void
+  // Woken on every transport connectionstatechange (and on close) so waitUntilConnected can re-check.
+  private stateWaiters = new Set<() => void>()
 
   private constructor(socket: Socket, device: Device, callbacks: SfuCallbacks) {
     this.socket = socket
@@ -76,6 +78,38 @@ export class SfuSession {
     return new SfuSession(socket, device, callbacks)
   }
 
+  private wake(): void { for (const w of [...this.stateWaiters]) w() }
+
+  /**
+   * Resolve true once a transport's ICE/DTLS actually connects (media path works), false if none
+   * connect within timeoutMs or one fails outright. The caller uses a false result to tear the SFU
+   * down and fall back to the P2P mesh — the SFU has no server-side fallback, so an unreachable
+   * media port (e.g. a remote user behind an un-forwarded router) would otherwise mean dead audio.
+   * Either transport reaching 'connected' proves the path (both use the same server candidates).
+   */
+  waitUntilConnected(timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      let done = false
+      const states = () => [this.sendTransport?.connectionState, this.recvTransport?.connectionState]
+      const finish = (ok: boolean) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        this.stateWaiters.delete(check)
+        resolve(ok)
+      }
+      const check = () => {
+        if (this.closed) return finish(false)
+        const s = states()
+        if (s.includes('connected')) return finish(true)
+        if (s.some((v) => v === 'failed')) return finish(false)
+      }
+      const timer = setTimeout(() => finish(false), timeoutMs)
+      this.stateWaiters.add(check)
+      check() // in case a transport is already connected/failed
+    })
+  }
+
   /** Create both transports. Called AFTER voice:join (the server requires room membership). */
   async connect(): Promise<void> {
     this.sendTransport = await this.createTransport('send')
@@ -90,6 +124,10 @@ export class SfuSession {
     const transport = direction === 'send'
       ? this.device.createSendTransport(params)
       : this.device.createRecvTransport(params)
+    // ICE/DTLS reachability signal. The 'connect' event below only proves the DTLS params were
+    // exchanged over socket.io — it fires even when the media port is unreachable. Actual
+    // connectivity shows up here, so this drives the caller's fall-back-to-mesh watchdog.
+    transport.on('connectionstatechange', () => { this.wake() })
     transport.on('connect', ({ dtlsParameters }, done, fail) => {
       request(this.socket, 'sfu:connect-transport', { transportId: transport.id, dtlsParameters }).then(() => done()).catch(fail)
     })
@@ -181,6 +219,7 @@ export class SfuSession {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.wake() // release any pending waitUntilConnected → resolves false
     this.cleanupSocketHandlers()
     try { this.audioProducer?.close() } catch { /* noop */ }
     try { this.videoProducer?.close() } catch { /* noop */ }

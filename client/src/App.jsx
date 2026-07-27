@@ -23,6 +23,7 @@ import ManageChannelAccessModal from './components/ManageChannelAccessModal'
 import { COLOR_SCHEMES, matchSchemeId } from './colorSchemes'
 import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
+import AppViewer from './components/AppViewer'
 import { normalizeProfile, nameStyleToCss, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
 import { SfuSession } from './sfu'
@@ -401,7 +402,7 @@ function renderMessageText(text, emojiMap, onSaveEmoji, currentUser) {
   let key = 0
   // Split out @mentions so they render as highlighted chips (extra pop when it's you).
   const pushPlain = (chunk) => { if (chunk) parts.push(...[].concat(enlargeUnicodeEmoji(chunk, `t${key++}`))) }
-  const pushText = (chunk) => {
+  const pushMentions = (chunk) => {
     if (!chunk) return
     const mentionRe = /@(\w[\w.-]*)/g
     let mLast = 0
@@ -413,6 +414,27 @@ function renderMessageText(text, emojiMap, onSaveEmoji, currentUser) {
       mLast = mm.index + mm[0].length
     }
     pushPlain(chunk.slice(mLast))
+  }
+  // Links become clickable first — https for the web, vaultmovies:// so a Watch
+  // Party invite pasted in chat opens straight into the Vault Movies app.
+  const pushText = (chunk) => {
+    if (!chunk) return
+    const urlRe = /(https?:\/\/[^\s<>"'`]+|vaultmovies:\/\/[^\s<>"'`]+)/g
+    let uLast = 0
+    let um
+    while ((um = urlRe.exec(chunk)) !== null) {
+      if (um.index > uLast) pushMentions(chunk.slice(uLast, um.index))
+      let url = um[0]
+      const trail = url.match(/[.,;:!?)\]}]+$/) // trailing punctuation isn't part of it
+      if (trail) url = url.slice(0, -trail[0].length)
+      const external = url.startsWith('http')
+      parts.push(
+        <a key={`u${key++}`} className="msg-link" href={url} onClick={(e) => e.stopPropagation()} {...(external ? { target: '_blank', rel: 'noreferrer' } : {})}>{url}</a>
+      )
+      uLast = um.index + url.length
+      urlRe.lastIndex = uLast
+    }
+    pushMentions(chunk.slice(uLast))
   }
   const hasCustom = emojiMap && Object.keys(emojiMap).length > 0
   while (hasCustom && (match = regex.exec(text)) !== null) {
@@ -882,6 +904,8 @@ export default function App() {
   const isDesktopApp = typeof window !== 'undefined' && !!window.desktop?.isElectron
   // Public app directory modal.
   const [showAppDirectory, setShowAppDirectory] = useState(false)
+  // The embeddable app currently open in the in-app sandboxed viewer (null = closed).
+  const [viewerApp, setViewerApp] = useState(null)
   const [publicApps, setPublicApps] = useState([])
   const [showSettingsPanel, setShowSettingsPanel] = useState(false)
   const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
@@ -3058,6 +3082,15 @@ export default function App() {
     sfuRef.current = sfuSession
     socket.emit('voice:join', { serverId: callServerId, channelId })
     if (sfuSession) {
+      // Drop the SFU and re-join so the server resends voice:peers, which now takes the mesh path
+      // (sfuRef is null again). Guarded so a watchdog fallback can't double-fire after a catch.
+      const fallbackToMesh = (why, err) => {
+        if (sfuRef.current !== sfuSession) return
+        console.warn(why, err || '')
+        try { sfuSession.close() } catch (e) { /* already closed */ }
+        sfuRef.current = null
+        socket.emit('voice:join', { serverId: callServerId, channelId })
+      }
       try {
         await sfuSession.connect()
         const audioTrack = localStreamRef.current?.getAudioTracks()[0]
@@ -3065,12 +3098,16 @@ export default function App() {
         const videoTrack = localStreamRef.current?.getVideoTracks()[0]
         if (videoTrack) await sfuSession.setVideoTrack(videoTrack)
       } catch (err) {
-        // SFU handshake failed after we already skipped mesh setup: drop the session and re-join so
-        // the server resends voice:peers, which now takes the mesh path (sfuRef is null again).
-        console.warn('SFU connect failed — falling back to mesh', err)
-        try { sfuSession.close() } catch (e) { /* already closed */ }
-        sfuRef.current = null
-        socket.emit('voice:join', { serverId: callServerId, channelId })
+        // Signaling-level failure (handshake threw) after we already skipped mesh setup.
+        fallbackToMesh('SFU connect failed — falling back to mesh', err)
+      }
+      // Media-path watchdog: connect()/produce resolve once DTLS params are exchanged over the
+      // socket, which succeeds even when the media port itself is unreachable (e.g. a remote user
+      // whose router isn't forwarded). If no transport actually reaches 'connected' in time, the
+      // audio would be silently dead — so fall back to the mesh, which the SFU can't do server-side.
+      if (sfuRef.current === sfuSession) {
+        const connected = await sfuSession.waitUntilConnected(8000)
+        if (!connected) fallbackToMesh('SFU media path did not connect — falling back to mesh')
       }
     }
     if (opts.camOn && outputTrackRef.current) emitStreamState(true, false, channelId) // announce our camera for Watch/Discover
@@ -4727,8 +4764,9 @@ export default function App() {
 
   const openAppDirectory = () => { setShowAppDirectory(true); loadPublicApps() }
 
-  // Upload an app to the public directory (optionally with an icon image).
-  const uploadApp = async ({ name, description, url, iconFile }) => {
+  // Upload an app to the public directory. `source` is 'link' (external URL) or 'bundle' (an uploaded
+  // .html/.zip that LAN Party hosts + runs sandboxed). Both may carry an optional icon image.
+  const uploadApp = async ({ source = 'link', name, description, url, iconFile, bundleFile }) => {
     const t = token || localStorage.getItem('lanparty_token')
     if (!t) throw new Error('You must be signed in.')
     let iconUrl = ''
@@ -4741,13 +4779,27 @@ export default function App() {
       if (!up.ok) throw new Error(upData.error || 'Icon upload failed')
       iconUrl = upData.attachment.url
     }
-    const res = await fetch(`${SERVER_URL}/apps`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
-      body: JSON.stringify({ name, description, url, iconUrl }),
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error || 'Failed to publish app')
+    let res
+    let data
+    if (source === 'bundle') {
+      if (!bundleFile) throw new Error('Choose a .html file or a .zip bundle.')
+      const fd = new FormData()
+      fd.append('name', name)
+      fd.append('description', description || '')
+      if (iconUrl) fd.append('iconUrl', iconUrl)
+      fd.append('bundle', bundleFile)
+      res = await fetch(`${SERVER_URL}/apps/bundle`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
+      data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Failed to publish app')
+    } else {
+      res = await fetch(`${SERVER_URL}/apps`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+        body: JSON.stringify({ name, description, url, iconUrl }),
+      })
+      data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to publish app')
+    }
     setPublicApps(data.apps || [])
   }
 
@@ -6212,9 +6264,13 @@ export default function App() {
         onClose={() => setShowAppDirectory(false)}
         onUpload={uploadApp}
         onRemove={removeApp}
+        onOpenApp={(app) => { setViewerApp(app); setShowAppDirectory(false) }}
         currentUser={name}
         resolveSrc={emojiSrc}
       />
+
+      {/* Sandboxed viewer for embedded (uploaded) mini-apps */}
+      <AppViewer app={viewerApp} resolveSrc={emojiSrc} onClose={() => setViewerApp(null)} />
 
       {/* Install panel (fallback) */}
       <div className={`members-panel install-panel ${showInstallPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showInstallPanel}>
