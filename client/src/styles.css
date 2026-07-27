@@ -749,6 +749,17 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .app-viewer-btn:hover{background:rgba(255,255,255,.1)}
 .app-viewer-close{width:34px;padding:7px 0;text-align:center}
 .app-viewer-frame{flex:1;width:100%;border:none;background:#fff}
+/* Sound settings (Appearance tab) */
+.sound-settings-row{display:flex;align-items:center;gap:12px;margin-top:12px}
+.sound-settings-row.disabled{opacity:.45}
+.sound-toggle{display:inline-flex;align-items:center;gap:10px;background:transparent;border:none;cursor:pointer;padding:0;font-family:inherit;color:var(--text)}
+.sound-toggle-track{position:relative;width:44px;height:24px;border-radius:12px;background:rgba(255,255,255,.18);transition:background .15s}
+.sound-toggle.on .sound-toggle-track{background:var(--accent-end)}
+.sound-toggle-knob{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .15s;box-shadow:0 1px 3px rgba(0,0,0,.35)}
+.sound-toggle.on .sound-toggle-knob{transform:translateX(20px)}
+.sound-toggle-label{font-size:14px;font-weight:600}
+.sound-volume-slider{flex:1;max-width:220px;accent-color:var(--accent-end);cursor:pointer}
+.sound-volume-value{font-size:13px;color:var(--muted);min-width:38px;text-align:right}
 
 /* Messages tab */
 .profile-settings-note{margin:0 0 14px;font-size:13px;color:var(--muted)}
@@ -1629,3 +1640,17 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 /* Clickable links in chat messages */
 .msg-link{color:var(--accent-start);text-decoration:underline;word-break:break-all}
 .msg-row.outgoing .msg-link{color:#032b46}
+
+/* Movie Night: in-browser playback (direct-play films) */
+.movie-activity.playing{display:flex;flex-direction:column;padding:0;height:100%;min-height:0}
+.movie-player{position:relative;flex:1;min-height:0;background:#000;display:flex;align-items:center;justify-content:center}
+.movie-video{width:100%;height:100%;object-fit:contain;background:#000}
+.movie-gate{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;border:none;cursor:pointer;background:rgba(6,10,14,.86);color:var(--text)}
+.movie-gate-emoji{font-size:44px}
+.movie-gate-title{font-size:18px;font-weight:800}
+.movie-gate-cta{font-size:13px;color:#f0a070}
+.movie-playbar{display:flex;align-items:center;gap:14px;padding:8px 14px;background:rgba(255,255,255,.04);border-top:1px solid rgba(255,255,255,.1)}
+.movie-playbar-title{font-size:13px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.movie-playbar-sync{font-size:12px;color:#f0a070;white-space:nowrap}
+.movie-playbar-app{margin-left:auto;font-size:12px;color:var(--text-muted,#9aa7b5);text-decoration:underline;white-space:nowrap}
+.movie-needsapp{max-width:340px;margin:4px 0 2px;font-size:12.5px;line-height:1.5;color:var(--text-muted,#9aa7b5)}

@@ -683,9 +683,69 @@ function parseMovieInvite(input) {
   return { code: code.toUpperCase(), server: server ? decodeURIComponent(server) : null }
 }
 
+// Where the relay lives. The invite may carry a full URL, a public hostname, or a bare LAN
+// address (which runs plain http on 5555).
+function relayBase(server) {
+  const s = String(server || '').trim().replace(/\/+$/, '')
+  if (!s) return `https://${VAULT_PUBLIC_HOST}`
+  if (/^https?:\/\//i.test(s)) return s
+  if (/^[\w-]+(\.[\w-]+)+$/.test(s)) return `https://${s}`
+  return `http://${s}:5555` // bare IP: a host's own relay
+}
+
 function MovieNight({ state, onEvent }) {
   const [invite, setInvite] = useState('')
   const [title, setTitle] = useState('')
+  const [info, setInfo] = useState(null)
+  const [infoErr, setInfoErr] = useState('')
+  const [joined, setJoined] = useState(false) // playback needs a click before audio is allowed
+  const videoRef = useRef(null)
+  const skewRef = useRef(0) // our clock minus the relay's
+
+  const base = state.code ? relayBase(state.server) : null
+  // A https page cannot fetch or stream from a plain-http LAN relay.
+  const mixedBlocked = !!base && window.location.protocol === 'https:' && base.startsWith('http:')
+
+  // Poll the room: is it web-playable, and where is the host right now?
+  useEffect(() => {
+    if (!state.code || !base || mixedBlocked) return undefined
+    let alive = true
+    const tick = async () => {
+      try {
+        const r = await fetch(`${base}/room/${encodeURIComponent(state.code)}`, { cache: 'no-store' })
+        if (!alive) return
+        if (!r.ok) {
+          setInfo(null)
+          setInfoErr(r.status === 404 ? 'That room has ended.' : 'Could not reach the room.')
+          return
+        }
+        const j = await r.json()
+        if (!alive) return
+        if (j.serverNowMs) skewRef.current = Date.now() - j.serverNowMs
+        setInfo(j)
+        setInfoErr('')
+      } catch {
+        if (alive) setInfoErr('Could not reach the room.')
+      }
+    }
+    tick()
+    const id = setInterval(tick, 3000)
+    return () => { alive = false; clearInterval(id) }
+  }, [state.code, base, mixedBlocked])
+
+  // Follow the host's clock. The beacon is stamped on the host's machine, so the
+  // relay's own time (minus our skew) is what makes the arithmetic honest.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v || !joined || !info?.webPlayable || info.positionMs == null) return
+    const nowOnRelay = Date.now() - skewRef.current
+    const elapsed = info.playing && info.atUnixMs ? Math.max(0, nowOnRelay - info.atUnixMs) : 0
+    const target = (info.positionMs + elapsed) / 1000
+    if (Number.isFinite(target) && Math.abs(v.currentTime - target) > 2) v.currentTime = target
+    if (info.playing && v.paused) v.play().catch(() => {})
+    if (!info.playing && !v.paused) v.pause()
+  }, [info, joined])
+
   if (!state.code) {
     const parsed = parseMovieInvite(invite)
     return (
@@ -705,12 +765,59 @@ function MovieNight({ state, onEvent }) {
   }
   const server = state.server || VAULT_PUBLIC_HOST
   const launch = `vaultmovies://join?code=${encodeURIComponent(state.code)}&server=${encodeURIComponent(server)}`
+  const heading = info?.title || state.title || 'Movie night'
+
+  // Watchable right here: stream it from the relay and follow the host.
+  if (info?.webPlayable && !mixedBlocked) {
+    return (
+      <div className="movie-activity playing">
+        <div className="movie-player">
+          <video
+            ref={videoRef}
+            className="movie-video"
+            src={`${base}/stream/${encodeURIComponent(state.code)}`}
+            playsInline
+            controls={false}
+            preload="auto"
+          />
+          {!joined && (
+            <button type="button" className="movie-gate" onClick={() => { setJoined(true); videoRef.current?.play().catch(() => {}) }}>
+              <span className="movie-gate-emoji">🍿</span>
+              <span className="movie-gate-title">{heading}</span>
+              <span className="movie-gate-cta">Click to watch with everyone</span>
+            </button>
+          )}
+        </div>
+        <div className="movie-playbar">
+          <span className="movie-playbar-title">{heading}</span>
+          <span className="movie-playbar-sync">
+            {info.playing === false ? 'Paused by the host' : `In sync with ${info.host || 'the host'}`}
+          </span>
+          <a className="movie-playbar-app" href={launch}>Open in the app instead</a>
+          <button type="button" className="movie-change" onClick={() => onEvent({ kind: 'clear' })}>Change room</button>
+        </div>
+      </div>
+    )
+  }
+
+  // Everything else — HEVC, MKV, DTS, a streaming title, or a http-only LAN relay
+  // on an https page. Transcoding these would cost the host real CPU, so the app,
+  // which decodes them natively, is the right place to watch.
+  const needsApp = mixedBlocked
+    ? 'This room is hosted on a local network address, which a web page can’t stream from.'
+    : info?.service
+      ? `Playing on ${info.service} — everyone opens it in their own app.`
+      : info?.webReason || 'This film needs the Vault Movies app.'
+
   return (
     <div className="movie-activity">
       <div className="movie-card">
         <div className="movie-emoji">🍿</div>
-        <div className="movie-title">{state.title || 'Movie night'}</div>
+        <div className="movie-title">{heading}</div>
         <div className="movie-code">{state.code}</div>
+        <div className="movie-needsapp">
+          {infoErr || (info ? needsApp : 'Checking the room…')}
+        </div>
         <a className="movie-join" href={launch}>Open in Vault Movies</a>
         <div className="movie-foot">
           <a className="movie-get" href={VAULT_DOWNLOAD} target="_blank" rel="noreferrer">Don&apos;t have Vault Movies?</a>

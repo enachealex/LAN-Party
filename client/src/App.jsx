@@ -24,6 +24,7 @@ import { COLOR_SCHEMES, matchSchemeId } from './colorSchemes'
 import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
+import { playUiSound, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
 import { normalizeProfile, nameStyleToCss, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
 import { SfuSession } from './sfu'
@@ -979,6 +980,9 @@ export default function App() {
   const [showStatusMenu, setShowStatusMenu] = useState(false)
   const [micMuted, setMicMuted] = useState(false)
   const [deafened, setDeafened] = useState(false)
+  // Synthesized UI feedback sounds (Web Audio; see uiSounds.js). Persisted per-user in settings.
+  const [uiSoundsEnabled, setUiSoundsEnabled] = useState(true)
+  const [uiSoundVolume, setUiSoundVolume] = useState(0.5)
   // Audio device selection (mic input + speaker output). Enumerated only after the user is in a call.
   const [audioInputs, setAudioInputs] = useState([])
   const [audioOutputs, setAudioOutputs] = useState([])
@@ -1737,6 +1741,7 @@ export default function App() {
         const data = await res.json()
         throw new Error(data.error || 'Failed to accept')
       }
+      playUiSound('success')
       await loadFriendsData()
     } catch (err) {
       console.warn('acceptFriendRequest', err)
@@ -1880,6 +1885,23 @@ export default function App() {
     if (flow !== 'top' && flow !== 'bottom') return
     setMessageFlow(flow)
     patchUserSettings({ messageFlow: flow })
+  }
+
+  // UI sound preferences (persisted per-user). Toggling on plays a confirmation blip so the change
+  // is audible; the volume slider previews with a tap.
+  const toggleUiSounds = () => {
+    const next = !uiSoundsEnabled
+    setUiSoundsEnabled(next)
+    setUiSoundPrefs({ enabled: next })
+    if (next) { unlockUiSounds(); playUiSound('toggle') }
+    patchUserSettings({ uiSounds: { enabled: next, volume: uiSoundVolume } })
+  }
+  const changeUiSoundVolume = (v) => {
+    const vol = Math.max(0, Math.min(1, v))
+    setUiSoundVolume(vol)
+    setUiSoundPrefs({ volume: vol })
+    if (uiSoundsEnabled) playUiSound('tap')
+    patchUserSettings({ uiSounds: { enabled: uiSoundsEnabled, volume: vol } })
   }
 
   // Replace one quick-reaction slot (from Settings). If the picked emoji already sits in
@@ -2142,6 +2164,13 @@ export default function App() {
     if (Array.isArray(settings.customEmojis)) setCustomEmojis(settings.customEmojis)
     if (settings.emojiSkinTones && typeof settings.emojiSkinTones === 'object') setEmojiSkinTones(settings.emojiSkinTones)
     if (settings.messageFlow === 'top' || settings.messageFlow === 'bottom') setMessageFlow(settings.messageFlow)
+    if (settings.uiSounds && typeof settings.uiSounds === 'object') {
+      const on = settings.uiSounds.enabled !== false // default on
+      const vol = typeof settings.uiSounds.volume === 'number' ? settings.uiSounds.volume : 0.5
+      setUiSoundsEnabled(on)
+      setUiSoundVolume(vol)
+      setUiSoundPrefs({ enabled: on, volume: vol })
+    }
     if (Array.isArray(settings.quickReactions) && settings.quickReactions.length > 0 && settings.quickReactions.every((e) => typeof e === 'string' && e)) {
       setQuickReactions(settings.quickReactions.slice(0, MESSAGE_REACTIONS.length))
     }
@@ -2189,6 +2218,7 @@ export default function App() {
       updateDmConversationPreview(fromUserId, fromUsername, message)
       const viewingThisDm = homeChatRef.current?.peerUsername === fromUsername &&
         selectedServerIdRef.current === 'home'
+      if (fromUsername && fromUsername !== userName) playUiSound(viewingThisDm && !document.hidden ? 'receive' : 'notify')
       if (viewingThisDm && !document.hidden) {
         markConversationRead(fromUsername, authToken)
       } else {
@@ -2271,6 +2301,7 @@ export default function App() {
         // doesn't count what we just watched arrive.
         if (selectedServerIdRef.current !== 'home') s.emit('channel:read', { serverId: msg.serverId, channelId: msg.channelId })
       }
+      if (msg && msg.author && msg.author !== userName) playUiSound('receive')
       setMessages(prev => {
         if (prev.some((m) => m.id === msg.id)) return prev
         return oldestMessagesFirst([...prev, msg])
@@ -2353,7 +2384,8 @@ export default function App() {
     })
     s.on('voice:peer-joined', ({ id, name: peerName }) => {
       // The newcomer offers to us; we create our peer when their offer arrives (handleSignal).
-      if (id) setPeerNames((prev) => ({ ...prev, [id]: peerName }))
+      // Fires only for people arriving after us — the existing roster comes via voice:peers (silent).
+      if (id) { setPeerNames((prev) => ({ ...prev, [id]: peerName })); playUiSound('peerJoin') }
     })
     s.on('voice:signal', ({ from, signal }) => { if (!sfuRef.current) handleSignal(from, signal) })
     // Direct 1:1 friend calls
@@ -2365,7 +2397,7 @@ export default function App() {
     s.on('call:unavailable', () => onCallUnavailable())
     s.on('call:handled', () => onCallHandledElsewhere())
     s.on('call:signal', ({ from, signal }) => handleCallSignal(from, signal))
-    s.on('voice:peer-left', ({ id }) => { removePeer(id); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
+    s.on('voice:peer-left', ({ id }) => { removePeer(id); playUiSound('peerLeave'); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
     s.on('voice:screenshare-state', ({ id, sharing }) => setScreenSharingPeers((prev) => ({ ...prev, [id]: sharing })))
     // Watch/Discover: the server pushes the full list of who's live whenever it changes.
     s.on('discover:update', (list) => setDiscoverStreams(Array.isArray(list) ? list : []))
@@ -2914,6 +2946,30 @@ export default function App() {
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [])
 
+  // Unlock synthesized UI sounds on the first user gesture (browsers suspend audio until then), and
+  // give a soft click on any button/link press so interactions don't feel dead. playUiSound() itself
+  // respects the enabled toggle, so this stays silent when sounds are turned off. Opt an element out
+  // with a [data-no-uitap] ancestor.
+  useEffect(() => {
+    const onPointerDown = (e) => {
+      unlockUiSounds()
+      const el = e.target?.closest?.('button, [role="button"], a[href]')
+      if (el && !el.closest?.('[data-no-uitap]')) playUiSound('tap')
+    }
+    const onKeyDown = () => unlockUiSounds()
+    document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('keydown', onKeyDown, true)
+    // Every alert() in the app is an error/warning to the user, so beep on all of them. Wrap rather
+    // than touch dozens of call sites; restore the original on unmount.
+    const origAlert = window.alert
+    window.alert = (...args) => { playUiSound('error'); return origAlert.apply(window, args) }
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true)
+      document.removeEventListener('keydown', onKeyDown, true)
+      window.alert = origAlert
+    }
+  }, [])
+
   // Desktop notification for activity you'd otherwise miss (tab hidden, or a DM/@mention while
   // you're elsewhere in the app). Gated on the Settings toggle + browser permission.
   const maybeNotify = (kind, info = {}) => {
@@ -2961,6 +3017,7 @@ export default function App() {
     try {
       const attachment = await uploadSelectedFile()
       socket.emit('message', { serverId: currentServerId(), channelId: activeChannel, text: body, attachment, quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined })
+      playUiSound('send')
       setPendingQuotes([])
       clearPendingAttachment()
     } catch (err) {
@@ -3070,6 +3127,7 @@ export default function App() {
     setVoiceRailTarget(selectedServerId === 'home' ? 'home' : selectedServerId)
     setVoiceChannelId(channelId)
     setInVoice(true)
+    playUiSound('joinVoice')
     // SFU-first: probe the server BEFORE joining so the mode is settled when voice:peers arrives.
     // A null answer (SFU off / old server) means the mesh path below runs exactly as before.
     let sfuSession = null
@@ -3681,6 +3739,7 @@ export default function App() {
     const next = track ? track.enabled : !micMuted // if enabled, we're muting → next=true
     if (track) track.enabled = !next
     setMicMuted(next)
+    playUiSound(next ? 'mute' : 'unmute')
     if (!next && deafened) setDeafened(false) // unmuting while deafened undeafens (Discord-like)
   }
 
@@ -3747,6 +3806,7 @@ export default function App() {
   const changeSpeaker = (deviceId) => setSelectedSpeakerId(deviceId)
 
   const leaveVoice = () => {
+    playUiSound('leaveVoice')
     // Never let a bad emit block the local teardown — always tear the call down.
     const chId = typeof voiceChannelId === 'string' ? voiceChannelId : 'voice1'
     try { socket?.emit('voice:leave', { serverId: voiceServerIdRef.current, channelId: chId }) } catch (err) { console.warn('voice:leave emit failed', err) }
@@ -6553,6 +6613,7 @@ export default function App() {
           )}
 
           {settingsTab === 'appearance' && (
+          <>
           <section className="profile-settings-section">
             <h3 className="profile-settings-section-title">Color Scheme</h3>
             <div className="scheme-grid">
@@ -6586,6 +6647,39 @@ export default function App() {
               })}
             </div>
           </section>
+          <section className="profile-settings-section" data-no-uitap>
+            <h3 className="profile-settings-section-title">Sounds</h3>
+            <p className="profile-settings-note">Play short sound effects for actions — clicks, sending &amp; receiving messages, joining a call, mute. Only affects you.</p>
+            <div className="sound-settings-row">
+              <button
+                type="button"
+                className={`sound-toggle${uiSoundsEnabled ? ' on' : ''}`}
+                onClick={toggleUiSounds}
+                role="switch"
+                aria-checked={uiSoundsEnabled}
+              >
+                <span className="sound-toggle-track"><span className="sound-toggle-knob" /></span>
+                <span className="sound-toggle-label">{uiSoundsEnabled ? 'Sound effects on' : 'Sound effects off'}</span>
+              </button>
+            </div>
+            <div className={`sound-settings-row${uiSoundsEnabled ? '' : ' disabled'}`}>
+              <label className="app-field-label" htmlFor="ui-sound-volume">Volume</label>
+              <input
+                id="ui-sound-volume"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={uiSoundVolume}
+                disabled={!uiSoundsEnabled}
+                onChange={(e) => changeUiSoundVolume(parseFloat(e.target.value))}
+                className="sound-volume-slider"
+                aria-label="Sound effects volume"
+              />
+              <span className="sound-volume-value">{Math.round(uiSoundVolume * 100)}%</span>
+            </div>
+          </section>
+          </>
           )}
 
           {settingsTab === 'messages' && (
