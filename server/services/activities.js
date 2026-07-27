@@ -7,7 +7,7 @@
 
 /** @param {{ io: any, clients: Record<string, any> }} deps */
 function createActivities({ io, clients }) {
-  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music'];
+  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music', 'movie'];
   const SKETCH_WORDS = ['pizza', 'dragon', 'controller', 'headset', 'wizard', 'castle', 'laptop', 'zombie', 'racecar', 'treasure', 'ninja', 'robot', 'campfire', 'spaceship', 'sword', 'shield', 'potion', 'dungeon', 'goblin', 'keyboard', 'trophy', 'boss fight', 'power up', 'game over', 'rage quit', 'speedrun', 'loot box', 'health bar', 'respawn', 'lan party', 'energy drink', 'mechanical keyboard', 'graphics card', 'blue screen', 'lag spike', 'victory royale', 'minecart', 'creeper', 'portal', 'joystick', 'arcade', 'pixel', 'avatar', 'guild', 'quest', 'checkpoint', 'combo', 'headshot', 'stealth', 'sniper', 'race track', 'finish line', 'monster truck', 'alien', 'meteor', 'volcano', 'pirate ship', 'skeleton', 'campaign', 'final boss'];
   function activityInit(type) {
     if (type === 'watch') return { videoId: null, playing: false, time: 0, ts: Date.now() };
@@ -18,6 +18,9 @@ function createActivities({ io, clients }) {
     // music: shared queue + synced playback (pos anchored to server time ts, like 'watch').
     // dj: null = everyone controls; a claimed DJ is the only one who can drive playback.
     if (type === 'music') return { queue: [], index: -1, playing: false, pos: 0, ts: Date.now(), history: [], dj: null };
+    // movie: a Vault Movies watch-party room shared with the call. The film plays in the
+    // desktop app (vaultmovies:// launch); this just carries the room so everyone can join.
+    if (type === 'movie') return { code: null, server: null, title: '' };
     return {};
   }
 
@@ -190,6 +193,17 @@ function createActivities({ io, clients }) {
         s.pos = Math.max(0, Number(ev.pos) || 0); s.ts = now;
       }
       warmMusicQueue(s.queue, s.index); // pre-resolve upcoming audio so skips start instantly
+    } else if (act.type === 'movie') {
+      if (ev.kind === 'set') {
+        const code = String(ev.code || '').trim().toUpperCase();
+        if (/^MOVIE-[A-Z0-9]{4}$/.test(code)) {
+          s.code = code;
+          s.server = String(ev.server || '').trim().slice(0, 120) || null;
+          s.title = String(ev.title || '').trim().slice(0, 120);
+        }
+      } else if (ev.kind === 'clear') {
+        s.code = null; s.server = null; s.title = '';
+      }
     }
   }
 

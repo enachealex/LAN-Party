@@ -5,6 +5,7 @@ import React, { useEffect, useRef, useState } from 'react'
 // entry here + a view below + a reducer branch on the server.
 export const ACTIVITY_TYPES = [
   { id: 'music', label: 'Music', icon: '🎵', hint: 'Queue songs — everyone hears them in sync' },
+  { id: 'movie', label: 'Movie Night', icon: '🍿', hint: 'Watch a film together in Vault Movies' },
   { id: 'sketch', label: 'Sketch & Guess', icon: '✏️', hint: 'Draw the word — friends race to guess it' },
   { id: 'watch', label: 'Watch Together', icon: '🎬', hint: 'Watch a YouTube video in sync' },
   { id: 'whiteboard', label: 'Whiteboard', icon: '🎨', hint: 'Draw on a shared canvas' },
@@ -36,6 +37,7 @@ export default function ActivityPanel({ activity, me, onEvent, onClose }) {
       </div>
       <div className="activity-body">
         {type === 'music' && <MusicActivity state={state} me={me} onEvent={onEvent} />}
+        {type === 'movie' && <MovieNight state={state} onEvent={onEvent} />}
         {type === 'watch' && <WatchTogether state={state} onEvent={onEvent} />}
         {type === 'whiteboard' && <Whiteboard state={state} onEvent={onEvent} />}
         {type === 'poll' && <PollActivity state={state} me={me} onEvent={onEvent} />}
@@ -664,6 +666,61 @@ function Whiteboard({ state, onEvent }) {
 }
 
 // ---- Quick Poll ----
+// ---- Movie Night (Vault Movies watch party) ----
+// The film itself plays in everyone's Vault Movies desktop app — LAN Party carries the room
+// so the whole call can hop in with one click while voice chat stays here.
+const VAULT_PUBLIC_HOST = 'party.thejumpvault.com'
+const VAULT_DOWNLOAD = 'https://github.com/enachealex/Vault-Player/releases/latest/download/VideoPlayer-win-Setup.exe'
+
+// Accept a bare room code, an invite link (https://…/join/MOVIE-XXXX?server=…), or a
+// vaultmovies:// launch link. Returns { code, server } or null.
+function parseMovieInvite(input) {
+  const s = String(input || '').trim()
+  if (!s) return null
+  const code = (s.match(/MOVIE-[A-Za-z0-9]{4}/i) || [])[0]
+  if (!code) return null
+  const server = (s.match(/[?&]server=([^&\s]+)/i) || [])[1]
+  return { code: code.toUpperCase(), server: server ? decodeURIComponent(server) : null }
+}
+
+function MovieNight({ state, onEvent }) {
+  const [invite, setInvite] = useState('')
+  const [title, setTitle] = useState('')
+  if (!state.code) {
+    const parsed = parseMovieInvite(invite)
+    return (
+      <div className="movie-activity">
+        <div className="poll-setup">
+          <div className="poll-setup-title">Share your Vault Movies room</div>
+          <div className="movie-hint">
+            Host a Watch Party in Vault Movies, hit <b>Invite link</b> (or copy the room code),
+            and paste it here — everyone in the call gets a one-click Join.
+          </div>
+          <input className="poll-q" placeholder="Invite link or room code (MOVIE-XXXX)" value={invite} onChange={(e) => setInvite(e.target.value)} />
+          <input className="poll-q" placeholder="What are you watching? (optional)" maxLength={120} value={title} onChange={(e) => setTitle(e.target.value)} />
+          <button type="button" className="poll-create" disabled={!parsed} onClick={() => onEvent({ kind: 'set', code: parsed.code, server: parsed.server, title: title.trim() })}>Start movie night</button>
+        </div>
+      </div>
+    )
+  }
+  const server = state.server || VAULT_PUBLIC_HOST
+  const launch = `vaultmovies://join?code=${encodeURIComponent(state.code)}&server=${encodeURIComponent(server)}`
+  return (
+    <div className="movie-activity">
+      <div className="movie-card">
+        <div className="movie-emoji">🍿</div>
+        <div className="movie-title">{state.title || 'Movie night'}</div>
+        <div className="movie-code">{state.code}</div>
+        <a className="movie-join" href={launch}>Open in Vault Movies</a>
+        <div className="movie-foot">
+          <a className="movie-get" href={VAULT_DOWNLOAD} target="_blank" rel="noreferrer">Don&apos;t have Vault Movies?</a>
+          <button type="button" className="movie-change" onClick={() => onEvent({ kind: 'clear' })}>Change room</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PollActivity({ state, me, onEvent }) {
   const [q, setQ] = useState('')
   const [opts, setOpts] = useState(['', ''])

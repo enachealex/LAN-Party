@@ -11,7 +11,7 @@ const fakeIo = () => ({ to: () => ({ emit() {} }), sockets: { adapter: { rooms: 
 describe('activities', () => {
   test('every advertised type initialises to a usable state', () => {
     const a = createActivities({ io: fakeIo(), clients: {} });
-    assert.deepEqual(a.ACTIVITY_TYPES, ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music']);
+    assert.deepEqual(a.ACTIVITY_TYPES, ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music', 'movie']);
     for (const type of a.ACTIVITY_TYPES) {
       assert.ok(a.activityInit(type), `${type} should initialise`);
     }
@@ -26,6 +26,7 @@ describe('activities', () => {
     assert.equal(a.activityInit('music').dj, null, 'music starts with nobody as DJ');
     assert.equal(a.activityInit('music').index, -1);
     assert.equal(a.activityInit('watch').playing, false);
+    assert.equal(a.activityInit('movie').code, null, 'movie starts with no room shared');
   });
 
   test('unknown activity types fall back to an empty state rather than throwing', () => {
