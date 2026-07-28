@@ -7,6 +7,12 @@ export interface ProfileBorder {
   color?: string
   width?: number
   style?: string
+  /**
+   * User's explicit colour override, applied on top of whichever preset is selected. Kept separate
+   * from `color` because `color` carries a default for every profile (so it can't signal intent),
+   * whereas an empty `tint` unambiguously means "use the preset's own colour".
+   */
+  tint?: string
 }
 
 export interface ProfileNameStyle {
@@ -26,6 +32,10 @@ export interface ProfileTag {
 export interface Profile {
   avatarUrl?: string
   overlay?: string
+  /** Colour override for the animation overlay; empty means use the theme accent. */
+  overlayColor?: string
+  /** Url (/entrances/…) of a short self-recording that plays for others when you join voice chat. */
+  entranceSound?: string
   border?: ProfileBorder
   statusMessage?: string
   bio?: string
@@ -87,7 +97,9 @@ export const NAME_STYLES: NameStylePreset[] = [
 export const DEFAULT_PROFILE = {
   avatarUrl: '',
   overlay: 'none',
-  border: { preset: 'none', color: '#f5c451', width: 3, style: 'solid' },
+  overlayColor: '',
+  entranceSound: '',
+  border: { preset: 'none', color: '#f5c451', width: 3, style: 'solid', tint: '' },
   statusMessage: '',
   bio: '',
   tags: [] as ProfileTag[],
@@ -104,6 +116,30 @@ export function normalizeProfile(p: Profile = {}) {
     nameStyle: { ...DEFAULT_PROFILE.nameStyle, ...(p.nameStyle || {}) },
     tags: Array.isArray(p.tags) ? p.tags : [],
   }
+}
+
+/**
+ * Resolve a profile's border down to concrete CSS values. A preset supplies colour/width/style;
+ * `tint`, when set, overrides just the colour. Shared so the editor preview and the rendered avatar
+ * always agree.
+ */
+export function resolveBorder(border?: ProfileBorder | null) {
+  const b = border || {}
+  const presetDef = BORDER_PRESETS.find((p) => p.id === b.preset)
+  const usePreset = !!b.preset && b.preset !== 'custom' && !!presetDef
+  return {
+    color: b.tint || (usePreset ? presetDef!.color : (b.color || 'transparent')),
+    width: usePreset ? presetDef!.width : (Number(b.width) || 0),
+    style: usePreset ? presetDef!.style : (b.style || 'solid'),
+  }
+}
+
+/** The colour a preset shows by default — what the colour picker should start from. */
+export function borderPresetColor(border?: ProfileBorder | null) {
+  const b = border || {}
+  const presetDef = BORDER_PRESETS.find((p) => p.id === b.preset)
+  if (b.preset === 'custom' || !presetDef) return b.color || '#f5c451'
+  return presetDef.color === 'transparent' ? '#f5c451' : presetDef.color
 }
 
 // Build the inline style for a username given its profile name styling. The '--flash' custom

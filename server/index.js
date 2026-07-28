@@ -69,6 +69,10 @@ async function main() {
   // served sandboxed below so their JS can't touch the LAN Party session.
   const appBundlesDir = path.join(DATA_DIR, 'app-bundles');
   fs.mkdirSync(appBundlesDir, { recursive: true });
+  // Per-user voice-chat entrance clips ("walk-on" sounds). Persistent (outside /uploads) — these are
+  // part of a profile, so they must outlive the 7-day upload sweep.
+  const entrancesDir = path.join(DATA_DIR, 'entrances');
+  fs.mkdirSync(entrancesDir, { recursive: true });
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -103,6 +107,19 @@ async function main() {
       },
     }),
     limits: { fileSize: MAX_UPLOAD_SIZE },
+  });
+
+  // Voice-chat entrance clips: a few seconds of recorded audio, so the cap is small.
+  const ENTRANCE_MAX_BYTES = 2 * 1024 * 1024;
+  const entranceUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, entrancesDir),
+      filename: (_req, file, cb) => {
+        const ext = (path.extname(file.originalname || '').match(/^\.[a-zA-Z0-9]{1,5}$/) || ['.webm'])[0];
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`);
+      },
+    }),
+    limits: { fileSize: ENTRANCE_MAX_BYTES },
   });
 
   // Screenshots on feedback/bug reports — images only, capped at 15 MB, stored persistently.
@@ -168,6 +185,7 @@ async function main() {
   // letting it fall through to the GIF-list API route below.
   app.use('/gifs', express.static(gifsDir, { redirect: false }));
   app.use('/sounds', express.static(soundsDir, { redirect: false }));
+  app.use('/entrances', express.static(entrancesDir, { redirect: false }));
   // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
@@ -389,6 +407,7 @@ async function main() {
       avatarUrl: p.avatarUrl || '',
       border: p.border || null,
       overlay: p.overlay || null,
+      overlayColor: p.overlayColor || '',
       nameStyle: p.nameStyle || null,
       nameFont: p.nameFont || null,
       tags: Array.isArray(p.tags) ? p.tags : [],
@@ -432,6 +451,65 @@ async function main() {
     if (!user) return res.status(404).json({ error: 'User not found' });
     await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(settings), username);
     return res.json({ success: true, settings });
+  });
+
+  // Read the caller's stored entrance-clip url (used to clean up the file it replaces).
+  async function currentEntranceUrl(username) {
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    const url = s.profile?.entranceSound;
+    return typeof url === 'string' && url.startsWith('/entrances/') ? url : '';
+  }
+
+  // Delete a file under entrancesDir, given its public /entrances/<name> url.
+  function removeEntranceFile(url) {
+    if (!url || !url.startsWith('/entrances/')) return;
+    const target = path.resolve(entrancesDir, path.basename(url));
+    if (!target.startsWith(entrancesDir + path.sep)) return; // never step outside the folder
+    fs.promises.unlink(target).catch(() => { /* already gone */ });
+  }
+
+  // Upload the caller's voice-chat entrance clip (a short self-recording that plays for everyone
+  // else when they join a voice channel). Returns the url to store on the profile; the previous
+  // clip is deleted so these can't pile up.
+  app.post('/profile/entrance-sound', authMiddleware, (req, res) => {
+    entranceUpload.single('clip')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Clip is larger than 2 MB' });
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      if (!req.file) return res.status(400).json({ error: 'Missing clip' });
+      const type = (req.file.mimetype || '').toLowerCase();
+      const ext = (path.extname(req.file.originalname || '').replace('.', '') || '').toLowerCase();
+      const AUDIO_EXTS = ['webm', 'ogg', 'oga', 'mp3', 'm4a', 'aac', 'wav', 'opus', 'weba'];
+      if (!type.startsWith('audio/') && !type.startsWith('video/webm') && !AUDIO_EXTS.includes(ext)) {
+        fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(400).json({ error: 'Entrance clip must be an audio recording' });
+      }
+      const previous = await currentEntranceUrl(req.user.username);
+      const url = `/entrances/${req.file.filename}`;
+      // Persist straight onto the profile so the clip survives even if the user never hits Save.
+      const row = await db.get('SELECT settings FROM users WHERE username = ?', req.user.username);
+      let s = {};
+      try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+      s.profile = { ...(s.profile || {}), entranceSound: url };
+      await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(s), req.user.username);
+      if (previous && previous !== url) removeEntranceFile(previous);
+      return res.json({ success: true, url });
+    });
+  });
+
+  // Remove the caller's entrance clip (file + profile field).
+  app.delete('/profile/entrance-sound', authMiddleware, async (req, res) => {
+    const previous = await currentEntranceUrl(req.user.username);
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', req.user.username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    if (s.profile) { s.profile = { ...s.profile, entranceSound: '' }; }
+    await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(s), req.user.username);
+    if (previous) removeEntranceFile(previous);
+    return res.json({ success: true });
   });
 
   // Change the current user's username. Username is used as a natural key across many tables, so the
@@ -483,6 +561,7 @@ async function main() {
       status: row.presence_status,
       profile: {
         avatarUrl: p.avatarUrl || '', border: p.border || null, overlay: p.overlay || null,
+        overlayColor: p.overlayColor || '',
         nameStyle: p.nameStyle || null, nameFont: p.nameFont || null, tags: Array.isArray(p.tags) ? p.tags : [],
         statusMessage: p.statusMessage || '', bio: p.bio || '',
       },
@@ -1003,14 +1082,21 @@ async function main() {
     socket.on('collab:leave', ({ sessionId } = {}) => { if (sessionId) socket.leave(`collab:${sessionId}`); });
 
     // Voice signaling: simple mesh signaling via server
-    socket.on('voice:join', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+    socket.on('voice:join', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
       const room = `voice:${serverId}:${channelId}`;
       socket.join(room);
       const roomSet = io.sockets.adapter.rooms.get(room) || new Set();
       const peers = Array.from(roomSet).filter(id => id !== socket.id).map(id => ({ id, name: clients[id]?.name || 'Anon' }));
       socket.emit('voice:peers', peers);
-      socket.to(room).emit('voice:peer-joined', { id: socket.id, name: clients[socket.id]?.name });
       socket.emit('activity:update', activityViewFor(activities[room], socket.id) || null); // late-joiners get the current activity (word redacted)
+      // The joiner's entrance clip is read from the DB, never taken from the client — otherwise a
+      // socket could make everyone else in the room fetch and play an arbitrary url.
+      let entranceSound = '';
+      if (socketUser) {
+        try { entranceSound = await currentEntranceUrl(socketUser); }
+        catch (err) { console.warn('entrance lookup failed', err && err.message); }
+      }
+      socket.to(room).emit('voice:peer-joined', { id: socket.id, name: clients[socket.id]?.name, entranceSound });
     });
 
     socket.on('voice:leave', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {

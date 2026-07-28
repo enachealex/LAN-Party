@@ -506,7 +506,9 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .emoji-cell-tone::after{content:"";position:absolute;right:3px;bottom:3px;width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,.4)}
 .emoji-cell-custom img{width:28px;height:28px;object-fit:contain;display:block}
 .emoji-empty{grid-column:1 / -1;padding:8px 4px;color:var(--muted);font-size:12px}
-.emoji-tone-menu,.emoji-context-menu{position:absolute;background:#13202c;border:1px solid rgba(255,255,255,.14);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:70}
+/* Right-click menus are portaled to <body> (see FloatingMenu.jsx) so an overflow:hidden picker
+   can't clip them near an edge; fixed + top z-index keeps them above every other layer. */
+.emoji-tone-menu,.emoji-context-menu{position:fixed;background:#13202c;border:1px solid rgba(255,255,255,.14);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:9600}
 .emoji-tone-menu{display:flex;gap:2px;padding:5px}
 .emoji-tone-option{width:30px;height:30px;border:none;background:transparent;border-radius:7px;font-size:20px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .emoji-tone-option:hover{background:rgba(255,255,255,.12)}
@@ -637,12 +639,12 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .pfp-img{width:100%;height:100%;object-fit:cover;display:block}
 .pfp-initial{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff}
 .pfp-fx{position:absolute;inset:-3px;border-radius:50%;pointer-events:none}
-.pfp-overlay-glow .pfp-fx{box-shadow:0 0 12px 3px var(--accent-end);animation:pfp-glow 2s ease-in-out infinite}
-.pfp-overlay-pulse .pfp-fx{box-shadow:0 0 0 0 var(--accent-end);animation:pfp-pulse 1.8s ease-out infinite}
-.pfp-overlay-ring .pfp-fx{inset:-4px;border:2px solid transparent;border-top-color:var(--accent-start);border-right-color:var(--accent-end);animation:pfp-spin 1.4s linear infinite}
-.pfp-overlay-sparkle .pfp-fx{background:radial-gradient(circle at 80% 15%,#fff 0,transparent 9%),radial-gradient(circle at 20% 80%,#fff 0,transparent 7%);animation:pfp-sparkle 1.6s ease-in-out infinite}
-@keyframes pfp-glow{0%,100%{box-shadow:0 0 8px 2px var(--accent-end)}50%{box-shadow:0 0 16px 5px var(--accent-end)}}
-@keyframes pfp-pulse{0%{box-shadow:0 0 0 0 rgba(43,195,255,.6)}100%{box-shadow:0 0 0 10px rgba(43,195,255,0)}}
+.pfp-overlay-glow .pfp-fx{box-shadow:0 0 12px 3px var(--pfp-fx,var(--accent-end));animation:pfp-glow 2s ease-in-out infinite}
+.pfp-overlay-pulse .pfp-fx{box-shadow:0 0 0 0 var(--pfp-fx,var(--accent-end));animation:pfp-pulse 1.8s ease-out infinite}
+.pfp-overlay-ring .pfp-fx{inset:-4px;border:2px solid transparent;border-top-color:var(--pfp-fx,var(--accent-start));border-right-color:var(--pfp-fx,var(--accent-end));animation:pfp-spin 1.4s linear infinite}
+.pfp-overlay-sparkle .pfp-fx{background:radial-gradient(circle at 80% 15%,var(--pfp-fx,#fff) 0,transparent 9%),radial-gradient(circle at 20% 80%,var(--pfp-fx,#fff) 0,transparent 7%);animation:pfp-sparkle 1.6s ease-in-out infinite}
+@keyframes pfp-glow{0%,100%{box-shadow:0 0 8px 2px var(--pfp-fx,var(--accent-end))}50%{box-shadow:0 0 16px 5px var(--pfp-fx,var(--accent-end))}}
+@keyframes pfp-pulse{0%{box-shadow:0 0 0 0 var(--pfp-fx,rgba(43,195,255,.6))}100%{box-shadow:0 0 0 10px transparent}}
 @keyframes pfp-spin{to{transform:rotate(360deg)}}
 @keyframes pfp-sparkle{0%,100%{opacity:.25}50%{opacity:1}}
 
@@ -665,6 +667,13 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .profile-inline-label{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
 .profile-inline-label input[type="color"]{width:36px;height:28px;border:none;padding:0;background:transparent}
 .profile-link-btn{border:none;background:none;color:var(--accent-end);cursor:pointer;font:inherit;text-decoration:underline}
+.profile-hint{font-size:12.5px;color:var(--muted);margin:0 0 12px}
+/* Voice-chat entrance clip recorder */
+.entrance-recorder{margin-bottom:4px}
+.entrance-stop{background:#f23f43;border-color:#f23f43}
+.entrance-status{font-size:12px;color:var(--muted)}
+.entrance-recording-bar{height:4px;border-radius:2px;background:rgba(255,255,255,.12);overflow:hidden;margin:8px 0}
+.entrance-recording-bar span{display:block;height:100%;background:#f23f43;transition:width .1s linear}
 .profile-chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
 .profile-chip{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:var(--text);font-size:13px;font-weight:600;padding:6px 12px;border-radius:999px;cursor:pointer}
 .profile-chip:hover{background:rgba(255,255,255,.09)}

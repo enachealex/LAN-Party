@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Grid } from '@giphy/react-components'
+import FloatingMenu from './FloatingMenu'
 
 // GIF picker shown above the composer (opened from the GIF button next to Emoji).
 // Sections: 'giphy' (search the Giphy library) and 'custom' (the shared uploaded library).
@@ -14,6 +15,8 @@ export default function GifPicker({
   onClose,
 }) {
   const rootRef = useRef(null)
+  // Portaled right-click menu node — exempt from the outside-click close (see FloatingMenu).
+  const menuRef = useRef(null)
   const gifUploadRef = useRef(null)
   const giphyGridWrapRef = useRef(null)
   const [section, setSection] = useState('giphy')
@@ -31,6 +34,7 @@ export default function GifPicker({
   // Close on outside click / Esc.
   useEffect(() => {
     const onDown = (e) => {
+      if (menuRef.current && menuRef.current.contains(e.target)) return // clicking a menu option
       if (rootRef.current && !rootRef.current.contains(e.target)) onClose?.()
     }
     const onKey = (e) => { if (e.key === 'Escape') { setGifMenu(null); onClose?.() } }
@@ -132,8 +136,7 @@ export default function GifPicker({
 
   const openGifMenu = (e, id) => {
     e.preventDefault()
-    const rect = rootRef.current.getBoundingClientRect()
-    setGifMenu({ id, x: e.clientX - rect.left, y: e.clientY - rect.top })
+    setGifMenu({ id, x: e.clientX, y: e.clientY }) // viewport coords; FloatingMenu clamps on screen
   }
   const deleteFromMenu = () => {
     if (gifMenu) onDeleteGif?.(gifMenu.id)
@@ -218,9 +221,9 @@ export default function GifPicker({
       </div>
 
       {gifMenu && (
-        <div className="emoji-context-menu" style={{ left: gifMenu.x, top: gifMenu.y }} role="menu">
+        <FloatingMenu x={gifMenu.x} y={gifMenu.y} className="emoji-context-menu" menuRef={menuRef}>
           <button type="button" className="danger" onClick={deleteFromMenu}>Remove GIF</button>
-        </div>
+        </FloatingMenu>
       )}
 
       {gifTooltip && (

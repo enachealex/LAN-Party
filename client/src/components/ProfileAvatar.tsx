@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react'
-import { BORDER_PRESETS, type Profile } from '../profileData'
+import { resolveBorder, type Profile } from '../profileData'
 
 interface ProfileAvatarProps {
   name?: string
@@ -18,17 +18,14 @@ export default function ProfileAvatar({ name = '?', profile = {}, size = 56, col
   const initial = (name || '?').slice(0, 1).toUpperCase()
   const overlay = profile.overlay && profile.overlay !== 'none' ? profile.overlay : null
 
-  // Resolve border: a preset, or custom values.
-  const b = profile.border || {}
-  const presetDef = BORDER_PRESETS.find((p) => p.id === b.preset)
-  const usePreset = b.preset && b.preset !== 'custom' && presetDef
-  const borderColor = usePreset ? presetDef.color : (b.color || 'transparent')
-  const borderWidth = usePreset ? presetDef.width : (Number(b.width) || 0)
-  const borderStyle = usePreset ? presetDef.style : (b.style || 'solid')
+  // Resolve border: a preset (optionally re-tinted), or fully custom values.
+  const { color: borderColor, width: borderWidth, style: borderStyle } = resolveBorder(profile.border)
 
   const src = profile.avatarUrl ? resolveSrc(profile.avatarUrl) : ''
 
+  // `--pfp-fx` colours the animated overlay; the CSS falls back to the theme accent when unset.
   const wrapStyle: CSSProperties = { width: size, height: size }
+  if (profile.overlayColor) (wrapStyle as Record<string, string>)['--pfp-fx'] = profile.overlayColor
   const innerStyle: CSSProperties = {
     borderColor,
     borderWidth,

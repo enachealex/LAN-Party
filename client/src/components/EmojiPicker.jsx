@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { EMOJI_GROUPS, SKIN_TONES, applySkinTone } from '../emojiData'
+import FloatingMenu from './FloatingMenu'
 
 // Icon shown in the shortcut strip for each standard group (first representative emoji).
 const GROUP_ICON = {
@@ -33,6 +34,9 @@ export default function EmojiPicker({
   const scrollRef = useRef(null)
   const uploadRef = useRef(null)
   const sectionRefs = useRef({})
+  // The open right-click menu's node. It's portaled outside this component, so the outside-click
+  // handler has to check it separately or clicking an option would close the whole picker first.
+  const menuRef = useRef(null)
   // Upload target: { scope: 'personal' } or { scope: 'server', serverId }.
   const uploadTargetRef = useRef({ scope: 'personal' })
   const [tab, setTab] = useState('emoji') // 'emoji' | 'personal' | 'server'
@@ -55,6 +59,7 @@ export default function EmojiPicker({
   // Close on outside click / Esc.
   useEffect(() => {
     const onDown = (e) => {
+      if (menuRef.current && menuRef.current.contains(e.target)) return // clicking a menu option
       if (rootRef.current && !rootRef.current.contains(e.target)) onClose?.()
     }
     const onKey = (e) => { if (e.key === 'Escape') { setToneMenu(null); onClose?.() } }
@@ -73,11 +78,12 @@ export default function EmojiPicker({
     return applySkinTone(item.e, tone.modifier)
   }
 
+  // Viewport coords — FloatingMenu portals to <body> and clamps itself on screen.
   const openToneMenu = (e, item) => {
     e.preventDefault()
     if (!item.tone) return
-    const rect = rootRef.current.getBoundingClientRect()
-    setToneMenu({ base: item.e, x: e.clientX - rect.left, y: e.clientY - rect.top })
+    setCustomMenu(null)
+    setToneMenu({ base: item.e, x: e.clientX, y: e.clientY })
   }
 
   const chooseTone = (toneKey) => {
@@ -110,8 +116,8 @@ export default function EmojiPicker({
 
   const openCustomMenu = (e, name, scope, serverId) => {
     e.preventDefault()
-    const rect = rootRef.current.getBoundingClientRect()
-    setCustomMenu({ name, scope, serverId, x: e.clientX - rect.left, y: e.clientY - rect.top })
+    setToneMenu(null)
+    setCustomMenu({ name, scope, serverId, x: e.clientX, y: e.clientY })
   }
   const deleteFromMenu = () => {
     if (!customMenu) return
@@ -219,19 +225,19 @@ export default function EmojiPicker({
       </div>
 
       {toneMenu && (
-        <div className="emoji-tone-menu" style={{ left: toneMenu.x, top: toneMenu.y }} role="menu">
+        <FloatingMenu x={toneMenu.x} y={toneMenu.y} className="emoji-tone-menu" menuRef={menuRef}>
           {SKIN_TONES.map((tone) => (
             <button key={tone.key} type="button" className="emoji-tone-option" onClick={() => chooseTone(tone.key)} title={tone.label}>
               {applySkinTone(toneMenu.base, tone.modifier)}
             </button>
           ))}
-        </div>
+        </FloatingMenu>
       )}
 
       {customMenu && (
-        <div className="emoji-context-menu" style={{ left: customMenu.x, top: customMenu.y }} role="menu">
+        <FloatingMenu x={customMenu.x} y={customMenu.y} className="emoji-context-menu" menuRef={menuRef}>
           <button type="button" className="danger" onClick={deleteFromMenu}>Delete emoji</button>
-        </div>
+        </FloatingMenu>
       )}
 
       {pendingUpload && (

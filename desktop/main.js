@@ -28,9 +28,12 @@ function hideToTray() {
   }
 }
 
+// Bring the window back from ANY hidden state. Order matters: a hidden window can't be focused into
+// view, and a minimized one needs restore() first — so show() + restore() both run before focus().
 function showFromTray() {
-  if (!mainWindow) return
+  if (!mainWindow || mainWindow.isDestroyed()) return
   if (process.platform === 'win32') mainWindow.setSkipTaskbar(false)
+  if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
   mainWindow.focus()
   mainWindow.webContents.send('app:visibility', true) // renderer tears the overlay down
@@ -75,17 +78,25 @@ ipcMain.on('overlay:resize', (_e, { dw, dh } = {}) => {
 
 function createTray() {
   if (tray) return
-  let img = nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.png'))
-  if (!img.isEmpty()) img = img.resize({ width: 16, height: 16 })
-  tray = new Tray(img)
-  tray.setToolTip('LAN Party')
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Show LAN Party', click: showFromTray },
-    { type: 'separator' },
-    { label: 'Quit LAN Party', click: () => { isQuitting = true; app.quit() } },
-  ]))
-  tray.on('click', showFromTray)
-  tray.on('double-click', showFromTray)
+  // If the tray can't be created there is no way back from a hidden window, so failure is recorded
+  // (tray stays null) and the close handler then lets the window close normally instead of trapping
+  // the app in an invisible state.
+  try {
+    let img = nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.png'))
+    if (!img.isEmpty()) img = img.resize({ width: 16, height: 16 })
+    tray = new Tray(img)
+    tray.setToolTip('LAN Party — click to reopen')
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Show LAN Party', click: showFromTray },
+      { type: 'separator' },
+      { label: 'Quit LAN Party', click: () => { isQuitting = true; app.quit() } },
+    ]))
+    tray.on('click', showFromTray)
+    tray.on('double-click', showFromTray)
+  } catch (err) {
+    tray = null
+    console.error('[tray] could not create tray icon; closing will quit instead of hiding:', err && err.message)
+  }
 }
 
 function createWindow() {
@@ -111,9 +122,10 @@ function createWindow() {
   mainWindow.loadURL(APP_URL)
   mainWindow.on('closed', () => { mainWindow = null })
 
-  // Closing the window hides it to the tray (keeps calls/chat alive) instead of quitting.
+  // Closing the window hides it to the tray (keeps calls/chat alive) instead of quitting. Without a
+  // tray icon there'd be no way to get the window back, so in that case let the close proceed.
   mainWindow.on('close', (e) => {
-    if (!isQuitting) { e.preventDefault(); hideToTray() }
+    if (!isQuitting && tray) { e.preventDefault(); hideToTray() }
   })
 
   // Keep app + OAuth flows inside the window; send everything else (links people paste in chat,
@@ -189,12 +201,10 @@ const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
-  })
+  // Relaunching from the shortcut/taskbar while we're hidden in the tray must bring the app BACK —
+  // this is how most people "reopen" it, and focus() alone can't reveal a hidden window, which made
+  // the app look like it had quit.
+  app.on('second-instance', () => { showFromTray() })
 
   app.whenReady().then(() => {
     configureMedia()
@@ -212,5 +222,7 @@ if (!gotLock) {
 
   // Do NOT quit when the window is closed — the app lives in the tray and keeps running so the user
   // stays in their call. Quitting happens only via the tray menu / auto-update / before-quit.
-  app.on('window-all-closed', () => { /* stay resident in the tray */ })
+  // Exception: with no tray icon there's nothing left to interact with, so don't linger as a
+  // process the user can't see or reach.
+  app.on('window-all-closed', () => { if (!tray) app.quit() })
 }

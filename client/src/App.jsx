@@ -24,8 +24,9 @@ import { COLOR_SCHEMES, matchSchemeId } from './colorSchemes'
 import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
-import { playUiSound, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
-import { normalizeProfile, nameStyleToCss, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
+import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
+import EntranceSoundRecorder from './components/EntranceSoundRecorder'
+import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
 import { SfuSession } from './sfu'
 
@@ -1944,6 +1945,54 @@ export default function App() {
   const updateProfileDraft = (patch) => setEditingProfile((p) => ({ ...(p || {}), ...patch }))
   const updateProfileBorder = (patch) => setEditingProfile((p) => ({ ...(p || {}), border: { ...(p?.border || {}), ...patch } }))
 
+  // Switching a cosmetic preset drops any colour override, so the newly picked preset shows in its
+  // own colours; the user can then re-tint it deliberately.
+  const selectBorderPreset = (preset) => updateProfileBorder({ preset, tint: '' })
+  const selectOverlay = (overlay) => updateProfileDraft({ overlay, overlayColor: '' })
+  const selectNameStyle = (id) => updateProfileDraft({ nameStyle: { id, color: '', from: '', to: '' } })
+  const updateNameStyle = (patch) => setEditingProfile((p) => ({ ...(p || {}), nameStyle: { ...(p?.nameStyle || {}), ...patch } }))
+
+  // Voice-chat entrance clip. The server stores it straight onto the profile (so it survives even if
+  // the user closes the editor without saving) and returns the url to mirror into the draft.
+  const [entranceBusy, setEntranceBusy] = useState(false)
+  const uploadEntranceSound = async (blob) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t || !blob) return
+    setEntranceBusy(true)
+    try {
+      const fd = new FormData()
+      // Name it with an extension so the server can sanity-check the type.
+      const ext = (blob.type || '').includes('ogg') ? 'ogg' : 'webm'
+      fd.append('clip', blob, `entrance.${ext}`)
+      const res = await fetch(`${SERVER_URL}/profile/entrance-sound`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not save the clip')
+      updateProfileDraft({ entranceSound: data.url })
+      setProfile((p) => ({ ...(p || {}), entranceSound: data.url }))
+      playUiSound('success')
+      setToast('Entrance sound saved')
+    } catch (err) {
+      alert(err.message || 'Could not save the entrance clip')
+    } finally {
+      setEntranceBusy(false)
+    }
+  }
+
+  const removeEntranceSound = async () => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) return
+    setEntranceBusy(true)
+    try {
+      await fetch(`${SERVER_URL}/profile/entrance-sound`, { method: 'DELETE', headers: { Authorization: `Bearer ${t}` } })
+      updateProfileDraft({ entranceSound: '' })
+      setProfile((p) => ({ ...(p || {}), entranceSound: '' }))
+    } catch (err) {
+      console.warn('removeEntranceSound failed', err)
+    } finally {
+      setEntranceBusy(false)
+    }
+  }
+
   const uploadProfileAvatar = async (file) => {
     const t = token || localStorage.getItem('lanparty_token')
     if (!t || !file) return
@@ -2382,10 +2431,15 @@ export default function App() {
       if (!sfuRef.current) { for (const p of peers) createPeer(p.id) }
       setInVoice(true)
     })
-    s.on('voice:peer-joined', ({ id, name: peerName }) => {
+    s.on('voice:peer-joined', ({ id, name: peerName, entranceSound }) => {
       // The newcomer offers to us; we create our peer when their offer arrives (handleSignal).
       // Fires only for people arriving after us — the existing roster comes via voice:peers (silent).
-      if (id) { setPeerNames((prev) => ({ ...prev, [id]: peerName })); playUiSound('peerJoin') }
+      if (!id) return
+      setPeerNames((prev) => ({ ...prev, [id]: peerName }))
+      // Their own recorded entrance clip takes the place of the generic join blip. The url is
+      // supplied by the server (looked up from their profile), never by the joining client.
+      if (typeof entranceSound === 'string' && entranceSound.startsWith('/entrances/')) playUiClip(emojiSrc(entranceSound))
+      else playUiSound('peerJoin')
     })
     s.on('voice:signal', ({ from, signal }) => { if (!sfuRef.current) handleSignal(from, signal) })
     // Direct 1:1 friend calls
@@ -6446,47 +6500,114 @@ export default function App() {
               </div>
             ) : null}
 
-            {/* Border decoration */}
+            {/* Entrance sound — your own recording, played for others when you join voice chat */}
+            <h3 className="profile-settings-section-title">Entrance Sound</h3>
+            <EntranceSoundRecorder
+              url={editingProfile.entranceSound || ''}
+              onRecorded={uploadEntranceSound}
+              onRemove={removeEntranceSound}
+              resolveSrc={emojiSrc}
+              busy={entranceBusy}
+            />
+
+            {/* Border decoration — preset dropdown, with an optional colour re-tint */}
             <h3 className="profile-settings-section-title">Border Decoration</h3>
-            <div className="profile-chip-row">
-              {BORDER_PRESETS.map((bp) => (
-                <button key={bp.id} type="button" className={`profile-chip${editingProfile.border?.preset === bp.id ? ' active' : ''}`} onClick={() => updateProfileBorder({ preset: bp.id })}>{bp.label}</button>
-              ))}
-              <button type="button" className={`profile-chip${editingProfile.border?.preset === 'custom' ? ' active' : ''}`} onClick={() => updateProfileBorder({ preset: 'custom' })}>Custom</button>
+            <div className="profile-edit-row">
+              <select className="profile-select" value={editingProfile.border?.preset || 'none'} onChange={(e) => selectBorderPreset(e.target.value)} aria-label="Border decoration">
+                {BORDER_PRESETS.map((bp) => <option key={bp.id} value={bp.id}>{bp.label}</option>)}
+                <option value="custom">Custom…</option>
+              </select>
+              {(editingProfile.border?.preset || 'none') !== 'none' && (
+                <>
+                  <label className="profile-inline-label">Color
+                    <input
+                      type="color"
+                      value={editingProfile.border?.tint || borderPresetColor(editingProfile.border)}
+                      onChange={(e) => updateProfileBorder({ tint: e.target.value })}
+                      aria-label="Border color"
+                    />
+                  </label>
+                  {editingProfile.border?.tint && (
+                    <button type="button" className="profile-link-btn" onClick={() => updateProfileBorder({ tint: '' })}>Reset color</button>
+                  )}
+                </>
+              )}
             </div>
             {editingProfile.border?.preset === 'custom' && (
               <div className="profile-edit-row">
-                <label className="profile-inline-label">Color <input type="color" value={editingProfile.border.color || '#f5c451'} onChange={(e) => updateProfileBorder({ color: e.target.value })} /></label>
                 <label className="profile-inline-label">Width
                   <input type="range" min="0" max="8" value={editingProfile.border.width || 0} onChange={(e) => updateProfileBorder({ width: Number(e.target.value) })} />
                   <span>{editingProfile.border.width || 0}px</span>
                 </label>
-                <select className="profile-select" value={editingProfile.border.style || 'solid'} onChange={(e) => updateProfileBorder({ style: e.target.value })}>
+                <select className="profile-select" value={editingProfile.border.style || 'solid'} onChange={(e) => updateProfileBorder({ style: e.target.value })} aria-label="Border style">
                   {BORDER_STYLES.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
             )}
 
-            {/* Animation overlay */}
+            {/* Animation overlay — dropdown + colour */}
             <h3 className="profile-settings-section-title">Animation Overlay</h3>
-            <div className="profile-chip-row">
-              {AVATAR_OVERLAYS.map((o) => (
-                <button key={o.id} type="button" className={`profile-chip${editingProfile.overlay === o.id ? ' active' : ''}`} onClick={() => updateProfileDraft({ overlay: o.id })}>{o.label}</button>
-              ))}
+            <div className="profile-edit-row">
+              <select className="profile-select" value={editingProfile.overlay || 'none'} onChange={(e) => selectOverlay(e.target.value)} aria-label="Animation overlay">
+                {AVATAR_OVERLAYS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+              </select>
+              {(editingProfile.overlay || 'none') !== 'none' && (
+                <>
+                  <label className="profile-inline-label">Color
+                    <input
+                      type="color"
+                      value={editingProfile.overlayColor || editingSettings?.accentEnd || '#0b86ff'}
+                      onChange={(e) => updateProfileDraft({ overlayColor: e.target.value })}
+                      aria-label="Overlay color"
+                    />
+                  </label>
+                  {editingProfile.overlayColor && (
+                    <button type="button" className="profile-link-btn" onClick={() => updateProfileDraft({ overlayColor: '' })}>Reset color</button>
+                  )}
+                </>
+              )}
             </div>
 
-            {/* Name styling */}
+            {/* Name styling — font + style dropdowns, with colours for the chosen style */}
             <h3 className="profile-settings-section-title">Username Style</h3>
             <div className="profile-edit-row">
-              <select className="profile-select" value={editingProfile.nameFont} onChange={(e) => updateProfileDraft({ nameFont: e.target.value })}>
+              <select className="profile-select" value={editingProfile.nameFont} onChange={(e) => updateProfileDraft({ nameFont: e.target.value })} aria-label="Username font">
                 {NAME_FONTS.map((f) => <option key={f.id} value={f.id}>{f.label} font</option>)}
               </select>
+              <select className="profile-select" value={editingProfile.nameStyle?.id || 'plain'} onChange={(e) => selectNameStyle(e.target.value)} aria-label="Username style">
+                {NAME_STYLES.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+              </select>
             </div>
-            <div className="profile-chip-row">
-              {NAME_STYLES.map((s) => (
-                <button key={s.id} type="button" className={`profile-chip${editingProfile.nameStyle?.id === s.id ? ' active' : ''}`} onClick={() => updateProfileDraft({ nameStyle: { ...editingProfile.nameStyle, id: s.id } })}>{s.label}</button>
-              ))}
-            </div>
+            {(() => {
+              const styleId = editingProfile.nameStyle?.id || 'plain'
+              const preset = NAME_STYLES.find((s) => s.id === styleId) || NAME_STYLES[0]
+              const ns = editingProfile.nameStyle || {}
+              const dirty = ns.color || ns.from || ns.to
+              if (preset.kind === 'flashy') {
+                return <div className="profile-hint">Rainbow cycles through colors on its own.</div>
+              }
+              return (
+                <div className="profile-edit-row">
+                  {preset.kind === 'gradient' ? (
+                    <>
+                      <label className="profile-inline-label">From
+                        <input type="color" value={ns.from || preset.from || '#2bc3ff'} onChange={(e) => updateNameStyle({ from: e.target.value })} aria-label="Gradient start color" />
+                      </label>
+                      <label className="profile-inline-label">To
+                        <input type="color" value={ns.to || preset.to || '#a855f7'} onChange={(e) => updateNameStyle({ to: e.target.value })} aria-label="Gradient end color" />
+                      </label>
+                    </>
+                  ) : (
+                    <label className="profile-inline-label">Color
+                      <input type="color" value={ns.color || preset.color || editingSettings?.fontColor || '#edf6ff'} onChange={(e) => updateNameStyle({ color: e.target.value })} aria-label="Username color" />
+                    </label>
+                  )}
+                  {dirty && (
+                    <button type="button" className="profile-link-btn" onClick={() => updateNameStyle({ color: '', from: '', to: '' })}>Reset color</button>
+                  )}
+                </div>
+              )
+            })()}
             </div>
             )}
 

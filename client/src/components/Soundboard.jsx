@@ -145,7 +145,7 @@ export default function Soundboard({
       </div>
 
       {menu && createPortal(
-        <div ref={menuRef} className="emoji-context-menu" style={{ position: 'fixed', left: menu.x, top: menu.y, zIndex: 2000 }} role="menu">
+        <div ref={menuRef} className="emoji-context-menu" style={{ left: menu.x, top: menu.y }} role="menu">
           <button type="button" onClick={playFromMenu}>Play</button>
           <button type="button" onClick={startRename}>Rename</button>
           <button type="button" className="danger" onClick={deleteFromMenu}>Remove</button>

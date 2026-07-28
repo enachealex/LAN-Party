@@ -69,6 +69,20 @@ const SOUNDS = {
   toggle:     (c, t) => tone(c, { freq: 620, start: t, dur: 0.05, type: 'square', gain: 0.07 }),
 }
 
+/**
+ * Play a recorded audio file (e.g. someone's voice-chat entrance clip) through the same enable
+ * toggle + volume as the synthesized cues. Uses an <audio> element rather than the oscillator graph
+ * because the source is a real file. Never throws.
+ */
+export function playUiClip(url) {
+  if (!enabled || !url) return
+  try {
+    const el = new Audio(url)
+    el.volume = volume
+    el.play().catch(() => { /* autoplay blocked until the user interacts — fine */ })
+  } catch (_) { /* unsupported */ }
+}
+
 /** Play a named cue. No-ops when disabled, unsupported, or the name is unknown. Never throws. */
 export function playUiSound(name) {
   if (!enabled) return
