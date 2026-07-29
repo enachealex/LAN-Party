@@ -26,6 +26,7 @@ import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
 import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
+import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
 import { SfuSession } from './sfu'
@@ -904,6 +905,12 @@ export default function App() {
   const [showInstallPanel, setShowInstallPanel] = useState(false)
   // Hide browser "Download App" / PWA install UI when already running inside the Electron desktop shell.
   const isDesktopApp = typeof window !== 'undefined' && !!window.desktop?.isElectron
+  // Phone layout: the left nav (server rail + channel list) collapses into a drawer.
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  // On a mobile browser we push the installed (home-screen) app instead of the tab. Computed once:
+  // these facts can't change without a reload, except the dismissal, which is state.
+  const [installGateSkipped, setInstallGateSkipped] = useState(() => installGateDismissed())
+  const [installedNow, setInstalledNow] = useState(false)
   // Public app directory modal.
   const [showAppDirectory, setShowAppDirectory] = useState(false)
   // The embeddable app currently open in the in-app sandboxed viewer (null = closed).
@@ -2956,6 +2963,9 @@ export default function App() {
 
   const joinChannel = (channelId) => {
     if (!socket) return
+    // On phones the nav is a drawer over the chat: reveal the chat even when this channel was already
+    // the active one (in which case the state-change effect below wouldn't fire).
+    setMobileNavOpen(false)
     setActiveChannel(channelId)
     setMessages([]) // drop the previous channel's messages so the scroll-to-bottom runs on fresh content
     const serverId = currentServerId()
@@ -2999,6 +3009,10 @@ export default function App() {
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [])
+
+  // Phone drawer: any navigation (server, channel or DM) closes it so the chat is revealed. Covers
+  // every entry point at once instead of threading a close call through each handler.
+  useEffect(() => { setMobileNavOpen(false) }, [selectedServerId, activeChannel, homeChat])
 
   // Unlock synthesized UI sounds on the first user gesture (browsers suspend audio until then), and
   // give a soft click on any button/link press so interactions don't feel dead. playUiSound() itself
@@ -4354,6 +4368,7 @@ export default function App() {
     // Capture unread count before it's cleared so the scroll lands on the first unread message.
     pendingUnreadScrollRef.current = unreadByChatId[chatId] || 0
     setShowMembersPanel(false)
+    setMobileNavOpen(false) // reveal the conversation on phones, even if it was already selected
     clearPendingAttachment()
     setHomeChat({ type, id: chatId, name: item.name, peerUsername })
     if (type === 'friend') {
@@ -5063,8 +5078,24 @@ export default function App() {
     !regUsernameError &&
     !regEmailError;
 
+  // Steer phones/tablets to the installed app. Skipped in the Electron shell, when already running
+  // standalone (installed), and once the user opts to continue in the browser for this session.
+  const showInstallGate = !isDesktopApp && !isStandalone() && !installedNow && !installGateSkipped
+    && detectPlatform().isMobile
+
   return (
-    <div className="app">
+    <div className={`app${mobileNavOpen ? ' mobile-nav-open' : ''}`}>
+
+      {showInstallGate && (
+        <MobileInstallGate
+          deferredPrompt={deferredPrompt}
+          onInstalled={() => setInstalledNow(true)}
+          onDismiss={() => { rememberInstallGateDismissed(); setInstallGateSkipped(true) }}
+        />
+      )}
+
+      {/* Phone layout: the left nav is an off-canvas drawer, so tapping the backdrop dismisses it. */}
+      <div className="mobile-nav-backdrop" onClick={() => setMobileNavOpen(false)} aria-hidden="true" />
 
       <AppLeftPane
         displayName={name}
@@ -5147,6 +5178,16 @@ export default function App() {
             <div className="topbar">
               <div className="topbar-inner" style={{justifyContent:'space-between'}}>
                   <div className="topbar-left" style={{display:'flex',gap:12,alignItems:'center'}}>
+                    {/* Only rendered on phone widths (CSS-gated) — opens the nav drawer. */}
+                    <button
+                      type="button"
+                      className="mobile-nav-toggle"
+                      onClick={() => setMobileNavOpen((v) => !v)}
+                      aria-label={mobileNavOpen ? 'Close navigation' : 'Open navigation'}
+                      aria-expanded={mobileNavOpen}
+                    >
+                      <span aria-hidden="true">☰</span>
+                    </button>
                     <div className="topbar-server">{topbarServerLabel}</div>
                     <div className="topbar-channel">{topbarChannelLabel}</div>
                   </div>

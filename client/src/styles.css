@@ -1663,3 +1663,120 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .movie-playbar-sync{font-size:12px;color:#f0a070;white-space:nowrap}
 .movie-playbar-app{margin-left:auto;font-size:12px;color:var(--text-muted,#9aa7b5);text-decoration:underline;white-space:nowrap}
 .movie-needsapp{max-width:340px;margin:4px 0 2px;font-size:12.5px;line-height:1.5;color:var(--text-muted,#9aa7b5)}
+
+/* ============================================================================
+   Mobile / small-screen layout
+   The desktop shell is a fixed 72px server rail + 240px channel list, which
+   leaves almost nothing for the chat on a phone. Below the breakpoint the whole
+   left nav becomes an off-canvas drawer over a backdrop, toggled from the
+   topbar, and the message column takes the full width.
+   ========================================================================= */
+
+/* Hidden on desktop; the media query below reveals it. */
+.mobile-nav-toggle{display:none}
+.mobile-nav-backdrop{display:none}
+
+@media (max-width: 820px){
+  /* dvh tracks the viewport as mobile browser chrome collapses, so the composer
+     never ends up underneath the URL bar. vh stays as the fallback above. */
+  .app{height:100dvh}
+  .dc-left{height:100dvh}
+
+  .mobile-nav-toggle{
+    display:flex;align-items:center;justify-content:center;
+    width:40px;height:40px;flex-shrink:0;margin-left:-6px;
+    border:none;border-radius:8px;background:transparent;
+    color:#fff;font-size:20px;line-height:1;cursor:pointer;
+  }
+  .mobile-nav-toggle:active{background:rgba(255,255,255,.14)}
+
+  /* The nav slides in from the left instead of taking permanent space. */
+  .dc-left{
+    position:fixed;left:0;top:0;bottom:0;z-index:1200;
+    transform:translateX(-100%);
+    transition:transform .22s ease;
+    box-shadow:none;
+    padding-left:env(safe-area-inset-left,0px);
+  }
+  .app.mobile-nav-open .dc-left{
+    transform:translateX(0);
+    box-shadow:0 0 40px rgba(0,0,0,.6);
+  }
+  /* Leave room for the chat to peek through, and never exceed the screen. */
+  .dc-guild-nav{width:calc(100vw - 72px - env(safe-area-inset-left,0px));min-width:0;max-width:280px}
+
+  .mobile-nav-backdrop{
+    display:block;position:fixed;inset:0;z-index:1150;
+    background:rgba(0,0,0,.5);
+    opacity:0;pointer-events:none;transition:opacity .22s ease;
+  }
+  .app.mobile-nav-open .mobile-nav-backdrop{opacity:1;pointer-events:auto}
+
+  .main{width:100%}
+  /* Notch / rounded-corner and home-bar clearance. */
+  .topbar-inner{padding:0 12px;padding-right:calc(12px + env(safe-area-inset-right,0px))}
+  .topbar-server{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:38vw}
+  .topbar-channel{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34vw}
+  .composer{padding-bottom:env(safe-area-inset-bottom,0px)}
+
+  /* Side panel becomes a near-full-screen sheet rather than a 300px flyout. */
+  .members-panel{
+    left:8px;right:8px;width:auto;top:56px;
+    bottom:calc(8px + env(safe-area-inset-bottom,0px));
+  }
+
+  /* Centred dialogs fill the screen so their contents aren't cramped. The desktop rule centres with
+     translate(-50%,-50%); once the box is anchored to all four edges that offset must go, and the
+     variants below are re-listed because their two-class selectors outrank a bare .auth-modal. */
+  .auth-modal,
+  .auth-modal.profile-settings-modal,
+  .auth-modal.app-directory-modal{
+    width:auto;max-width:none;left:8px;right:8px;
+    top:8px;bottom:calc(8px + env(safe-area-inset-bottom,0px));
+    max-height:none;
+    transform:scale(.98);
+  }
+  /* Keep the open/close scale animation, just without the centring translate. */
+  .auth-modal.open{transform:scale(1)}
+
+  /* Two-up grids don't fit at phone widths. */
+  .app-dir-grid{grid-template-columns:1fr}
+  .msg-flow-options{grid-template-columns:1fr}
+  .emoji-grid{grid-template-columns:repeat(7,1fr)}
+}
+
+/* ============================================================================
+   Mobile install gate — steers phone/tablet browsers to the installed app.
+   Sits above everything (including the auth modal at 9100) so it's the first
+   thing a phone visitor sees.
+   ========================================================================= */
+.install-gate{
+  position:fixed;inset:0;z-index:10000;
+  display:flex;align-items:center;justify-content:center;
+  padding:24px calc(20px + env(safe-area-inset-right,0px)) calc(24px + env(safe-area-inset-bottom,0px)) calc(20px + env(safe-area-inset-left,0px));
+  background:linear-gradient(180deg,#0d1117,#0b0d12);
+  overflow-y:auto;
+}
+.install-gate-card{width:100%;max-width:420px;text-align:center;color:var(--text)}
+.install-gate-logo{width:88px;height:88px;border-radius:20px;margin:0 auto 18px;display:block;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.install-gate-title{margin:0 0 10px;font-size:24px;font-weight:800;line-height:1.25}
+.install-gate-sub{margin:0 0 22px;font-size:14px;line-height:1.55;color:var(--muted)}
+.install-gate-btn{
+  width:100%;min-height:52px;border:none;border-radius:12px;cursor:pointer;
+  background:linear-gradient(90deg,var(--accent-start),var(--accent-end));
+  color:#fff;font-size:16px;font-weight:800;font-family:inherit;margin-bottom:20px;
+}
+.install-gate-btn:disabled{opacity:.65}
+.install-gate-steps{
+  margin:0 0 18px;padding:16px 16px 16px 34px;text-align:left;
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:12px;
+  font-size:14px;line-height:1.6;color:var(--text);
+}
+.install-gate-steps li+li{margin-top:8px}
+.install-gate-note{margin:0 0 14px;font-size:13px;color:#f0a070}
+.install-gate-skip{
+  background:transparent;border:none;color:var(--muted);
+  font-size:13px;text-decoration:underline;cursor:pointer;
+  padding:12px;min-height:44px;font-family:inherit;
+}
+.install-gate-skip:active{color:var(--text)}
