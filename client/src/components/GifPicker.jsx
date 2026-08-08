@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import longPressProps from '../longPress'
 import { Grid } from '@giphy/react-components'
 import FloatingMenu from './FloatingMenu'
 
@@ -209,6 +210,7 @@ export default function GifPicker({
                       title={`${g.name || 'GIF'} — right-click to remove`}
                       onClick={() => onSelectGif?.(g)}
                       onContextMenu={(e) => openGifMenu(e, g.id)}
+                      {...longPressProps((e) => openGifMenu(e, g.id))}
                     >
                       <img src={resolveSrc(g.url)} alt={g.name || 'GIF'} loading="lazy" />
                     </button>

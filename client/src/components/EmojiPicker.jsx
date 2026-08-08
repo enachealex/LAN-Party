@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import longPressProps from '../longPress'
 import { EMOJI_GROUPS, SKIN_TONES, applySkinTone } from '../emojiData'
 import FloatingMenu from './FloatingMenu'
 
@@ -152,6 +153,7 @@ export default function EmojiPicker({
           title={`:${c.name}: — right-click to delete`}
           onClick={() => onSelectCustom?.(c)}
           onContextMenu={(e) => openCustomMenu(e, c.name, scope, serverId)}
+          {...longPressProps((e) => openCustomMenu(e, c.name, scope, serverId))}
         >
           <img src={resolveSrc(c.url)} alt={`:${c.name}:`} />
         </button>
@@ -190,6 +192,7 @@ export default function EmojiPicker({
                   title={item.tone ? 'Right-click to change skin tone' : undefined}
                   onClick={() => onSelectEmoji?.(tonedEmoji(item))}
                   onContextMenu={(e) => openToneMenu(e, item)}
+                  {...longPressProps((e) => openToneMenu(e, item))}
                 >
                   {tonedEmoji(item)}
                 </button>

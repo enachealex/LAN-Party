@@ -2,7 +2,9 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover is required for env(safe-area-inset-*) to report real values on notched
+         iPhones; without it every safe-area inset resolves to 0. Zoom is deliberately left enabled. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>LAN Party</title>
     <link rel="icon" type="image/png" sizes="192x192" href="/icons/logo-192.png">
     <link rel="apple-touch-icon" href="/icons/logo-192.png">

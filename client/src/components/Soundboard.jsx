@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import longPressProps from '../longPress'
 import { createPortal } from 'react-dom'
 
 // Soundboard names are kept short so they fit on a tile (see .sb-pad-name in styles.css).
@@ -132,6 +133,7 @@ export default function Soundboard({
                   title={`${s.name || 'Sound'} — right-click for options`}
                   onClick={() => onPlay?.(s)}
                   onContextMenu={(e) => openMenu(e, s)}
+                  {...longPressProps((e) => openMenu(e, s))}
                 >
                   <span className="sb-pad-name">{s.name || 'Sound'}</span>
                   <span className="sb-eq" aria-hidden="true">

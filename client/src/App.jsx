@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef, useLayoutEffect, useMemo } from 'react'
+import longPressProps from './longPress'
 import { createPortal } from 'react-dom'
 
 // Debounce utility
@@ -599,6 +600,9 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
         onMouseEnter={showToolbar}
         onMouseLeave={hideToolbarSoon}
         onFocus={showToolbar}
+        // Touch has no hover, so the react/reply/more toolbar would be unreachable on a phone —
+        // long-pressing the message reveals it (the same state the mouse path uses).
+        {...longPressProps(showToolbar)}
         onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget)) hideToolbarSoon()
         }}
@@ -1070,6 +1074,20 @@ export default function App() {
   const [channelPins, setChannelPins] = useState([])
   const [showPinsModal, setShowPinsModal] = useState(false)   // "View Pins" list
   const [pinBarMenu, setPinBarMenu] = useState(null)          // right-click menu on the pin bar: {x,y}
+  // Opened by right-click on desktop and long-press on touch, so both paths share one definition
+  // and stay clamped inside the viewport.
+  const openPinBarMenu = (e) => {
+    e.preventDefault()
+    setPinBarMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 90) })
+  }
+  const openMemberMenu = (e, member, role) => {
+    e.preventDefault()
+    setMemberMenu({
+      x: Math.min(e.clientX, window.innerWidth - 190),
+      y: Math.min(e.clientY, window.innerHeight - 120),
+      username: member.username, name: member.name, role,
+    })
+  }
   const [forwardMsg, setForwardMsg] = useState(null)          // message being forwarded (opens the picker)
   // Desktop notifications preference (persisted locally; Notification.permission gates actual use).
   const [notifyEnabled, setNotifyEnabled] = useState(() => localStorage.getItem('lanparty_notify') === '1')
@@ -5273,8 +5291,9 @@ export default function App() {
                   type="button"
                   className="pin-bar"
                   onClick={() => jumpToMessage(channelPins[0].id)}
-                  onContextMenu={(e) => { e.preventDefault(); setPinBarMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 90) }) }}
-                  title="Click to view · right-click for options"
+                  onContextMenu={openPinBarMenu}
+                  {...longPressProps(openPinBarMenu)}
+                  title="Tap to view · long-press (or right-click) for options"
                 >
                   <span className="pin-bar-icon">📌</span>
                   <span className="pin-bar-body">
@@ -5931,8 +5950,9 @@ export default function App() {
                       type="button"
                       className="members-panel-row"
                       onClick={() => member.username && openMemberProfile(member.username)}
-                      onContextMenu={canManage ? (e) => { e.preventDefault(); setMemberMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 120), username: member.username, name: member.name, role }) } : undefined}
-                      title={member.username ? `View ${member.name}'s profile${canManage ? ' — right-click to manage' : ''}` : undefined}
+                      onContextMenu={canManage ? (e) => openMemberMenu(e, member, role) : undefined}
+                      {...(canManage ? longPressProps((e) => openMemberMenu(e, member, role)) : {})}
+                      title={member.username ? `View ${member.name}'s profile${canManage ? ' — long-press to manage' : ''}` : undefined}
                     >
                       {!isHomeView && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
                       <span className="members-panel-name">{member.name}{member.isYou ? ' (you)' : ''}</span>

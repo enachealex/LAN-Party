@@ -1,4 +1,5 @@
 import React, { useRef, useState, useCallback, useEffect } from 'react'
+import longPressProps from '../longPress'
 import { createPortal } from 'react-dom'
 import HomeLeftPanel from './HomeLeftPanel'
 import ProfileAvatar from './ProfileAvatar'
@@ -81,6 +82,7 @@ function RailIcon({
   active,
   onClick,
   onContextMenu,
+  longPress,   // touch equivalent of onContextMenu (see longPress.js); spread onto the button
   badge,
   className = '',
   home = false,
@@ -97,7 +99,7 @@ function RailIcon({
       onMouseLeave={voiceActive ? onVoiceTileLeave : undefined}
     >
       {active && <span className="dc-rail-pill" aria-hidden="true" />}
-      <button type="button" className={`dc-rail-item ${className}`} title={title} onClick={onClick} onContextMenu={onContextMenu}>
+      <button type="button" className={`dc-rail-item ${className}`} title={title} onClick={onClick} onContextMenu={onContextMenu} {...(longPress || {})}>
         {children}
         {voiceActive && <VoiceTileScrim />}
       </button>
@@ -292,6 +294,7 @@ export default function AppLeftPane({
             badge={serverUnreadTotals[s.id] || 0}
             onClick={() => onSelectServer?.(s.id)}
             onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null })}
+            longPress={longPressProps((e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null }))}
             {...voiceTileProps}
           >
             <span className="dc-server-icon" style={{ background: SERVER_COLORS[i % SERVER_COLORS.length] }}>
@@ -339,6 +342,7 @@ export default function AppLeftPane({
                       className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''} ${unread > 0 ? 'unread' : ''}`}
                       onClick={() => onJoinChannel?.(ch.id)}
                       onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy })}
+                      {...longPressProps((e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy }))}
                     >
                       <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
                       <span>{ch.name}</span>
@@ -362,6 +366,7 @@ export default function AppLeftPane({
                         className="dc-channel-item"
                         onClick={() => onJoinChannel?.(ch.id)}
                         onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy })}
+                        {...longPressProps((e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy }))}
                       >
                         <span className="dc-channel-icon dc-channel-icon-voice"><ChannelSpeakerIcon /></span>
                         <span>{ch.name}</span>

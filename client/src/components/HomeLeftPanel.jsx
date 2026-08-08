@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
+import longPressProps from '../longPress'
 import ProfileAvatar from './ProfileAvatar'
 import { nameStyleToCss } from '../profileData'
 
@@ -566,6 +567,7 @@ export default function HomeLeftPanel({
           className={`dc-dm-item ${selected ? 'active' : ''} ${unread > 0 ? 'has-unread' : ''}`}
           onClick={() => onClick?.(item)}
           onContextMenu={(e) => openDmMenu(e, kind, item)}
+          {...longPressProps((e) => openDmMenu(e, kind, item))}
         >
           <DmAvatar
             name={item.name}
