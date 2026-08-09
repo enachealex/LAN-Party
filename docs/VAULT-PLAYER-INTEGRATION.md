@@ -5,7 +5,10 @@ Everything Vault Player needs to sign a LAN Party user in automatically and mirr
 **LAN Party origin (prod):** `https://lanparty.thejumpvault.com`
 **Shared secret:** `VAULT_SSO_SECRET` — 32 random bytes, hex. On the LAN Party host it lives in
 `/mnt/retroboard-data/lan-party/vault-sso.key` (mode 600) and in the gitignored
-`ecosystem.config.cjs`. Read it with `cat vault-sso.key`; never commit it or put it in a client build.
+`ecosystem.config.cjs`. Both services run on the same host, so read it **server-side** straight into the relay's gitignored
+`deploy/vault.env` — it never needs to pass through a chat window, a client build or a repo.
+Rotation: regenerate 32 bytes, update `vault-sso.key` + `ecosystem.config.cjs`, restart `lan-party`,
+put the same value in `vault.env`.
 
 ---
 
@@ -44,7 +47,7 @@ Appended to the existing deep link when the user clicks *Open in Vault Player*:
 vaultmovies://join?code=ABC123&server=party.thejumpvault.com&sso=<JWT>
 ```
 
-It's minted **at click time** because it expires in 60 seconds. If SSO is unconfigured the link simply
+It's minted **at click time**. It expires in **5 minutes** — long enough to survive a cold app launch, short enough that a leaked assertion is near-useless. If SSO is unconfigured the link simply
 arrives without `sso=` — treat that as "anonymous guest", don't fail the join.
 
 ### Token format
@@ -58,7 +61,7 @@ arrives without `sso=` — treat that as "anonymous guest", don't fail the join.
   "name": "alexander",
   "email": "user@example.com",
   "iat": 1786240000,
-  "exp": 1786240060,
+  "exp": 1786240300,
   "jti": "6f1c…"
 }
 ```
@@ -68,7 +71,7 @@ arrives without `sso=` — treat that as "anonymous guest", don't fail the join.
 | `sub` | **The identity key. Store this.** The LAN Party username — stable, unique, lowercase-ish. |
 | `name` | Display name (currently the same as `sub`). |
 | `email` | The user's own address. May be absent. |
-| `exp` | 60 seconds after `iat`. |
+| `exp` | 300 seconds (5 minutes) after `iat`. |
 | `jti` | Unique per mint — cache consumed values to block replay. |
 
 ### What your `/auth/sso` must do
@@ -87,7 +90,7 @@ arrives without `sso=` — treat that as "anonymous guest", don't fail the join.
 
 ## 3. User + friends structure
 
-Call this **server-to-server** with the assertion as a bearer token, within its 60s window:
+Call this **server-to-server** with the assertion as a bearer token, within its 5-minute window:
 
 ```
 GET https://lanparty.thejumpvault.com/integrations/vault/userinfo
@@ -141,7 +144,20 @@ this payload.
 | --- | --- |
 | `401` | Missing / malformed / forged / expired assertion, or wrong `aud`/`iss`. |
 | `404` | The asserted user no longer exists (deleted account). |
+| `429` | Rate limited — see below. Honour `Retry-After`. |
 | `503` | SSO isn't configured on the LAN Party server. |
+
+### Rate limits
+
+Both integration routes are limited per caller IP (fixed window, `X-RateLimit-Limit` /
+`X-RateLimit-Remaining` / `Retry-After` headers returned):
+
+| Route | Limit |
+| --- | --- |
+| `POST /integrations/vault/sso-token` | 60 per 5 minutes |
+| `GET /integrations/vault/userinfo` | 120 per 5 minutes |
+
+Generous for per-login use. Don't poll `userinfo` on a timer — fetch it once per SSO login.
 
 ---
 
@@ -149,7 +165,7 @@ this payload.
 
 ```
 User clicks "Open in Vault Player" in LAN Party
-   → LAN Party mints the assertion (60s) and opens vaultmovies://join?...&sso=<JWT>
+   → LAN Party mints the assertion (5 min) and opens vaultmovies://join?...&sso=<JWT>
       → Vault Player validates it (§2), finds/creates the user by `sub`
          → Vault Player GETs /integrations/vault/userinfo with the same JWT
             → stores displayName + avatar, and mirrors `friends[]` into FriendsService
@@ -179,11 +195,18 @@ curl -s https://lanparty.thejumpvault.com/integrations/vault/userinfo \
   -H "Authorization: Bearer $SSO" | jq
 ```
 
-Expect `401` if you wait more than 60s between steps 2 and 3 — that's the expiry working.
+Expect `401` if you wait more than 5 minutes between steps 2 and 3 — that's the expiry working.
 
 ---
 
-## 6. Open items
+## 6. Note on voice/activity gating (changed 2026-08-09)
+
+`voice:join`, `sfu:caps` and `activity:*` now require the socket to be a **member** of the server
+(previously ungated). The public commons (`demo`) is open to any signed-in user; other servers need
+membership. Relevant if you drive those sockets from a test harness — an unauthenticated socket now
+receives `server:denied` instead of the participant list.
+
+## 7. Open items
 
 - **Presence is a snapshot.** If Vault Player wants live status, we'd add a webhook or let it poll
   `userinfo`; there's no push today.
