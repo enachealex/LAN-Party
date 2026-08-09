@@ -1846,9 +1846,31 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .dc-section-label .dc-section-delete{opacity:1;padding:8px}
   .emoji-cell{min-height:40px}
 
-  /* Voice controls already 52px, but keep them from wrapping off-screen. */
-  .voice-controls{flex-wrap:wrap;justify-content:center}
+  /* In-call control bar. The bar is .voice-controlbar — an earlier version of this rule targeted
+     .voice-controls, which matches no element, so the wrap never applied while .voice-ctrl-wrap's
+     flex-shrink:0 guaranteed overflow: the hangup button ended up off-screen and a phone user could
+     not leave a call. Shrinking the buttons to 44px and allowing two rows fits 375px. */
+  .voice-controlbar{flex-wrap:wrap;justify-content:center;gap:8px;padding:10px 8px calc(12px + env(safe-area-inset-bottom,0px))}
+  .voice-ctrl{width:44px;height:44px}
+  .voice-golive-btn{height:44px;padding:0 12px}
   .voice-ctrl-wrap{flex-shrink:0}
+  /* The caret is the only route to the mic/speaker picker and sits flush against mute — at 22px a
+     mistap muted the user instead. */
+  .voice-ctrl-caret{width:44px;min-width:44px;height:44px;margin-left:2px}
+
+  /* In-call popovers are absolutely positioned and centred on a ~52px button, then clipped by
+     .voice-panel.in-call{overflow:hidden} and .content-area{overflow:hidden} — the device picker and
+     camera-background menus were permanently cut off. Anchor them to the viewport instead. */
+  .voice-quality-menu,.voice-effects-menu,.voice-audio-menu,.voice-soundboard-wrap .soundboard{
+    position:fixed;left:8px;right:8px;width:auto;min-width:0;max-width:none;transform:none;
+    bottom:calc(104px + env(safe-area-inset-bottom,0px));
+    max-height:min(56dvh,420px);overflow-y:auto;
+  }
+  /* The tail arrows pointed at a button the popover is no longer centred on. */
+  .voice-quality-menu::after,.voice-effects-menu::after,.voice-audio-menu::after{display:none}
+
+  /* Reclaim the nested padding that squeezed the video tiles to 82% of the screen. */
+  .content-area{padding:8px}
 }
 
 /* ---------------------------------------------------------------------------
@@ -1898,4 +1920,25 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .auth-form input{min-height:44px}
   /* Stacked content is taller than the screen — make the dialog scrollable. */
   .auth-modal{overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px}
+}
+
+/* Settings panel: collapsible section headers ("Edit" / "Add") and the read-back summaries shown
+   in place of the collapsed editors. */
+.settings-section-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.settings-section-head .profile-settings-section-title{margin-bottom:0}
+.settings-edit-btn{
+  flex-shrink:0;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.05);
+  color:var(--text);font-size:12px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;
+  padding:6px 12px;border-radius:7px;cursor:pointer;font-family:inherit;min-height:32px;
+}
+.settings-edit-btn:hover{background:rgba(255,255,255,.1);border-color:var(--accent-end)}
+.settings-readback{
+  margin:6px 0 12px;padding:10px 12px;border-radius:9px;
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);
+  font-size:13px;line-height:1.55;color:var(--text);
+}
+.settings-readback-status{font-weight:700}
+.settings-readback-bio{margin-top:4px;color:var(--muted);white-space:pre-wrap}
+@media (max-width: 820px){
+  .settings-edit-btn{min-height:40px;padding:8px 14px}
 }

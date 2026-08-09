@@ -909,6 +909,11 @@ export default function App() {
   const [showInstallPanel, setShowInstallPanel] = useState(false)
   // Hide browser "Download App" / PWA install UI when already running inside the Electron desktop shell.
   const isDesktopApp = typeof window !== 'undefined' && !!window.desktop?.isElectron
+  // Settings panel: the long editors stay collapsed so the panel reads as a summary until the user
+  // opts into editing. Each closes again on its own button.
+  const [editGenresOpen, setEditGenresOpen] = useState(false)
+  const [editAboutOpen, setEditAboutOpen] = useState(false)
+  const [addTagOpen, setAddTagOpen] = useState(false)
   // Phone layout: the left nav (server rail + channel list) collapses into a drawer.
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   // On a mobile browser we push the installed (home-screen) app instead of the tab. Computed once:
@@ -2662,7 +2667,7 @@ export default function App() {
 
   // Start deactivation from Settings → emails a confirmation link.
   const requestDeactivate = async () => {
-    if (!window.confirm('Deactivate your account? We’ll email a confirmation link. Confirming permanently deletes your account and all its data.')) return
+    if (!window.confirm('Delete your account? We’ll email a confirmation link. Confirming permanently deletes your account and all its data.')) return
     try {
       const t = token || localStorage.getItem('lanparty_token')
       const res = await fetch(`${SERVER_URL}/account/deactivate`, { method: 'POST', headers: { Authorization: `Bearer ${t}` } })
@@ -6430,7 +6435,7 @@ export default function App() {
                 {flowError && <div className="account-flow-error">{flowError}</div>}
                 <div className="account-flow-actions">
                   <button className="account-flow-btn ghost" onClick={() => setAccountFlow(null)}>Cancel</button>
-                  <button className="account-flow-btn danger" disabled={flowBusy} onClick={submitDeactivateConfirm}>{flowBusy ? 'Deactivating…' : 'Deactivate account'}</button>
+                  <button className="account-flow-btn danger" disabled={flowBusy} onClick={submitDeactivateConfirm}>{flowBusy ? 'Deleting…' : 'Delete Account'}</button>
                 </div>
               </>
             )}
@@ -6522,14 +6527,29 @@ export default function App() {
             {/* Gaming profile — set during onboarding; not part of the Edit Profile popup */}
             {!showProfileEditor && (
             <div className="gaming-profile-card">
-              <h3 className="profile-settings-section-title">🎮 Gaming Profile</h3>
-              <div className="gaming-sub">Favorite genres</div>
-              <div className="reg-genres">
-                {GAME_GENRES.map((g) => (
-                  <button key={g} type="button" className={`reg-genre${(editingGaming.genres || []).includes(g) ? ' active' : ''}`} onClick={() => toggleEditGenre(g)}>{g}</button>
-                ))}
+              <div className="settings-section-head">
+                <h3 className="profile-settings-section-title">🎮 Gaming Profile</h3>
+                <button type="button" className="settings-edit-btn" onClick={() => setEditGenresOpen((v) => !v)} aria-expanded={editGenresOpen}>
+                  {editGenresOpen ? 'Done' : 'Edit'}
+                </button>
               </div>
-              <div className="gaming-sub">Playing right now <span className="reg-optional">(past 2 weeks)</span></div>
+              {/* The full genre grid is long, so it stays behind Edit; the chosen genres read back as
+                  a summary line. */}
+              {editGenresOpen ? (
+                <>
+                  <div className="gaming-sub">Favorite genres</div>
+                  <div className="reg-genres">
+                    {GAME_GENRES.map((g) => (
+                      <button key={g} type="button" className={`reg-genre${(editingGaming.genres || []).includes(g) ? ' active' : ''}`} onClick={() => toggleEditGenre(g)}>{g}</button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                (editingGaming.genres || []).length > 0 && (
+                  <div className="settings-readback">{(editingGaming.genres || []).join(' · ')}</div>
+                )
+              )}
+              <div className="gaming-sub">Recently Played</div>
               <input
                 type="text"
                 className="profile-text-input"
@@ -6538,7 +6558,6 @@ export default function App() {
                 value={editingGaming.currentGames || ''}
                 onChange={(e) => updateGamingProfile({ currentGames: e.target.value })}
               />
-              <div className="gaming-hint">Shown to others on your live-stream cards in Discover.</div>
             </div>
             )}
 
@@ -6678,47 +6697,75 @@ export default function App() {
             </div>
             )}
 
-            {/* Status message + bio */}
-            <h3 className="profile-settings-section-title">About</h3>
-            <input
-              type="text"
-              className="profile-text-input"
-              placeholder="Status message (e.g. 'Building stuff')"
-              maxLength={80}
-              value={editingProfile.statusMessage}
-              onChange={(e) => updateProfileDraft({ statusMessage: e.target.value })}
-            />
-            <textarea
-              className="profile-textarea"
-              placeholder="Bio — tell people about yourself"
-              maxLength={400}
-              rows={3}
-              value={editingProfile.bio}
-              onChange={(e) => updateProfileDraft({ bio: e.target.value })}
-            />
+            {/* Status message + bio. Collapsed by default: only what's filled in is shown, so the
+                panel stays quiet until the user chooses to edit. */}
+            <div className="settings-section-head">
+              <h3 className="profile-settings-section-title">About</h3>
+              <button type="button" className="settings-edit-btn" onClick={() => setEditAboutOpen((v) => !v)} aria-expanded={editAboutOpen}>
+                {editAboutOpen ? 'Done' : 'Edit'}
+              </button>
+            </div>
+            {editAboutOpen ? (
+              <>
+                <input
+                  type="text"
+                  className="profile-text-input"
+                  placeholder="Status message (e.g. 'Building stuff')"
+                  maxLength={80}
+                  value={editingProfile.statusMessage}
+                  onChange={(e) => updateProfileDraft({ statusMessage: e.target.value })}
+                />
+                <textarea
+                  className="profile-textarea"
+                  placeholder="Bio — tell people about yourself"
+                  maxLength={400}
+                  rows={3}
+                  value={editingProfile.bio}
+                  onChange={(e) => updateProfileDraft({ bio: e.target.value })}
+                />
+              </>
+            ) : (
+              (editingProfile.statusMessage || editingProfile.bio) ? (
+                <div className="settings-readback">
+                  {editingProfile.statusMessage && <div className="settings-readback-status">{editingProfile.statusMessage}</div>}
+                  {editingProfile.bio && <div className="settings-readback-bio">{editingProfile.bio}</div>}
+                </div>
+              ) : (
+                <div className="profile-hint">Nothing added yet.</div>
+              )
+            )}
 
-            {/* Tags */}
-            <h3 className="profile-settings-section-title">Clan / Server Tags</h3>
+            {/* Tags. The selected tags are visible on the profile preview at the top of this panel,
+                so they aren't echoed again here — only the selectable options are shown. */}
+            <div className="settings-section-head">
+              <h3 className="profile-settings-section-title">Clan / Server Tags</h3>
+              <button type="button" className="settings-edit-btn" onClick={() => setAddTagOpen((v) => !v)} aria-expanded={addTagOpen}>
+                {addTagOpen ? 'Done' : 'Add'}
+              </button>
+            </div>
+            <p className="profile-hint">Tags can be previewed in the user profile on the top.</p>
             <div className="profile-chip-row">
               <button type="button" className={`profile-chip${(editingProfile.tags || []).some((t) => t.type === 'server' && t.label === serverName) ? ' active' : ''}`} onClick={() => toggleServerTag(serverName)}>{serverName}</button>
+              {/* Custom tags stay selectable/removable here so they aren't stranded once the input is
+                  collapsed. */}
+              {(editingProfile.tags || []).filter((t) => t.type === 'custom').map((t) => (
+                <button key={`custom-${t.label}`} type="button" className="profile-chip active" onClick={() => removeTag(t)} title={`Remove ${t.label}`}>
+                  {t.label} ×
+                </button>
+              ))}
             </div>
-            <div className="profile-edit-row">
-              <input
-                type="text"
-                className="profile-text-input"
-                placeholder="Add a custom tag (e.g. DEV)"
-                maxLength={16}
-                value={customTagInput}
-                onChange={(e) => setCustomTagInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomTag() } }}
-              />
-              <button type="button" className="connect-btn" onClick={addCustomTag}>Add</button>
-            </div>
-            {(editingProfile.tags || []).length > 0 && (
-              <div className="profile-chip-row">
-                {editingProfile.tags.map((t) => (
-                  <span key={`${t.type}-${t.label}`} className={`profile-tag profile-tag-${t.type}`}>{t.label}<button type="button" onClick={() => removeTag(t)} aria-label={`Remove ${t.label}`}>×</button></span>
-                ))}
+            {addTagOpen && (
+              <div className="profile-edit-row">
+                <input
+                  type="text"
+                  className="profile-text-input"
+                  placeholder="Add a custom tag (e.g. DEV)"
+                  maxLength={16}
+                  value={customTagInput}
+                  onChange={(e) => setCustomTagInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomTag() } }}
+                />
+                <button type="button" className="connect-btn" onClick={addCustomTag}>Add</button>
               </div>
             )}
 
@@ -6736,11 +6783,7 @@ export default function App() {
               </button>
               <div className="notify-setting-text">
                 <span className="notify-setting-title">Desktop notifications</span>
-                <span className="notify-setting-hint">
-                  {notifyEnabled
-                    ? 'On — DMs and @mentions always notify; channel messages notify when the app is in the background.'
-                    : 'Get notified about DMs, @mentions and channel activity when you look away.'}
-                </span>
+                <span className="notify-setting-hint">Receive Message notifications.</span>
               </div>
             </div>
 
@@ -6777,10 +6820,13 @@ export default function App() {
             </div>
 
             {isAuthenticated && (
-              <div className="profile-danger-zone">
-                <button type="button" className="profile-deactivate-btn" onClick={requestDeactivate}>Deactivate account</button>
-                <span className="profile-danger-hint">Permanently deletes your account &amp; data. We email a confirmation link first.</span>
-              </div>
+              <>
+                <h3 className="profile-settings-section-title">Account Removal</h3>
+                <div className="profile-danger-zone">
+                  <button type="button" className="profile-deactivate-btn" onClick={requestDeactivate}>Delete Account</button>
+                  <span className="profile-danger-hint">Permanently deletes your account &amp; data. We email a confirmation link first.</span>
+                </div>
+              </>
             )}
 
             <div className="profile-settings-actions">
