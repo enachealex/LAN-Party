@@ -168,6 +168,12 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     await emitPendingUpdate(me.username);
     await emitFriendsListUpdate(me.username);
     await emitFriendsListUpdate(fr.fromUsername);
+    // Tell the ORIGINAL SENDER specifically that their request was accepted. friend:list-updated
+    // can't serve this: it goes to BOTH parties (so the accepter would also get a "you have a new
+    // friend" celebration on top of their own click) and it carries no payload, so there'd be no
+    // name for the toast. Keeping it separate also stays correct if a future unfriend/remove path
+    // starts emitting friend:list-updated too.
+    io.to(`user:${fr.fromUsername}`).emit('friend:request-accepted', { by: me.username });
     return res.json({ success: true });
   });
 

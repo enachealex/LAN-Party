@@ -186,6 +186,9 @@ async function main() {
   app.use('/gifs', express.static(gifsDir, { redirect: false }));
   app.use('/sounds', express.static(soundsDir, { redirect: false }));
   app.use('/entrances', express.static(entrancesDir, { redirect: false }));
+  // Terminal for this mount: a deleted/missing clip must 404 rather than fall through to the SPA
+  // catch-all, which would hand an <audio> element the client's HTML with a 200.
+  app.use('/entrances', (req, res) => res.status(404).type('txt').send('Not found'));
   // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).

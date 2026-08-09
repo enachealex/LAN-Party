@@ -114,6 +114,13 @@ describe('entrance sounds', () => {
     }
   });
 
+  test('a missing clip 404s instead of leaking the SPA shell', async () => {
+    // An <audio> element must get a real 404, not the client HTML with a 200.
+    const miss = await fetch(base + '/entrances/does-not-exist.webm');
+    assert.equal(miss.status, 404);
+    assert.doesNotMatch(await miss.text(), /<!doctype html>/i);
+  });
+
   test('a user with no clip reports an empty url', async () => {
     const otherToken = await makeUser(call, 'silent');
     const a = await connect(base, token);

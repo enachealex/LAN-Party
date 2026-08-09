@@ -2273,6 +2273,12 @@ export default function App() {
     })
     s.on('friend:pending-updated', () => loadFriendsData(authToken))
     s.on('friend:list-updated', () => { loadFriendsData(authToken); loadMessagesData(authToken) })
+    // Someone accepted the request WE sent. Distinct from friend:list-updated (which also fires on
+    // unfriend), so this is the only place it's safe to celebrate.
+    s.on('friend:request-accepted', ({ by } = {}) => {
+      playUiSound('success')
+      if (by) setToast(`${by} accepted your friend request`)
+    })
     s.on('friend:presence-updated', ({ username, status }) => {
       applyFriendPresence(username, status)
     })
