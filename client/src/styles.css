@@ -1942,3 +1942,59 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 @media (max-width: 820px){
   .settings-edit-btn{min-height:40px;padding:8px 14px}
 }
+
+/* PiP miniplayer on touch. touch-action:none is required on the drag/resize handles: without it the
+   browser claims the gesture for panning and the pointermove stream never reaches the handler. The
+   default 344px box is 368 of 375px wide, so it's clamped, and the header buttons — the only
+   controls the PiP has — were ~24x20px. */
+.extviewer-overlay.mini .extviewer-head.drag,
+.extviewer-overlay.mini .extviewer-resize{touch-action:none}
+@media (max-width: 820px){
+  .extviewer-overlay.mini{width:min(344px,calc(100vw - 16px))}
+  .extviewer-mini-btn,
+  .extviewer-overlay.mini .discover-close{
+    min-width:44px;min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0;
+  }
+  .extviewer-overlay.mini .extviewer-head{padding:6px 8px}
+  .extviewer-head-btns{gap:8px}
+  /* Pager arrows sat on top of the tiles at phone widths. */
+  .video-page-btn.prev{left:2px}
+  .video-page-btn.next{right:2px}
+  .video-stage{padding:8px;gap:8px}
+}
+
+/* ---------------------------------------------------------------------------
+   Activities on a phone. The worst case was Sketch & Guess: .sketch-main is a
+   flex ROW and .sketch-side has min-width:200px that never yields, so after the
+   panel margin and padding the drawing surface was left ~107px wide at 375px.
+   Stacking the scoreboard under the canvas and giving the stage a 16:9 box (the
+   <canvas> backing store is 1280x720) restores a usable drawing area.
+   ------------------------------------------------------------------------- */
+@media (max-width: 820px){
+  .activity-panel{margin:8px}
+
+  /* Sketch & Guess */
+  .sketch-main{flex-direction:column;gap:8px;padding:0 8px 8px}
+  .sketch-stage{flex:none;width:100%;aspect-ratio:16/9}
+  .sketch-side{min-width:0;max-width:none;flex:none;max-height:32dvh;overflow-y:auto}
+  .sketch-topbar{flex-wrap:wrap;gap:6px;padding:8px}
+  .sketch-topbar > *{min-width:0}
+  /* The masked word is letter-spaced and can be long; let it wrap instead of pushing the row wide. */
+  .sketch-word{font-size:15px;letter-spacing:1px;overflow-wrap:anywhere}
+  /* Drawing tools were mouse-sized (24px swatches). */
+  .sketch-tools{flex-wrap:wrap;gap:8px}
+  .wb-color{width:36px;height:36px}
+  .wb-size,.wb-tool{min-height:40px;padding:0 12px}
+  /* Plain whiteboard activity shares the stage/canvas rules. */
+  .wb-stage{margin:0 8px 8px}
+
+  /* Movie Night: four items in one non-wrapping row overflowed a ~313px box. */
+  .movie-playbar{flex-wrap:wrap;gap:8px;padding:8px}
+  .movie-playbar-title{flex:1 1 100%}
+  .movie-playbar-app{margin-left:0}
+  .movie-playbar-sync{white-space:normal}
+
+  /* Music: transport + queue buttons were 30x28. */
+  .music-mini{width:40px;height:40px}
+  .music-seek{flex:1 1 100%;min-width:0}
+}

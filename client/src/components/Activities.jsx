@@ -588,7 +588,7 @@ function WatchTogether({ state, onEvent }) {
   return (
     <div className="watch-activity">
       <div className="watch-main">
-        {state.videoId ? <div className="watch-player" ref={containerRef} /> : <div className="watch-empty">Load a YouTube video from the panel on the right — play, pause, and seek stay in sync for everyone.</div>}
+        {state.videoId ? <div className="watch-player" ref={containerRef} /> : <div className="watch-empty">Load a YouTube video from the Watch panel — play, pause, and seek stay in sync for everyone.</div>}
       </div>
       <div className="watch-side">
         <div className="watch-side-title">Load a video</div>

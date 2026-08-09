@@ -3436,27 +3436,45 @@ export default function App() {
     setStreamMini(true)
   }
   // Drag the PiP miniplayer around by its header (keeps the iframe mounted, so playback never stops).
+  // Pointer events (not mouse) so the miniplayer can be dragged with a finger — touch never fires
+  // mousemove/mouseup, which left the PiP immovable on phones while covering most of the screen.
+  // Clamping uses the LIVE streamSize: it used to assume the default 344x226, so dragging after a
+  // resize let the player run off-screen.
   const startDragStream = (e) => {
-    if (e.button !== 0) return
+    if (e.pointerType === 'mouse' && e.button !== 0) return
     const startX = e.clientX, startY = e.clientY
     const origin = { ...streamPos }
-    const W = 344, H = 226
-    const onMove = (ev) => setStreamPos({
-      x: Math.max(0, Math.min(window.innerWidth - W, origin.x + (ev.clientX - startX))),
-      y: Math.max(0, Math.min(window.innerHeight - H, origin.y + (ev.clientY - startY))),
-    })
-    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+    const { w: W, h: H } = streamSize
+    const id = e.pointerId
+    try { e.currentTarget.setPointerCapture(id) } catch (_) { /* capture unsupported */ }
+    const onMove = (ev) => {
+      if (ev.pointerId !== id) return // ignore a second finger
+      setStreamPos({
+        x: Math.max(0, Math.min(window.innerWidth - W, origin.x + (ev.clientX - startX))),
+        y: Math.max(0, Math.min(window.innerHeight - H, origin.y + (ev.clientY - startY))),
+      })
+    }
+    const onUp = (ev) => {
+      if (ev.pointerId !== id) return
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
   // Resize the PiP miniplayer from its bottom-right corner (keeps it fully on-screen by nudging
   // its position if growing would push it past an edge).
   const startResizeStream = (e) => {
     e.stopPropagation()
-    if (e.button !== 0) return
+    if (e.pointerType === 'mouse' && e.button !== 0) return
     const startX = e.clientX, startY = e.clientY
     const origin = { ...streamSize }
+    const id = e.pointerId
+    try { e.currentTarget.setPointerCapture(id) } catch (_) { /* capture unsupported */ }
     const onMove = (ev) => {
+      if (ev.pointerId !== id) return
       const w = Math.max(240, Math.min(window.innerWidth - 12, origin.w + (ev.clientX - startX)))
       const h = Math.max(150, Math.min(window.innerHeight - 12, origin.h + (ev.clientY - startY)))
       setStreamSize({ w, h })
@@ -3465,9 +3483,15 @@ export default function App() {
         y: Math.max(6, Math.min(p.y, window.innerHeight - h - 6)),
       }))
     }
-    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+    const onUp = (ev) => {
+      if (ev.pointerId !== id) return
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
 
   // Activities: start one for the room, relay an event, or end it (all scoped to the voice channel).
@@ -3764,8 +3788,13 @@ export default function App() {
     const ASPECT = 16 / 9
     const compute = () => {
       const n = voicePageTileCount
-      const W = el.clientWidth, H = el.clientHeight
-      if (!W || !H || n < 1) return
+      // clientWidth/Height include the stage's own padding, so the solver was handed more room than
+      // the tiles actually get and picked cells slightly too large (most visible on a phone, where
+      // the padding is a big fraction of the width). Measure the content box.
+      const pad = getComputedStyle(el)
+      const W = el.clientWidth - parseFloat(pad.paddingLeft || 0) - parseFloat(pad.paddingRight || 0)
+      const H = el.clientHeight - parseFloat(pad.paddingTop || 0) - parseFloat(pad.paddingBottom || 0)
+      if (!W || !H || W < 0 || H < 0 || n < 1) return
       let best = 1, bestArea = -1
       for (let cols = 1; cols <= n; cols++) {
         const rows = Math.ceil(n / cols)
@@ -5785,7 +5814,7 @@ export default function App() {
           <div className="extviewer-frame" onClick={(e) => e.stopPropagation()}>
             <div
               className={`extviewer-head ${streamMini ? 'drag' : ''}`}
-              onMouseDown={streamMini ? startDragStream : undefined}
+              onPointerDown={streamMini ? startDragStream : undefined}
             >
               <span className="extviewer-title">🔴 {externalViewer.name}{streamMini ? '' : ` — ${externalViewer.title || externalViewer.channel}${externalViewer.game ? ` · 🎮 ${externalViewer.game}` : ''}`}</span>
               <div className="extviewer-head-btns">
@@ -5799,7 +5828,7 @@ export default function App() {
               <div className="discover-empty">This stream can't be embedded — check the link the streamer shared.</div>
             )}
           </div>
-          {streamMini && <div className="extviewer-resize" onMouseDown={startResizeStream} title="Resize" />}
+          {streamMini && <div className="extviewer-resize" onPointerDown={startResizeStream} title="Resize" />}
         </div>
       )}
       {/* Teams-style pre-join screen */}
