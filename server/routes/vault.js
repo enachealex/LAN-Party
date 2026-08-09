@@ -10,20 +10,32 @@
 //     bound to aud='vault-player' and signed with VAULT_SSO_SECRET — a different secret from
 //     JWT_SECRET. If the Vault side ever leaks its copy, an attacker still cannot forge a LAN Party
 //     session, and vice versa.
-//   * 60-second lifetime keeps the replay window tiny; `jti` lets Vault dedupe a login it has
-//     already consumed.
+//   * A 5-minute lifetime keeps the replay window small while surviving a cold app launch; `jti`
+//     lets Vault dedupe a login it has already consumed.
 //
 // Disabled unless VAULT_SSO_SECRET is configured, so an unconfigured deployment can't hand out
 // assertions signed with a guessable key.
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const { rateLimit } = require('../rateLimit');
 
 const AUDIENCE = 'vault-player';
 const ISSUER = 'lanparty';
-const TTL_SECONDS = 60;
+// 5 minutes: a cold Vault Player launch (process start, window, relay handshake) can easily outlive
+// 60s, which stranded the user at a login screen. Still short enough that a leaked assertion is
+// near-useless, and `jti` blocks replay within the window.
+const TTL_SECONDS = 300;
 
 /** @param {Record<string, any>} deps */
-function registerVaultRoutes({ app, db, authMiddleware, getUserByUsername, displayProfileFromSettings, avatarColorForUsername, normalizePresence }) {
+function registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence }) {
+  // The shared getUserByUsername() helper selects only id/username/presence_status, so it cannot feed
+  // this integration — reading me.settings/me.email off it yields undefined and the caller's own
+  // avatar and email silently come back null. Query the columns this route actually needs.
+  const loadUser = (username) => db.get(
+    `SELECT id, username, email, settings, COALESCE(presence_status, 'offline') AS presence_status
+     FROM users WHERE username = ?`,
+    username
+  );
   const SECRET = process.env.VAULT_SSO_SECRET || '';
   const enabled = !!SECRET;
   if (!enabled) {
@@ -38,9 +50,9 @@ function registerVaultRoutes({ app, db, authMiddleware, getUserByUsername, displ
 
   // Mint an assertion for the CALLING user. The client hands this to Vault Player (query string for
   // the web player, or appended to the vaultmovies:// deep link for the desktop app).
-  app.post('/integrations/vault/sso-token', authMiddleware, async (req, res) => {
+  app.post('/integrations/vault/sso-token', rateLimit({ id: 'vault-sso', windowMs: 5 * 60_000, max: 60 }), authMiddleware, async (req, res) => {
     if (!requireEnabled(res)) return;
-    const me = await getUserByUsername(req.user.username);
+    const me = await loadUser(req.user.username);
     if (!me) return res.status(404).json({ error: 'User not found' });
     const token = jwt.sign(
       {
@@ -77,12 +89,12 @@ function registerVaultRoutes({ app, db, authMiddleware, getUserByUsername, displ
   // assertion, so it can mirror the LAN Party social graph (its FriendsService) instead of asking the
   // user to rebuild a friends list. Read-only: it exposes only display-safe fields, never secrets,
   // password hashes or another user's email.
-  app.get('/integrations/vault/userinfo', async (req, res) => {
+  app.get('/integrations/vault/userinfo', rateLimit({ id: 'vault-userinfo', windowMs: 5 * 60_000, max: 120 }), async (req, res) => {
     if (!requireEnabled(res)) return;
     const { claims, error } = verifyAssertion(req);
     if (error) return res.status(401).json({ error });
 
-    const me = await getUserByUsername(claims.sub);
+    const me = await loadUser(claims.sub);
     if (!me) return res.status(404).json({ error: 'User not found' });
 
     const rows = await db.all(

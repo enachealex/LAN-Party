@@ -2,13 +2,14 @@
 // reset (forgot/reset), account deactivation (request + confirm), logout, and the dev mock-emails
 // list. deleteUserCompletely lives here since deactivation is its only caller.
 const bcrypt = require('bcryptjs');
+const { rateLimit } = require('../rateLimit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('../email');
 
 /** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, mockEmails: any[] }} deps */
 function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, mockEmails }) {
-  app.post('/auth/register', async (req, res) => {
+  app.post('/auth/register', rateLimit({ id: 'register', windowMs: 60 * 60_000, max: 10 }), async (req, res) => {
     const { username, email, password, passwordConfirm } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
     if (password !== passwordConfirm) return res.status(400).json({ error: 'Passwords do not match' });
@@ -29,14 +30,14 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       // have this flag, so `=== false` is false for them and they skip it.
       onboardingComplete: false,
     };
-    const hash = bcrypt.hashSync(password, 10);
+    const hash = await bcrypt.hash(password, 10);
     await db.run('INSERT INTO users (username, email, password_hash, settings) VALUES (?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings));
     // Fire-and-forget welcome email (never block or fail registration on email).
     mailer.sendWelcome(username, email).catch((e) => console.warn('welcome email error', e && e.message));
     return res.json({ success: true });
   });
 
-  app.post('/auth/check-availability', async (req, res) => {
+  app.post('/auth/check-availability', rateLimit({ id: 'availability', windowMs: 5 * 60_000, max: 120 }), async (req, res) => {
     const { username, email } = req.body || {};
     if (!username && !email) return res.status(400).json({ error: 'Missing username or email' });
     if (username) {
@@ -50,12 +51,12 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     return res.json({ username: username ? true : undefined, email: email ? true : undefined });
   });
 
-  app.post('/auth/login', async (req, res) => {
+  app.post('/auth/login', rateLimit({ id: 'login', windowMs: 15 * 60_000, max: 20, message: 'Too many sign-in attempts — wait a few minutes.' }), async (req, res) => {
     const { username, password, remember } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
     const user = await db.get('SELECT * FROM users WHERE username = ?', username);
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    const ok = bcrypt.compareSync(password, user.password_hash);
+    const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
     const settings = user.settings ? JSON.parse(user.settings) : {};
     const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: remember ? '90d' : '7d' });
@@ -71,7 +72,7 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
 
   const newAuthToken = () => crypto.randomBytes(24).toString('base64url');
 
-  app.post('/auth/forgot', async (req, res) => {
+  app.post('/auth/forgot', rateLimit({ id: 'forgot', windowMs: 15 * 60_000, max: 10 }), async (req, res) => {
     const email = String((req.body || {}).email || '').trim();
     if (!email) return res.status(400).json({ error: 'Missing email' });
     const user = await db.get('SELECT id, username FROM users WHERE email = ?', email);
@@ -85,7 +86,7 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
   });
 
   // Complete a password reset with the emailed token.
-  app.post('/auth/reset', async (req, res) => {
+  app.post('/auth/reset', rateLimit({ id: 'reset', windowMs: 15 * 60_000, max: 20 }), async (req, res) => {
     const { token, email, password, passwordConfirm } = req.body || {};
     if (!token || !email || !password) return res.status(400).json({ error: 'Missing fields' });
     if (passwordConfirm != null && password !== passwordConfirm) return res.status(400).json({ error: 'Passwords do not match' });
@@ -94,7 +95,7 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     if (!row || row.purpose !== 'reset' || row.expires_at < Date.now()) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
     const user = await db.get('SELECT id, email FROM users WHERE id = ?', row.user_id);
     if (!user || user.email !== email) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
-    await db.run('UPDATE users SET password_hash = ? WHERE id = ?', bcrypt.hashSync(password, 10), user.id);
+    await db.run('UPDATE users SET password_hash = ? WHERE id = ?', await bcrypt.hash(password, 10), user.id);
     await db.run('DELETE FROM auth_tokens WHERE token = ?', token);
     return res.json({ success: true });
   });

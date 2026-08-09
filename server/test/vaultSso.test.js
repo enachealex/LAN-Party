@@ -26,15 +26,16 @@ describe('vault player SSO', () => {
     const res = await mint();
     assert.equal(res.status, 200);
     assert.equal(res.data.audience, 'vault-player');
-    assert.equal(res.data.expiresIn, 60);
+    assert.equal(res.data.expiresIn, 300);
 
     const claims = jwt.verify(res.data.token, SSO_SECRET, { algorithms: ['HS256'] });
     assert.equal(claims.iss, 'lanparty');
     assert.equal(claims.aud, 'vault-player');
     assert.equal(claims.sub, 'watcher');
     assert.equal(claims.name, 'watcher');
+    assert.equal(claims.email, 'watcher@example.com', 'email claim is populated, not undefined');
     assert.ok(claims.jti, 'carries a jti so Vault can dedupe a consumed login');
-    assert.ok(claims.exp - claims.iat <= 60, 'lifetime is at most 60s');
+    assert.ok(claims.exp - claims.iat <= 300, 'lifetime is at most 5 minutes');
   });
 
   test('the assertion is NOT signed with the LAN Party session secret', async () => {
@@ -66,8 +67,12 @@ describe('vault player SSO', () => {
     assert.equal(body.issuer, 'lanparty');
     assert.equal(body.user.username, 'watcher');
     assert.equal(body.user.displayName, 'watcher');
-    assert.ok('avatarUrl' in body.user);
-    assert.ok('avatarColor' in body.user);
+    // Assert real VALUES, not just key presence — the original test only checked `'avatarUrl' in
+    // body.user`, which passed happily while the endpoint returned null for the caller's own avatar
+    // and email (getUserByUsername doesn't select settings/email).
+    assert.equal(body.user.email, 'watcher@example.com', 'the caller gets their own email, not null');
+    assert.match(body.user.avatarColor, /^#[0-9a-f]{6}$/i, 'avatarColor is a real colour');
+    assert.ok('avatarUrl' in body.user, 'avatarUrl key is present (null until they upload one)');
     assert.ok(['available', 'idle', 'dnd', 'offline'].includes(body.user.status));
 
     assert.equal(body.friends.length, 1);

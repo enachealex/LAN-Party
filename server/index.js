@@ -703,7 +703,7 @@ async function main() {
   registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
-  registerVaultRoutes({ app, db, authMiddleware, getUserByUsername, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
+  registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
 
   app.post('/files/upload', authMiddleware, (req, res) => {
     upload.single('file')(req, res, (err) => {
@@ -832,13 +832,24 @@ async function main() {
     console.log('socket connected', socket.id);
     // The voice room this socket currently occupies (sockets join at most one voice room).
     const voiceRoomOf = (s) => { for (const r of s.rooms) if (r.startsWith('voice:')) return r; return null; };
-    sfu.bindSocket(socket, voiceRoomOf);
-    // try to read token from handshake
+    // try to read token from handshake. Read BEFORE anything is bound, so the membership guard below
+    // can never observe an unset socketUser.
     const token = socket.handshake.auth && socket.handshake.auth.token;
     let socketUser = null;
     if (token) {
       try { socketUser = jwt.verify(token, JWT_SECRET).username; } catch (e) { socketUser = null }
     }
+
+    // Membership gate for VOICE rooms and activities. Text channels were gated (the 'join' handler
+    // checks roleOf and answers server:denied) but voice and activities were not: any socket — even
+    // one that presented no token at all, since a bad token only leaves socketUser null rather than
+    // refusing the connection — could join `voice:<serverId>:<channelId>` by guessing the ids and
+    // then read the participant list, receive activity state, and start or drive activities.
+    // roleOf() already returns null for a missing username and 'member' for the public commons, so it
+    // is exactly the right check.
+    const mayUseVoice = async (serverId) => !!(await roleOf(serverId, socketUser));
+
+    sfu.bindSocket(socket, voiceRoomOf, mayUseVoice);
     if (socketUser) {
       socket.join(`user:${socketUser}`);
       setUserPresenceByUsername(socketUser, 'available')
@@ -1038,20 +1049,23 @@ async function main() {
     });
 
     // Activities: start one for the voice room (everyone in it gets it), relay events, or stop.
-    socket.on('activity:start', ({ serverId = 'demo', channelId = 'voice1', type } = {}) => {
+    socket.on('activity:start', async ({ serverId = 'demo', channelId = 'voice1', type } = {}) => {
       if (!ACTIVITY_TYPES.includes(type)) return;
+      if (!(await mayUseVoice(serverId))) return;
       const room = `voice:${serverId}:${channelId}`;
       activities[room] = { type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon' };
       broadcastActivity(room, activities[room]);
     });
-    socket.on('activity:event', ({ serverId = 'demo', channelId = 'voice1', event } = {}) => {
+    socket.on('activity:event', async ({ serverId = 'demo', channelId = 'voice1', event } = {}) => {
+      if (!(await mayUseVoice(serverId))) return;
       const room = `voice:${serverId}:${channelId}`;
       const act = activities[room];
       if (!act || !event || typeof event !== 'object') return;
       applyActivityEvent(act, event, clients[socket.id]?.name || 'Anon', { room });
       broadcastActivity(room, act);
     });
-    socket.on('activity:stop', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+    socket.on('activity:stop', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      if (!(await mayUseVoice(serverId))) return;
       const room = `voice:${serverId}:${channelId}`;
       delete activities[room];
       io.to(room).emit('activity:update', null);
@@ -1090,6 +1104,7 @@ async function main() {
 
     // Voice signaling: simple mesh signaling via server
     socket.on('voice:join', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      if (!(await mayUseVoice(serverId))) { socket.emit('server:denied', { serverId }); return; }
       const room = `voice:${serverId}:${channelId}`;
       socket.join(room);
       const roomSet = io.sockets.adapter.rooms.get(room) || new Set();

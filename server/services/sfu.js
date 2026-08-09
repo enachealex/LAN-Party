@@ -133,7 +133,9 @@ function createSfu({ io }) {
 
   // Wire the per-socket signaling. `roomOf(socket)` returns the voice room this socket is in (the
   // caller owns room membership); handlers verify it so a socket can't produce into a room it left.
-  function bindSocket(socket, roomOf) {
+  // `mayUseVoice(serverId)` is the membership gate — sfu:caps names a server/channel explicitly, so
+  // without it an ungated socket could probe (and spin up a router for) any room it could name.
+  function bindSocket(socket, roomOf, mayUseVoice = async () => true) {
     const fail = (cb, msg) => { if (typeof cb === 'function') cb({ error: msg }) };
 
     // Capability probe + router caps. Answering null (not an error) = "use the mesh". The client
@@ -144,6 +146,9 @@ function createSfu({ io }) {
       if (!enabled()) return cb(null);
       const explicit = payload && payload.serverId && payload.channelId
         ? `voice:${payload.serverId}:${payload.channelId}` : null;
+      // An explicitly named server must be one this socket is a member of. Answering null (not an
+      // error) keeps the client's mesh fallback working for a genuine non-member.
+      if (explicit && !(await mayUseVoice(payload.serverId))) return cb(null);
       const roomName = explicit || roomOf(socket);
       if (!roomName) return cb(null);
       try {
