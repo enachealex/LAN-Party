@@ -23,12 +23,15 @@ function hookCleanup() {
   process.on('uncaughtException', (err) => { killAll(); throw err; });
 }
 
-async function startServer() {
+// `opts.env` adds/overrides environment variables for this server, so a test can boot a feature that
+// is gated behind config (e.g. VAULT_SSO_SECRET) — and can also boot it WITHOUT that config to prove
+// the feature stays disabled.
+async function startServer(opts = {}) {
   hookCleanup();
   const port = nextPort++;
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanparty-test-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
-    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, JWT_SECRET: 'test-secret' },
+    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, JWT_SECRET: 'test-secret', ...(opts.env || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   running.add(child);

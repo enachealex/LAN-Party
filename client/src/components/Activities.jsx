@@ -5,7 +5,7 @@ import React, { useEffect, useRef, useState } from 'react'
 // entry here + a view below + a reducer branch on the server.
 export const ACTIVITY_TYPES = [
   { id: 'music', label: 'Music', icon: '🎵', hint: 'Queue songs — everyone hears them in sync' },
-  { id: 'movie', label: 'Movie Night', icon: '🍿', hint: 'Watch a film together in Vault Movies' },
+  { id: 'movie', label: 'Vault Player', icon: '🍿', hint: 'Watch a film together, in sync, via Vault Player' },
   { id: 'sketch', label: 'Sketch & Guess', icon: '✏️', hint: 'Draw the word — friends race to guess it' },
   { id: 'watch', label: 'Watch Together', icon: '🎬', hint: 'Watch a YouTube video in sync' },
   { id: 'whiteboard', label: 'Whiteboard', icon: '🎨', hint: 'Draw on a shared canvas' },
@@ -765,6 +765,26 @@ function MovieNight({ state, onEvent }) {
   }
   const server = state.server || VAULT_PUBLIC_HOST
   const launch = `vaultmovies://join?code=${encodeURIComponent(state.code)}&server=${encodeURIComponent(server)}`
+
+  // Hand Vault Player a short-lived SSO assertion so the user lands already signed in as their LAN
+  // Party identity. Minted on CLICK, not on mount: the assertion only lives 60s, so fetching it
+  // early would usually hand over an expired one. Never the LAN Party session token itself.
+  const openInVaultPlayer = async (e) => {
+    e.preventDefault()
+    let url = launch
+    try {
+      const t = localStorage.getItem('lanparty_token') || ''
+      const r = await fetch(`${SERVER_URL}/integrations/vault/sso-token`, {
+        method: 'POST', headers: { Authorization: `Bearer ${t}` },
+      })
+      if (r.ok) {
+        const { token } = await r.json()
+        if (token) url += `&sso=${encodeURIComponent(token)}`
+      }
+      // A 503 just means SSO isn't configured — fall through and open without it.
+    } catch (_) { /* offline or blocked: the plain deep link still works */ }
+    window.location.href = url
+  }
   const heading = info?.title || state.title || 'Movie night'
 
   // Watchable right here: stream it from the relay and follow the host.
@@ -793,7 +813,7 @@ function MovieNight({ state, onEvent }) {
           <span className="movie-playbar-sync">
             {info.playing === false ? 'Paused by the host' : `In sync with ${info.host || 'the host'}`}
           </span>
-          <a className="movie-playbar-app" href={launch}>Open in the app instead</a>
+          <a className="movie-playbar-app" href={launch} onClick={openInVaultPlayer}>Open in the app instead</a>
           <button type="button" className="movie-change" onClick={() => onEvent({ kind: 'clear' })}>Change room</button>
         </div>
       </div>
@@ -807,7 +827,7 @@ function MovieNight({ state, onEvent }) {
     ? 'This room is hosted on a local network address, which a web page can’t stream from.'
     : info?.service
       ? `Playing on ${info.service} — everyone opens it in their own app.`
-      : info?.webReason || 'This film needs the Vault Movies app.'
+      : info?.webReason || 'This film needs the Vault Player app.'
 
   return (
     <div className="movie-activity">
@@ -818,7 +838,7 @@ function MovieNight({ state, onEvent }) {
         <div className="movie-needsapp">
           {infoErr || (info ? needsApp : 'Checking the room…')}
         </div>
-        <a className="movie-join" href={launch}>Open in Vault Movies</a>
+        <a className="movie-join" href={launch} onClick={openInVaultPlayer}>Open in Vault Player</a>
         <div className="movie-foot">
           <a className="movie-get" href={VAULT_DOWNLOAD} target="_blank" rel="noreferrer">Don&apos;t have Vault Movies?</a>
           <button type="button" className="movie-change" onClick={() => onEvent({ kind: 'clear' })}>Change room</button>

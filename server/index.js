@@ -20,6 +20,7 @@ const { createSfu } = require('./services/sfu');
 const { registerMediaRoutes } = require('./routes/media');
 const { registerAuthRoutes } = require('./routes/auth');
 const { registerSocialRoutes } = require('./routes/social');
+const { registerVaultRoutes } = require('./routes/vault');
 const { registerServerRoutes } = require('./routes/servers');
 const { registerLibraryRoutes } = require('./routes/library');
 
@@ -700,6 +701,9 @@ async function main() {
 
   // Presence / friends / direct messages (routes/social.js).
   registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
+  // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
+  // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
+  registerVaultRoutes({ app, db, authMiddleware, getUserByUsername, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
 
   app.post('/files/upload', authMiddleware, (req, res) => {
     upload.single('file')(req, res, (err) => {
