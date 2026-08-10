@@ -6894,8 +6894,11 @@ export default function App() {
 
             {isAuthenticated && (
               <>
-                <h3 className="profile-settings-section-title">Account Removal</h3>
+                {/* The heading sits INSIDE the danger zone so it lands below that div's border-top —
+                    the divider should separate the account details from this section, not sit under
+                    its heading. */}
                 <div className="profile-danger-zone">
+                  <h3 className="profile-settings-section-title profile-danger-title">Account Removal</h3>
                   <button type="button" className="profile-deactivate-btn" onClick={requestDeactivate}>Delete Account</button>
                   <span className="profile-danger-hint">Permanently deletes your account &amp; data. We email a confirmation link first.</span>
                 </div>

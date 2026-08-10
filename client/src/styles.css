@@ -2042,3 +2042,7 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .mictest-meter{height:104px;width:18px}
   .mictest-row{gap:10px}
 }
+
+/* The Account Removal heading lives inside the danger zone (below its divider), so it needs the
+   section-title look without the extra top margin a standalone heading carries. */
+.profile-danger-title{margin:0 0 2px}
