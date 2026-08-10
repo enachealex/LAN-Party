@@ -28,6 +28,8 @@ import AppViewer from './components/AppViewer'
 import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
+import MicTest from './components/MicTest'
+import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
 import { SfuSession } from './sfu'
@@ -1033,9 +1035,12 @@ export default function App() {
   const [showPreJoin, setShowPreJoin] = useState(false)
   const [preJoinChannelId, setPreJoinChannelId] = useState('voice1')
   const [preJoinCamOn, setPreJoinCamOn] = useState(false)
+  const [showMicTest, setShowMicTest] = useState(false) // pre-join: reveal the full mic test
   const [preJoinMuted, setPreJoinMuted] = useState(false)
   const preJoinMicStreamRef = useRef(null) // mic acquired during pre-join (transferred to the call on join)
   const micMeterRef = useRef(null)     // the meter mask element (updated directly to avoid re-renders)
+  const micBtnRef = useRef(null)       // in-call mic button; its --mic-level is written per frame
+  const callMeterRef = useRef(null)    // createMicMeter handle for the in-call level indicator
   const micAnalyserRef = useRef(null)  // { ctx, src, rafId, stopped } for the live mic level meter
   const [regUsernameError, setRegUsernameError] = useState(null)
   const [regUsernameAvailable, setRegUsernameAvailable] = useState(null)
@@ -3038,6 +3043,26 @@ export default function App() {
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [])
+
+  // Drive the in-call mic button's level indicator. Runs only while actually in a call, and is
+  // rebuilt when the local stream is replaced (device change, camera toggle rebuilding the stream).
+  // The level is written straight onto the element as a CSS variable — going through React state
+  // would re-render this whole component ~60x a second.
+  useEffect(() => {
+    const stream = localStream
+    if (!inVoice || !stream || !stream.getAudioTracks().length) {
+      try { callMeterRef.current?.stop() } catch (_) { /* ignore */ }
+      callMeterRef.current = null
+      micBtnRef.current?.style.setProperty('--mic-level', '0')
+      return undefined
+    }
+    const meter = createMicMeter(stream, (level) => {
+      // A muted track yields silence, so the indicator honestly shows nothing while muted.
+      micBtnRef.current?.style.setProperty('--mic-level', level.toFixed(3))
+    })
+    callMeterRef.current = meter
+    return () => { try { meter.stop() } catch (_) { /* ignore */ } }
+  }, [inVoice, localStream])
 
   // Phone drawer: any navigation (server, channel or DM) closes it so the chat is revealed. Covers
   // every entry point at once instead of threading a close call through each handler.
@@ -5574,7 +5599,7 @@ export default function App() {
                             <div className="voice-effects-hint">🔒 Your mic &amp; speakers are only accessed while you're in a call.</div>
                           </div>
                         )}
-                        <button className={`voice-ctrl${micMuted ? ' toggled' : ''}`} onClick={toggleMute} title={micMuted ? 'Unmute' : 'Mute'} aria-label="Toggle microphone" aria-pressed={micMuted}>
+                        <button ref={micBtnRef} className={`voice-ctrl voice-ctrl-mic${micMuted ? ' toggled' : ''}`} onClick={toggleMute} title={micMuted ? 'Unmute' : 'Mute'} aria-label="Toggle microphone" aria-pressed={micMuted}>
                           {micMuted ? <MicOffIcon /> : <MicOnIcon />}
                         </button>
                         <button className="voice-ctrl-caret" onClick={() => setShowAudioMenu((v) => { if (!v) loadAudioDevices(); return !v })} title="Audio settings — choose microphone &amp; speaker" aria-label="Audio device settings" aria-haspopup="menu" aria-expanded={showAudioMenu}>▾</button>
@@ -5889,6 +5914,16 @@ export default function App() {
                     </select>
                   ) : <div className="voice-effects-hint">Detecting microphones…</div>}
                   <div className="prejoin-meter" title="Live microphone level" aria-hidden="true"><div className="prejoin-meter-mask" ref={micMeterRef} /></div>
+                  <button type="button" className="profile-link-btn" onClick={() => setShowMicTest((v) => !v)} aria-expanded={showMicTest}>
+                    {showMicTest ? 'Hide microphone test' : 'Test microphone'}
+                  </button>
+                  {showMicTest && (
+                    <MicTest
+                      devices={audioInputs}
+                      selectedDeviceId={selectedMicId}
+                      onSelectDevice={preJoinSelectMic}
+                    />
+                  )}
                 </div>
                 {supportsSpeakerSelect && (
                   <div className="prejoin-group">
@@ -6797,6 +6832,15 @@ export default function App() {
                 <button type="button" className="connect-btn" onClick={addCustomTag}>Add</button>
               </div>
             )}
+
+            {/* Microphone — check the mic works without having to join a call first. */}
+            <h3 className="profile-settings-section-title">🎙️ Microphone</h3>
+            <p className="profile-hint">Check your mic is heard, and hear yourself back before you join a call.</p>
+            <MicTest
+              devices={audioInputs}
+              selectedDeviceId={selectedMicId}
+              onSelectDevice={(id) => { setSelectedMicId(id); loadAudioDevices() }}
+            />
 
             {/* Desktop notifications */}
             <h3 className="profile-settings-section-title">🔔 Notifications</h3>

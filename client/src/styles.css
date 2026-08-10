@@ -1998,3 +1998,47 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .music-mini{width:40px;height:40px}
   .music-seek{flex:1 1 100%;min-width:0}
 }
+
+/* ---------------------------------------------------------------------------
+   Microphone feedback: is my mic working?
+   1. The in-call mic button fills from the bottom with the live input level, so
+      you can see you're being picked up without leaving the call.
+   2. The Test Microphone panel adds a meter, a no-signal warning, and record +
+      playback — a moving bar can't tell you the audio actually sounds right.
+   --mic-level (0..1) is written straight onto the button each frame from JS.
+   ------------------------------------------------------------------------- */
+.voice-ctrl-mic{position:relative;overflow:hidden}
+.voice-ctrl-mic::after{
+  content:'';position:absolute;left:0;right:0;bottom:0;
+  height:calc(var(--mic-level, 0) * 100%);
+  background:linear-gradient(180deg, rgba(52,211,153,.95), rgba(52,211,153,.45));
+  pointer-events:none;z-index:0;border-radius:inherit;
+}
+/* Keep the icon above the fill. */
+.voice-ctrl-mic > *{position:relative;z-index:1}
+/* Muted: the track is disabled so the level is silence anyway — grey out any residual fill so the
+   indicator can never imply you're being heard while muted. */
+.voice-ctrl-mic.toggled::after{background:rgba(255,255,255,.18)}
+
+/* Test Microphone panel */
+.mictest{margin:6px 0 14px}
+/* flex-start, not stretch: stretching made the skinny bar as tall as the controls column. */
+.mictest-row{display:flex;align-items:flex-start;gap:14px;margin:10px 0}
+.mictest-meter{
+  width:14px;height:84px;flex-shrink:0;position:relative;overflow:hidden;
+  border-radius:8px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
+  display:flex;align-items:flex-end;
+}
+.mictest-meter-fill{
+  display:block;width:100%;height:0%;
+  background:linear-gradient(180deg,#f0a020,#34d399);
+}
+.mictest-controls{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;justify-content:center}
+.mictest-status{font-size:13px}
+.mictest-ok{color:#34d399;font-weight:700}
+.mictest-listening{color:var(--muted)}
+.mictest-rec{color:#f23f43;font-weight:700}
+@media (max-width: 820px){
+  .mictest-meter{height:104px;width:18px}
+  .mictest-row{gap:10px}
+}
