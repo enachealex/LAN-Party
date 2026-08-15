@@ -29,6 +29,7 @@ import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSo
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
 import MicTest from './components/MicTest'
+import BootSplash from './components/BootSplash'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
@@ -981,6 +982,13 @@ export default function App() {
   // Whether the initial session-restore check has completed. If a token exists we hold the
   // login modal back until /auth/me resolves, so it doesn't flash on refresh for signed-in users.
   const [authChecked, setAuthChecked] = useState(() => !localStorage.getItem('lanparty_token'))
+  // Startup sequence for a RETURNING user (a stored token). A signed-out visitor skips the splash and
+  // goes straight to the login screen, so `bootDone` starts true for them.
+  const hadTokenAtBoot = useRef(!!localStorage.getItem('lanparty_token'))
+  const [bootSteps, setBootSteps] = useState(() => (hadTokenAtBoot.current ? { session: 'active' } : {}))
+  const [bootDone, setBootDone] = useState(() => !hadTokenAtBoot.current)
+  const [bootNote, setBootNote] = useState(null)
+  const markBoot = (id, state) => setBootSteps((prev) => (prev[id] === state ? prev : { ...prev, [id]: state }))
   const [authMode, setAuthMode] = useState('login') // 'login' | 'register'
   const [loginUsername, setLoginUsername] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
@@ -2262,6 +2270,7 @@ export default function App() {
   }
 
   const connect = (userName, t) => {
+    markBoot('connect', 'active')
     if (socket) {
       try { socket.disconnect(); } catch (e) {}
     }
@@ -2276,10 +2285,19 @@ export default function App() {
       const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
       s.emit('join', { serverId: sid, name: nick })
       setConnected(true)
-      loadFriendsData(authToken)
-      loadMessagesData(authToken)
-      loadServers()
-      loadUnreads()
+      markBoot('connect', 'done')
+      markBoot('sync', 'active')
+      // allSettled, not all: one failing fetch must not strand the splash. The individual loaders
+      // already swallow and log their own errors, so this is belt & braces.
+      Promise.allSettled([
+        loadFriendsData(authToken),
+        loadMessagesData(authToken),
+        loadServers(),
+        loadUnreads(),
+      ]).then(() => {
+        markBoot('sync', 'done')
+        setBootDone(true)
+      })
     })
     s.on('friend:pending-updated', () => loadFriendsData(authToken))
     s.on('friend:list-updated', () => { loadFriendsData(authToken); loadMessagesData(authToken) })
@@ -3063,6 +3081,41 @@ export default function App() {
     callMeterRef.current = meter
     return () => { try { meter.stop() } catch (_) { /* ignore */ } }
   }, [inVoice, localStream])
+
+  // Session restored (or the stored token turned out to be stale) -> advance the splash.
+  useEffect(() => {
+    if (!hadTokenAtBoot.current || bootDone || !authChecked) return
+    if (!isAuthenticated) { setBootDone(true); return } // stale token: show the login screen instead
+    markBoot('session', 'done')
+
+    // Update check is desktop-only, and the bridge only exists in shells new enough to expose it —
+    // web and older installs skip the step rather than stalling on an event that never comes.
+    const bridge = typeof window !== 'undefined' ? window.desktop : null
+    if (!bridge || typeof bridge.onUpdateStatus !== 'function') {
+      markBoot('updates', 'skipped')
+    } else {
+      markBoot('updates', 'active')
+      let settled = false
+      const finish = (state) => { if (!settled) { settled = true; markBoot('updates', state) } }
+      bridge.onUpdateStatus((status) => {
+        // 'downloading' is left running in the background — electron-updater installs on quit, so
+        // there's no reason to hold the app hostage to it.
+        if (status === 'available' || status === 'none' || status === 'downloading' || status === 'error') finish('done')
+      })
+      // Never let a silent feed hold up startup.
+      setTimeout(() => finish('done'), 4000)
+    }
+  }, [authChecked, isAuthenticated, bootDone])
+
+  // Fail open: if any step stalls, reveal the app rather than trapping the user on the splash.
+  // Say so at 4s first — on a slow connection a silent splash is indistinguishable from a hang, and
+  // the note has to land BEFORE the reveal or it unmounts with the splash and is never read.
+  useEffect(() => {
+    if (bootDone) return undefined
+    const slow = setTimeout(() => setBootNote('Taking longer than usual — still syncing…'), 4000)
+    const t = setTimeout(() => setBootDone(true), 9000)
+    return () => { clearTimeout(slow); clearTimeout(t) }
+  }, [bootDone])
 
   // Phone drawer: any navigation (server, channel or DM) closes it so the chat is revealed. Covers
   // every entry point at once instead of threading a close call through each handler.
@@ -5169,6 +5222,14 @@ export default function App() {
   return (
     <div className={`app${mobileNavOpen ? ' mobile-nav-open' : ''}`}>
 
+      {!bootDone && (
+        <BootSplash
+          steps={bootSteps}
+          note={bootNote}
+          resolveSrc={(u) => import.meta.env.BASE_URL + u}
+        />
+      )}
+
       {showInstallGate && (
         <MobileInstallGate
           deferredPrompt={deferredPrompt}
@@ -5271,7 +5332,10 @@ export default function App() {
                     >
                       <span aria-hidden="true">☰</span>
                     </button>
-                    <div className="topbar-server">{topbarServerLabel}</div>
+                    {/* In a server the name is already the header above the channel list, so
+                        repeating it here is redundant. In DM/group view this slot is the "Direct
+                        Message" / "Group Message" qualifier, which appears nowhere else — keep it. */}
+                    {showHomeChat && <div className="topbar-server">{topbarServerLabel}</div>}
                     <div className="topbar-channel">{topbarChannelLabel}</div>
                   </div>
 

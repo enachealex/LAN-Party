@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld('desktop', {
   platform: process.platform,
   // Window hidden/shown to the tray → the client pops the call video into the floating overlay.
   onVisibility: (cb) => ipcRenderer.on('app:visibility', (_e, visible) => cb(visible)),
+  // Auto-update progress, so the startup splash can show a real "checking for updates" step.
+  // Statuses: 'checking' | 'available' | 'none' | 'downloading' | 'downloaded' | 'error'.
+  onUpdateStatus: (cb) => ipcRenderer.on('app:update-status', (_e, status) => cb(status)),
   // Show / hide / close the transparent always-on-top video overlay.
   overlayShow: () => ipcRenderer.send('overlay:show'),
   overlayHide: () => ipcRenderer.send('overlay:hide'),

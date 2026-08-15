@@ -161,19 +161,35 @@ function configureMedia() {
 // Check for a new shell version at startup (and periodically), download it in the background, and
 // install it. Because chats live on the server, updating the shell never touches conversation data
 // — the app just reloads the live web app after restarting and everything is already in sync.
+// Tell the renderer where the update check is up to, so the startup splash isn't guessing. Safe to
+// call before the window exists or after it's gone.
+function sendUpdateStatus(status) {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app:update-status', status)
+  } catch (_) { /* window torn down mid-check */ }
+}
+
 function setupAutoUpdates() {
-  if (!app.isPackaged) return // no update feed when run unpackaged (dev)
+  // Unpackaged dev runs have no feed, but the renderer still waits on a status — answer immediately
+  // instead of letting the splash sit on this step until its timeout.
+  if (!app.isPackaged) { sendUpdateStatus('none'); return }
 
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = true
 
+  autoUpdater.on('checking-for-update', () => sendUpdateStatus('checking'))
+  autoUpdater.on('update-not-available', () => sendUpdateStatus('none'))
+  autoUpdater.on('download-progress', () => sendUpdateStatus('downloading'))
+
   autoUpdater.on('update-available', (info) => {
+    sendUpdateStatus('available')
     if (Notification.isSupported()) {
       new Notification({ title: 'LAN Party', body: `Downloading update v${info.version}…` }).show()
     }
   })
 
   autoUpdater.on('update-downloaded', (info) => {
+    sendUpdateStatus('downloaded')
     const choice = dialog.showMessageBoxSync(mainWindow, {
       type: 'info',
       buttons: ['Restart now', 'Later'],
@@ -188,6 +204,7 @@ function setupAutoUpdates() {
   })
 
   autoUpdater.on('error', (err) => {
+    sendUpdateStatus('error')
     console.error('auto-update error:', err == null ? 'unknown' : (err.stack || err).toString())
   })
 
