@@ -174,19 +174,46 @@ function mediaKind(attachment) {
 
 // If a message's text is a single bare http(s) URL pointing at media, turn it into a
 // pseudo-attachment so it renders inline (and joins the lightbox). Returns null otherwise.
-function mediaFromText(text) {
+// Inline media inside a message body. Two shapes count: a bare url on its own, and a caption followed
+// by a url — "look at this <url>". The second shape is what the GIF picker sends when you type
+// alongside an external Giphy pick, and it is also how people paste links; it used to fall through to
+// a raw underlined link, which looked broken next to every other GIF in the channel.
+//
+// A url in the MIDDLE of a sentence is deliberately still just a link. Promoting that to a full-width
+// image is rarely what someone meant, and it would change how existing messages render.
+function mediaUrlFromText(text) {
   const trimmed = (text || '').trim()
-  if (!/^https?:\/\/\S+$/i.test(trimmed) || /\s/.test(trimmed)) return null
-  let pathname = trimmed
+  if (!trimmed) return null
+  const last = trimmed.split(/\s+/).pop()
+  return /^https?:\/\/\S+$/i.test(last) ? last : null
+}
+
+function mediaFromText(text) {
+  const url = mediaUrlFromText(text)
+  if (!url) return null
+  let pathname = url
   try {
-    pathname = new URL(trimmed).pathname
+    pathname = new URL(url).pathname
   } catch {
     return null
   }
-  const name = pathname.split('/').pop() || trimmed
-  const probe = { url: trimmed, name }
+  const name = pathname.split('/').pop() || url
+  const probe = { url, name }
   if (!isMediaAttachment(probe)) return null
   return probe
+}
+
+/**
+ * The words in front of inline media — the caption to show with it. Empty when the message was only
+ * a url, which is what lets a bare GIF still render as media alone with no stray text above it.
+ * @param {string} text
+ * @returns {string}
+ */
+function captionFromText(text) {
+  const media = mediaFromText(text)
+  const trimmed = (text || '').trim()
+  if (!media) return trimmed
+  return trimmed.slice(0, trimmed.length - media.url.length).trim()
 }
 
 // Ordered list of every media item in a message array (attachments + media URLs) for lightbox cycling.
@@ -470,7 +497,9 @@ function renderMessageText(text, emojiMap, onSaveEmoji, currentUser) {
 function pinPreview(m) {
   if (!m) return ''
   const bodyMedia = m.attachment || mediaFromText(m.text)
-  if (m.text && !mediaFromText(m.text)) return m.text.length > 90 ? m.text.slice(0, 90) + '…' : m.text
+  // A captioned GIF previews as its caption; only a media-only message falls through to "🎞 GIF".
+  const caption = m.attachment ? (m.text || '') : captionFromText(m.text)
+  if (caption) return caption.length > 90 ? caption.slice(0, 90) + '…' : caption
   if (bodyMedia) {
     if (isGifAttachment(bodyMedia)) return '🎞 GIF'
     if (isImageAttachment(bodyMedia)) return '📷 Image'
@@ -492,12 +521,14 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
   const isOutgoing = message.author === currentUser
   const isToolbarActive = String(activeReactionMessageId) === String(message.id)
   const reactions = message.reactions || {}
-  // A bare image/gif/video URL pasted as the message body is rendered inline as media.
+  // An image/gif/video URL in the message body is rendered inline as media, with any words in front
+  // of it shown as its caption rather than leaving the raw url on screen.
   const textMedia = message.attachment ? null : mediaFromText(message.text)
-  // True when the bubble's main content is media (no body text) so it can shrink-wrap tightly.
+  const bodyText = textMedia ? captionFromText(message.text) : message.text
+  // True when the bubble's main content is media (no caption) so it can shrink-wrap tightly.
   // Reactions are allowed — they render below the media without widening the bubble.
   const hasMediaContent = Boolean(message.attachment) || Boolean(textMedia)
-  const isMediaOnly = hasMediaContent && !(message.text && !textMedia)
+  const isMediaOnly = hasMediaContent && !bodyText
   const timestamp = formatMessageTime(message.ts || message.createdAt || message.created_at)
   const toggleTimestamp = () => setShowTimestamp((visible) => !visible)
   const copyMessage = async () => {
@@ -724,9 +755,9 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
               <div className="msg-edit-hint">escape to <button type="button" onClick={cancelEdit}>cancel</button> · enter to <button type="button" onClick={saveEdit}>save</button></div>
             </div>
           ) : (
-            message.text && !textMedia && (
+            bodyText && (
               <div className="msg-text">
-                {renderMessageText(message.text, emojiMap, onSaveEmoji, currentUser)}
+                {renderMessageText(bodyText, emojiMap, onSaveEmoji, currentUser)}
                 {message.edited && <span className="msg-edited"> (edited)</span>}
               </div>
             )
