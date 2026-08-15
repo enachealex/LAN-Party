@@ -23,6 +23,7 @@ const { registerSocialRoutes } = require('./routes/social');
 const { registerVaultRoutes } = require('./routes/vault');
 const { registerServerRoutes } = require('./routes/servers');
 const { registerLibraryRoutes } = require('./routes/library');
+const { rateLimit } = require('./rateLimit');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const PORT = process.env.PORT || 3000;
@@ -49,14 +50,17 @@ const TILE_ICON_TYPES = { 'image/webp': '.webp', 'image/png': '.png', 'image/jpe
 const AVATAR_TYPES = { ...TILE_ICON_TYPES, 'image/gif': '.gif' };
 
 // Raster image signatures, longest-prefix first so 'RIFF….WEBP' can't be mistaken for anything else.
-// `min` is how many leading bytes the check needs, so a small-but-valid GIF isn't rejected for being
-// shorter than the widest signature.
+// Every candidate must still supply the full HEADER_BYTES below: the smallest decodable file of any of
+// these formats is far larger than that (a 1x1 GIF is ~35 bytes), so a file that is nothing but a
+// signature — a truncated download — is malformed, and accepting it would store an avatar that renders
+// broken everywhere while reporting success.
+const HEADER_BYTES = 12;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const IMAGE_SIGNATURES = [
-  { format: 'webp', min: 12, test: (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP' },
-  { format: 'png', min: 8, test: (b) => b.subarray(0, 8).equals(PNG_SIGNATURE) },
-  { format: 'gif', min: 6, test: (b) => ['GIF87a', 'GIF89a'].includes(b.subarray(0, 6).toString('latin1')) },
-  { format: 'jpeg', min: 3, test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { format: 'webp', test: (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP' },
+  { format: 'png', test: (b) => b.subarray(0, 8).equals(PNG_SIGNATURE) },
+  { format: 'gif', test: (b) => ['GIF87a', 'GIF89a'].includes(b.subarray(0, 6).toString('latin1')) },
+  { format: 'jpeg', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
 ];
 const FORMAT_EXTENSIONS = { png: '.png', jpeg: '.jpg', webp: '.webp', gif: '.gif' };
 
@@ -71,9 +75,10 @@ async function detectImageFormat(filePath) {
   let fh;
   try {
     fh = await fs.promises.open(filePath, 'r');
-    const { buffer, bytesRead } = await fh.read(Buffer.alloc(12), 0, 12, 0);
+    const { buffer, bytesRead } = await fh.read(Buffer.alloc(HEADER_BYTES), 0, HEADER_BYTES, 0);
+    if (bytesRead < HEADER_BYTES) return null; // too short to be any real image
     for (const sig of IMAGE_SIGNATURES) {
-      if (bytesRead >= sig.min && sig.test(buffer)) return sig.format;
+      if (sig.test(buffer)) return sig.format;
     }
     return null;
   } catch (_) {
@@ -591,14 +596,24 @@ async function main() {
     const storedAvatar = before.profile?.avatarUrl;
     const hasProfile = typeof settings.profile === 'object' && settings.profile !== null;
 
-    // A client that was already running when rescueLegacyAvatars migrated this user still holds the
-    // old /uploads url in memory, and saving a profile posts the whole profile object — which would
-    // revert the migration and leave the profile pointing at a file the 7-day sweep then deletes.
-    // Nothing legitimately sets an avatar to a /uploads path any more, so the stored copy wins.
-    if (hasProfile && typeof settings.profile.avatarUrl === 'string'
-      && settings.profile.avatarUrl.startsWith('/uploads/')
-      && typeof storedAvatar === 'string' && storedAvatar.startsWith('/avatars/')) {
-      settings.profile = { ...settings.profile, avatarUrl: storedAvatar };
+    // Saving a profile posts the WHOLE profile object from client state, so a client can send an
+    // avatarUrl it captured before something else changed it — a second tab or device, or a session
+    // that was open when rescueLegacyAvatars ran. Writing a stale pointer is doubly destructive: the
+    // profile ends up aimed at a file that is already gone, AND the release below then deletes the
+    // picture that was actually current, losing both. Two guards, in order:
+    const incomingAvatar = hasProfile ? settings.profile.avatarUrl : undefined;
+    const keepStored = () => {
+      settings.profile = { ...settings.profile, avatarUrl: typeof storedAvatar === 'string' ? storedAvatar : '' };
+    };
+    if (typeof incomingAvatar === 'string' && incomingAvatar !== storedAvatar) {
+      // 1. A legacy /uploads url never wins over a migrated /avatars one, even if the original file is
+      //    still lying around un-swept — nothing legitimately points an avatar at /uploads any more.
+      if (incomingAvatar.startsWith('/uploads/') && typeof storedAvatar === 'string' && storedAvatar.startsWith('/avatars/')) {
+        keepStored();
+      // 2. Any of our own urls whose file is missing is a stale pointer, not a choice.
+      } else if (incomingAvatar.startsWith('/avatars/') && !managedAvatarExists(incomingAvatar)) {
+        keepStored();
+      }
     }
 
     await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(settings), username);
@@ -695,6 +710,18 @@ async function main() {
   };
   const removeTileIconFile = (url) => removeManagedFile(tileIconsDir, '/tile-icons/', url);
 
+  /** Resolve a /avatars/<name> url to its path on disk, or '' if it doesn't address one of our files. */
+  const avatarPathFor = (url) => {
+    if (typeof url !== 'string' || !/^\/avatars\/[A-Za-z0-9._-]+$/.test(url)) return '';
+    const target = path.resolve(avatarsDir, path.basename(url));
+    return target.startsWith(avatarsDir + path.sep) ? target : '';
+  };
+  /** Does this /avatars/ url still have a file behind it? */
+  const managedAvatarExists = (url) => {
+    const p = avatarPathFor(url);
+    return !!p && fs.existsSync(p);
+  };
+
   /**
    * Delete an avatar file, but only once nobody references it any more. Avatar urls are visible to
    * other users (they're in every member list), so someone can paste another person's url into their
@@ -778,7 +805,12 @@ async function main() {
   // Upload the caller's profile picture. Written straight onto the profile (like the entrance clip)
   // so the file and the pointer to it are never out of step, and so closing the editor without
   // saving can't leave an uploaded file that nothing references.
-  app.post('/profile/avatar', authMiddleware, async (req, res) => {
+  //
+  // Rate limited because avatars/ is deliberately never swept on a timer: without a ceiling, one
+  // account could sit in a loop stranding 5 MB files. That plus sweepOrphanAvatars() below bounds how
+  // much disk a single user can tie up — and avatars/ shares a volume with data.sqlite, so filling it
+  // would take the whole app down, not just pictures.
+  app.post('/profile/avatar', rateLimit({ id: 'avatar-upload', windowMs: 10 * 60_000, max: 20 }), authMiddleware, async (req, res) => {
     const saved = await receiveAvatar(req, res);
     if (!saved) return undefined; // receiveAvatar already answered
     const previous = await currentAvatarFile(req.user.username);
@@ -1516,11 +1548,53 @@ async function main() {
     });
   });
 
-  // Sweep expired uploads on startup, then hourly.
-  cleanupExpiredUploads().catch((err) => console.warn('upload cleanup failed', err));
-  setInterval(() => {
+  // Collect avatar files nothing points at any more. Avatars are exempt from the 7-day sweep by
+  // design, so without this they accumulate forever: a crash between writing a file and storing its
+  // url orphans one, and so does a settings write that drops the reference without going through the
+  // release path. Unreferenced files older than the grace period below are removed.
+  //
+  // The grace period matters — a file is on disk before its url is stored, so sweeping a brand-new
+  // upload would delete the picture out from under the request that just created it.
+  const ORPHAN_AVATAR_GRACE_MS = 24 * 60 * 60 * 1000;
+  async function sweepOrphanAvatars() {
+    let files;
+    try {
+      files = await fs.promises.readdir(avatarsDir);
+    } catch (_) {
+      return;
+    }
+    if (!files.length) return;
+    // One pass over the settings blobs: anything mentioning the filename counts as a reference, which
+    // errs towards keeping files rather than deleting one that is still in use.
+    const rows = await db.all("SELECT settings FROM users WHERE settings LIKE '%/avatars/%'");
+    const referenced = new Set();
+    for (const row of rows) {
+      for (const match of String(row.settings || '').matchAll(/\/avatars\/([A-Za-z0-9._-]+)/g)) {
+        referenced.add(match[1]);
+      }
+    }
+    const now = Date.now();
+    let removed = 0;
+    for (const name of files) {
+      if (referenced.has(name)) continue;
+      const full = path.join(avatarsDir, name);
+      try {
+        const stat = await fs.promises.stat(full);
+        if (!stat.isFile() || now - stat.mtimeMs < ORPHAN_AVATAR_GRACE_MS) continue;
+        await fs.promises.unlink(full);
+        removed += 1;
+      } catch (_) { /* vanished under us, or not ours to remove */ }
+    }
+    if (removed) console.log(`[avatars] removed ${removed} unreferenced picture(s)`);
+  }
+
+  // Sweep expired uploads on startup, then hourly. Orphaned avatars ride the same schedule.
+  const runSweeps = () => {
     cleanupExpiredUploads().catch((err) => console.warn('upload cleanup failed', err));
-  }, CLEANUP_INTERVAL_MS).unref();
+    sweepOrphanAvatars().catch((err) => console.warn('avatar cleanup failed', err));
+  };
+  runSweeps();
+  setInterval(runSweeps, CLEANUP_INTERVAL_MS).unref();
 
   // SPA fallback for the app: any /app/* GET returns the app's index.html so client-side routes
   // boot (must be LAST, after all API routes + static mounts). API paths stay at root and are

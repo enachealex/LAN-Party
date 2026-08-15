@@ -149,6 +149,34 @@ describe('profile pictures', () => {
     assert.equal((await fetch(base + current.data.url)).status, 404, 'the file it replaced is released');
   });
 
+  test('a stale /avatars url from a second session destroys nothing', async () => {
+    // Two sessions, both holding /avatars/A. One uploads /avatars/B (releasing A); the other then
+    // saves its stale draft. Writing that pointer would aim the profile at the deleted A AND release
+    // B on the way past — losing both files and leaving every avatar render a hard 404.
+    const first = await upload();
+    const stale = first.data.url;
+    const second = await upload(); // releases `stale`
+    assert.equal((await fetch(base + stale)).status, 404, 'precondition: the old file is gone');
+
+    const settings = (await call('GET', '/user/settings', undefined, token)).data.settings;
+    settings.profile = { ...(settings.profile || {}), avatarUrl: stale };
+    assert.equal((await call('POST', '/user/settings', { settings }, token)).status, 200);
+
+    assert.equal(await storedAvatar(), second.data.url, 'the live picture is kept');
+    assert.equal((await fetch(base + second.data.url)).status, 200, 'and its file was not released');
+  });
+
+  test('refuses a file that is nothing but a signature', async () => {
+    // A truncated download: the right magic bytes and nothing else. Storing it would report success
+    // while rendering broken everywhere, and would release the working picture it replaced.
+    const current = await upload();
+    const truncated = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const res = await upload(truncated, 'image/png', 'cut.png');
+    assert.equal(res.status, 400);
+    assert.equal(await storedAvatar(), current.data.url, 'the real picture is untouched');
+    assert.equal((await fetch(base + current.data.url)).status, 200);
+  });
+
   test('requires auth', async () => {
     const fd = new FormData();
     fd.append('image', new Blob([PNG_BYTES], { type: 'image/png' }), 'me.png');
@@ -186,6 +214,47 @@ describe('profile pictures', () => {
     theirs.profile = { avatarUrl: '' };
     await call('POST', '/user/settings', { settings: theirs }, other);
     assert.equal((await fetch(base + mine.data.url)).status, 404, 'collected once unreferenced');
+  });
+});
+
+describe('orphaned avatar files', () => {
+  let server, call, base, token, dataDir;
+
+  before(async () => {
+    server = await startServer();
+    call = apiFor(server.base);
+    base = server.base;
+    dataDir = server.dataDir;
+    token = await makeUser(call, 'orphanpic');
+  });
+  after(async () => { await server.stop(); });
+
+  test('an unreferenced file is collected, and a referenced one is not', async () => {
+    // avatars/ is exempt from the 7-day sweep on purpose, so files nothing points at would otherwise
+    // accumulate forever — a settings write that drops the reference without going through the release
+    // path is enough to strand one, which is an unbounded disk-fill lever for any account.
+    const fd = new FormData();
+    fd.append('image', new Blob([PNG_BYTES], { type: 'image/png' }), 'me.png');
+    const live = await call('POST', '/profile/avatar', fd, token);
+    const liveName = path.basename(live.data.url);
+
+    // An orphan old enough to be past the grace period (a fresh upload must NOT be swept).
+    const orphan = path.join(dataDir, 'avatars', 'orphan-old.png');
+    fs.writeFileSync(orphan, PNG_BYTES);
+    const old = Date.now() - (48 * 60 * 60 * 1000);
+    fs.utimesSync(orphan, new Date(old), new Date(old));
+    const fresh = path.join(dataDir, 'avatars', 'orphan-fresh.png');
+    fs.writeFileSync(fresh, PNG_BYTES);
+
+    // The sweep runs at boot, so a second server against the same data dir triggers it.
+    const second = await startServer({ env: { DATA_DIR: dataDir } });
+    try {
+      assert.ok(!fs.existsSync(orphan), 'the unreferenced file is gone');
+      assert.ok(fs.existsSync(fresh), 'a recent file is left alone (it may be mid-upload)');
+      assert.ok(fs.existsSync(path.join(dataDir, 'avatars', liveName)), 'the referenced picture survives');
+    } finally {
+      await second.stop();
+    }
   });
 });
 
