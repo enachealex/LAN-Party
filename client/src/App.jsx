@@ -907,6 +907,9 @@ export default function App() {
   // networks in production. Defaults to public STUN until the fetch resolves.
   const iceConfigRef = useRef([{ urls: 'stun:stun.l.google.com:19302' }])
   const [showMembersPanel, setShowMembersPanel] = useState(false)
+  // Which view the server side panel shows: 'channels' | 'members'. Group-DM members still use the
+  // right-side panel above, since that view has no channel list to share a panel with.
+  const [serverPaneTab, setServerPaneTab] = useState('channels')
   const [memberMenu, setMemberMenu] = useState(null) // right-click manage menu: { x, y, username, name, role }
   const [deferredPrompt, setDeferredPrompt] = useState(null)
   const [showInstallPanel, setShowInstallPanel] = useState(false)
@@ -3121,6 +3124,10 @@ export default function App() {
   // every entry point at once instead of threading a close call through each handler.
   useEffect(() => { setMobileNavOpen(false) }, [selectedServerId, activeChannel, homeChat])
 
+  // Switching servers returns the side panel to Channels: arriving somewhere new and seeing a member
+  // list instead of the channels you came for is disorienting.
+  useEffect(() => { setServerPaneTab('channels') }, [selectedServerId])
+
   // Unlock synthesized UI sounds on the first user gesture (browsers suspend audio until then), and
   // give a soft click on any button/link press so interactions don't feel dead. playUiSound() itself
   // respects the enabled toggle, so this stays silent when sounds are turned off. Opt an element out
@@ -5304,7 +5311,9 @@ export default function App() {
         voiceServerId={inVoice ? voiceServerIdRef.current : null}
         onJoinVoice={joinVoiceChannel}
         onLeaveVoice={leaveVoice}
-        members={serverState?.members || []}
+        members={serverMembers}
+        paneTab={serverPaneTab}
+        onPaneTabChange={setServerPaneTab}
         socketId={socket?.id}
         onSelectMember={openMemberProfile}
         myRole={serverState?.myRole || 'member'}
@@ -5359,7 +5368,19 @@ export default function App() {
                       </button>
                     )}
                     {showMembersButton && (
-                      <button className="members-btn" onClick={() => setShowMembersPanel(true)}>Members</button>
+                      <button
+                        className="members-btn"
+                        onClick={() => {
+                          // In a server the list lives in the side panel's Members tab, so this button
+                          // reveals that instead of opening a second copy in a slide-over. On phones the
+                          // side panel is the nav drawer, so it has to be opened too.
+                          if (isHomeView) { setShowMembersPanel(true); return }
+                          setServerPaneTab('members')
+                          setMobileNavOpen(true)
+                        }}
+                      >
+                        Members
+                      </button>
                     )}
                   </div>
                 </div>

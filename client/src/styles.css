@@ -262,6 +262,29 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
 .dc-voice-join-btn:hover{filter:brightness(1.08)}
 .dc-voice-join-btn.leave{background:#ed4245;color:#fff}
 .dc-channel-hash{width:100%;text-align:center;line-height:1}
+/* Channels / Members switcher: one side panel, two views. Sits directly under the server header so
+   it reads as a control for everything below it. */
+.dc-pane-tabs{display:flex;gap:4px;padding:0 8px;margin:0 0 6px}
+.dc-pane-tab{
+  flex:1;display:flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 8px;border:none;border-radius:8px;cursor:pointer;
+  background:transparent;color:#949ba4;font:inherit;font-size:13px;font-weight:700;
+  letter-spacing:.02em;text-transform:uppercase;
+}
+.dc-pane-tab:hover{background:#35373c;color:#dbdee1}
+.dc-pane-tab.active{background:#404249;color:#fff}
+.dc-pane-tab-count{
+  padding:1px 6px;border-radius:9px;background:rgba(255,255,255,.12);
+  font-size:11px;font-weight:800;letter-spacing:0;
+}
+.dc-pane-tab.active .dc-pane-tab-count{background:rgba(255,255,255,.2)}
+.dc-members-invite{
+  width:100%;margin:0 0 8px;padding:7px 8px;border:1px dashed rgba(255,255,255,.18);
+  border-radius:8px;background:transparent;color:#dbdee1;font:inherit;font-size:13px;
+  font-weight:700;cursor:pointer;
+}
+.dc-members-invite:hover{background:#35373c;border-color:rgba(255,255,255,.3);color:#fff}
+.dc-members-empty{padding:6px 8px;color:#949ba4;font-size:13px}
 .dc-members-section{padding:0 8px 12px}
 .dc-members-list{list-style:none;margin:0;padding:0}
 .dc-member-row{display:flex;align-items:center;gap:8px;padding:4px 8px;color:#949ba4;font-size:14px}
@@ -1827,6 +1850,9 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .dc-channel-item{min-height:44px}
   .dc-dm-item{min-height:52px}
   .dc-section-label{min-height:36px}
+  .dc-pane-tab{min-height:44px}
+  .dc-member-row{min-height:44px}
+  .dc-members-invite{min-height:44px}
 
   /* Tab strips: allow horizontal scrolling instead of squashing or overflowing. */
   .profile-settings-tabs,.app-dir-tabs,.emoji-tabs{
