@@ -175,14 +175,20 @@ export default function MicTest({ devices = [], selectedDeviceId = null, onSelec
       )}
 
       <div className="mictest-row">
-        {/* Vertical bar so it reads like a level meter rather than a progress bar. */}
-        <div className="mictest-meter" aria-hidden="true">
-          <span ref={barRef} className="mictest-meter-fill" />
-        </div>
+        {/* Only while a test is actually running. An empty meter parked next to the button reads as a
+            broken level indicator — there is nothing to measure until the mic is open. The level is
+            written straight to this element's style, and that writer already null-checks the ref, so
+            it is safe for the element to come and go. */}
+        {testing && (
+          /* Vertical bar so it reads like a level meter rather than a progress bar. */
+          <div className="mictest-meter" aria-hidden="true">
+            <span ref={barRef} className="mictest-meter-fill" />
+          </div>
+        )}
 
         <div className="mictest-controls">
           {!testing ? (
-            <button type="button" className="connect-btn" onClick={startTest}>🎤 Test microphone</button>
+            <button type="button" className="connect-btn mictest-start" onClick={startTest}>🎤 Test microphone</button>
           ) : (
             <>
               <div className="mictest-status">
