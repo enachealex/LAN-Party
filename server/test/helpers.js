@@ -6,8 +6,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-// Spread test files across ports so parallel files never collide.
-let nextPort = 3400 + Math.floor(Math.random() * 300);
+// Ports are assigned by the OS (PORT=0) and read back from the server's own startup line. The
+// previous scheme — a random start in 3400-3700, incremented per server — collided often once there
+// were a dozen test files running in parallel, each starting one to three servers: whichever file
+// lost the race failed with ECONNRESET and missing files, which looks exactly like a real bug in
+// whatever that file happened to be testing. There is no port to collide over now.
 
 // A survivng child keeps the runner's stdio pipes open, which hangs the whole test command. Track
 // every spawned server and make sure they're gone when this process exits, however it exits.
@@ -28,10 +31,9 @@ function hookCleanup() {
 // the feature stays disabled.
 async function startServer(opts = {}) {
   hookCleanup();
-  const port = nextPort++;
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanparty-test-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
-    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, JWT_SECRET: 'test-secret', ...(opts.env || {}) },
+    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', ...(opts.env || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   running.add(child);
@@ -41,8 +43,18 @@ async function startServer(opts = {}) {
   child.stdout.on('data', (d) => { log += d; });
   child.stderr.on('data', (d) => { log += d; });
 
-  const base = `http://127.0.0.1:${port}`;
+  // The server announces the port it bound; that line is the only way to learn an OS-assigned one.
   const deadline = Date.now() + 20000;
+  let port = null;
+  for (;;) {
+    if (child.exitCode !== null) throw new Error(`server exited early (${child.exitCode}):\n${log}`);
+    const match = log.match(/LAN Party server on (\d+)/);
+    if (match) { port = Number(match[1]); break }
+    if (Date.now() > deadline) throw new Error(`server did not announce a port within 20s:\n${log}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  const base = `http://127.0.0.1:${port}`;
   for (;;) {
     if (child.exitCode !== null) throw new Error(`server exited early (${child.exitCode}):\n${log}`);
     // Any HTTP response (even 401) means it's listening.

@@ -3,7 +3,7 @@
 // read, send, delete). Leans on shared helpers (friend-graph, DM-unread, presence broadcasts) that
 // also serve the socket layer, so they are injected rather than moved.
 /** @param {Record<string, any>} deps */
-function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes }) {
+function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes }) {
   app.post('/user/presence', authMiddleware, async (req, res) => {
     const status = normalizePresence(req.body?.status);
     const username = req.user.username;
@@ -237,8 +237,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     if (!me) return res.status(404).json({ error: 'User not found' });
     const peer = await getUserByUsername(req.params.username);
     if (!peer) return res.status(404).json({ error: 'User not found' });
-    if (!(await areFriends(me.id, peer.id))) {
-      return res.status(403).json({ error: 'You can only message friends' });
+    // Friends, or people you share a server with — the member list offers a private message.
+    if (!(await canDirectMessage(me.id, me.username, peer.id, peer.username))) {
+      return res.status(403).json({ error: 'You can only message friends or people you share a server with' });
     }
     const markRead = req.query.markRead === '1' || req.query.markRead === 'true';
     if (markRead) {
@@ -297,8 +298,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     if (!me) return res.status(404).json({ error: 'User not found' });
     const peer = await getUserByUsername(toUsername);
     if (!peer) return res.status(404).json({ error: 'User not found' });
-    if (!(await areFriends(me.id, peer.id))) {
-      return res.status(403).json({ error: 'You can only message friends' });
+    // Friends, or people you share a server with — the member list offers a private message.
+    if (!(await canDirectMessage(me.id, me.username, peer.id, peer.username))) {
+      return res.status(403).json({ error: 'You can only message friends or people you share a server with' });
     }
     const createdAt = Date.now();
     const cleanQuotes = sanitizeQuotes(req.body?.quotes);

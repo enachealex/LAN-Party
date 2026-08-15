@@ -31,6 +31,7 @@ import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, 
 import MicTest from './components/MicTest'
 import BootSplash from './components/BootSplash'
 import ImageCropModal from './components/ImageCropModal'
+import PrivateMessageModal from './components/PrivateMessageModal'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
@@ -1107,14 +1108,18 @@ export default function App() {
     e.preventDefault()
     setPinBarMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 90) })
   }
-  const openMemberMenu = (e, member, role) => {
+  const openMemberMenu = (e, member, role, canManage = false) => {
     e.preventDefault()
     setMemberMenu({
       x: Math.min(e.clientX, window.innerWidth - 190),
       y: Math.min(e.clientY, window.innerHeight - 120),
-      username: member.username, name: member.name, role,
+      username: member.username, name: member.name, role, canManage,
     })
   }
+  // Private message composer, opened from a member's right-click menu in a server or group chat.
+  const [pmTarget, setPmTarget] = useState(null)              // { username, name } | null
+  const [pmSending, setPmSending] = useState(false)
+  const [pmError, setPmError] = useState(null)
   const [forwardMsg, setForwardMsg] = useState(null)          // message being forwarded (opens the picker)
   // Desktop notifications preference (persisted locally; Notification.permission gates actual use).
   const [notifyEnabled, setNotifyEnabled] = useState(() => localStorage.getItem('lanparty_notify') === '1')
@@ -2082,6 +2087,48 @@ export default function App() {
       setToast('Profile picture updated')
     } catch (err) {
       setToast(err.message || 'Could not save that picture')
+    }
+  }
+
+  // ---- Private messages from a member list ----
+
+  const openPrivateMessage = (target) => {
+    if (!target?.username) { setToast("That member can't be messaged directly."); return }
+    setPmError(null)
+    setPmSending(false)
+    setPmTarget(target)
+  }
+
+  const closePrivateMessage = () => {
+    // Cancel must not send anything — the modal owns the draft and drops it with this state.
+    setPmTarget(null)
+    setPmError(null)
+    setPmSending(false)
+  }
+
+  const sendPrivateMessage = async (text) => {
+    const target = pmTarget
+    const body = (text || '').trim()
+    if (!target?.username || !body || pmSending) return
+    setPmSending(true)
+    setPmError(null)
+    try {
+      const t = token || localStorage.getItem('lanparty_token')
+      const res = await fetch(`${SERVER_URL}/messages/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+        body: JSON.stringify({ toUsername: target.username, text: body }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { setPmError(data.error || 'Could not send that message.'); return }
+      // Refresh the DM lists so the new conversation appears under Messages straight away.
+      loadMessagesData()
+      setToast(`Message sent to ${target.name || target.username}`)
+      setPmTarget(null)
+    } catch (_) {
+      setPmError('Network error — the message was not sent.')
+    } finally {
+      setPmSending(false)
     }
   }
 
@@ -4220,6 +4267,9 @@ export default function App() {
       map.set(participantId, {
         id: participantId,
         name: participantName,
+        // Carried so a group member can be privately messaged. Group chats are client-side only, so
+        // peerUsername is the one reliable handle here; the display name is the fallback.
+        username: participant?.peerUsername || participantName,
         isYou: participantName === name || participant?.peerUsername === name,
       })
     })
@@ -5379,6 +5429,15 @@ export default function App() {
         style={{ display: 'none' }}
         onChange={onTileFilePicked}
       />
+      <PrivateMessageModal
+        open={!!pmTarget}
+        recipient={pmTarget}
+        sending={pmSending}
+        error={pmError}
+        onCancel={closePrivateMessage}
+        onSend={sendPrivateMessage}
+      />
+
       <ImageCropModal
         open={!!tileCrop}
         file={tileCrop?.file || null}
@@ -5468,6 +5527,7 @@ export default function App() {
         resolveTileSrc={emojiSrc}
         onChangeTileImage={openTileImagePicker}
         onResetTileImage={resetTileImage}
+        onPrivateMessage={openPrivateMessage}
         socketId={socket?.id}
         onSelectMember={openMemberProfile}
         myRole={serverState?.myRole || 'member'}
@@ -6247,15 +6307,18 @@ export default function App() {
                 const role = member.role || 'member'
                 const canManage = !isHomeView && currentServerId() !== 'demo' && isStaff && !member.isYou && member.username
                   && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
+                // Everyone gets a menu (for Private message); only staff get the manage entries. This
+                // is the group-chat path, which is why it can't be staff-gated like it used to be.
+                const hasMenu = Boolean(member.username) && !member.isYou
                 return (
                   <li key={member.id}>
                     <button
                       type="button"
                       className="members-panel-row"
                       onClick={() => member.username && openMemberProfile(member.username)}
-                      onContextMenu={canManage ? (e) => openMemberMenu(e, member, role) : undefined}
-                      {...(canManage ? longPressProps((e) => openMemberMenu(e, member, role)) : {})}
-                      title={member.username ? `View ${member.name}'s profile${canManage ? ' — long-press to manage' : ''}` : undefined}
+                      onContextMenu={hasMenu ? (e) => openMemberMenu(e, member, role, canManage) : undefined}
+                      {...(hasMenu ? longPressProps((e) => openMemberMenu(e, member, role, canManage)) : {})}
+                      title={member.username ? `View ${member.name}'s profile${hasMenu ? ' — right-click for more' : ''}` : undefined}
                     >
                       {!isHomeView && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
                       <span className="members-panel-name">{member.name}{member.isYou ? ' (you)' : ''}</span>
@@ -6278,13 +6341,17 @@ export default function App() {
           <div className="dc-ctx-backdrop" onClick={() => setMemberMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMemberMenu(null) }} />
           <div className="dc-ctx-menu" style={{ left: memberMenu.x, top: memberMenu.y }} role="menu">
             <div className="dc-ctx-title">{memberMenu.name}{memberMenu.role !== 'member' ? ` · ${memberMenu.role}` : ''}</div>
-            {serverState?.myRole === 'owner' && memberMenu.role === 'member' && (
+            <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); openPrivateMessage({ username: memberMenu.username, name: memberMenu.name }) }}>✉️ Private message</button>
+            {/* Manage entries are staff-only; the menu itself now opens for every member. */}
+            {memberMenu.canManage && serverState?.myRole === 'owner' && memberMenu.role === 'member' && (
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'admin') }}>🛡️ Make admin</button>
             )}
-            {serverState?.myRole === 'owner' && memberMenu.role === 'admin' && (
+            {memberMenu.canManage && serverState?.myRole === 'owner' && memberMenu.role === 'admin' && (
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'member') }}>⬇️ Remove admin</button>
             )}
-            <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setMemberMenu(null); kickMember(memberMenu.username) }}>🚫 Remove from server</button>
+            {memberMenu.canManage && (
+              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setMemberMenu(null); kickMember(memberMenu.username) }}>🚫 Remove from server</button>
+            )}
           </div>
         </>,
         document.body

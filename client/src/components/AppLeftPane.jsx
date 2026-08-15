@@ -219,6 +219,7 @@ export default function AppLeftPane({
   resolveTileSrc = (u) => u,
   onChangeTileImage,      // (target) => void, where target is { kind: 'home' } | { kind: 'server', id, name }
   onResetTileImage,
+  onPrivateMessage,       // ({ username, name }) => void — opens the compose modal
 }) {
   const isStaff = myRole === 'owner' || myRole === 'admin'
   const showMembersTab = paneTab === 'members'
@@ -405,16 +406,20 @@ export default function AppLeftPane({
                         // admin can't act on another admin. Mirrors what the server enforces.
                         const canManage = isStaff && serverId !== 'demo' && !m.isYou && m.username
                           && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
-                        const openMemberMenu = (e) => openCtxMenu(e, { kind: 'member', id: m.id, name: m.name, username: m.username, role })
+                        // Anyone can privately message anyone else here, so the menu opens for every
+                        // member but yourself — it used to open only for staff, which would have left
+                        // ordinary members with no way to reach it. The manage entries stay gated.
+                        const hasMenu = Boolean(m.username) && !m.isYou
+                        const openMemberMenu = (e) => openCtxMenu(e, { kind: 'member', id: m.id, name: m.name, username: m.username, role, canManage })
                         return (
                           <li key={m.id}>
                             <button
                               type="button"
                               className="dc-member-row"
                               onClick={() => m.username && onSelectMember?.(m.username)}
-                              onContextMenu={canManage ? openMemberMenu : undefined}
-                              {...(canManage ? longPressProps(openMemberMenu) : {})}
-                              title={m.username ? `View ${m.name}'s profile${canManage ? ' — long-press to manage' : ''}` : undefined}
+                              onContextMenu={hasMenu ? openMemberMenu : undefined}
+                              {...(hasMenu ? longPressProps(openMemberMenu) : {})}
+                              title={m.username ? `View ${m.name}'s profile${hasMenu ? ' — right-click for more' : ''}` : undefined}
                             >
                               <span className={`dc-member-dot ${m.online === false ? 'offline' : ''}`} />
                               <span className="dc-member-name">{m.name}{m.isYou ? ' (you)' : ''}</span>
@@ -638,14 +643,17 @@ export default function AppLeftPane({
           {ctxMenu.kind === 'member' && (
             <>
               <div className="dc-ctx-title">{ctxMenu.name}{ctxMenu.role !== 'member' ? ` · ${ctxMenu.role}` : ''}</div>
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onPrivateMessage?.({ username: ctxMenu.username, name: ctxMenu.name }) }}>✉️ Private message</button>
               {/* Only the owner hands out or takes back admin; admins can kick but not promote. */}
-              {myRole === 'owner' && ctxMenu.role === 'member' && (
+              {ctxMenu.canManage && myRole === 'owner' && ctxMenu.role === 'member' && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'admin') }}>🛡️ Make admin</button>
               )}
-              {myRole === 'owner' && ctxMenu.role === 'admin' && (
+              {ctxMenu.canManage && myRole === 'owner' && ctxMenu.role === 'admin' && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'member') }}>⬇️ Remove admin</button>
               )}
-              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onKickMember?.(ctxMenu.username) }}>🚫 Remove from server</button>
+              {ctxMenu.canManage && (
+                <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onKickMember?.(ctxMenu.username) }}>🚫 Remove from server</button>
+              )}
             </>
           )}
 

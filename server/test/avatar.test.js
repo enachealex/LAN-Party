@@ -246,9 +246,15 @@ describe('orphaned avatar files', () => {
     const fresh = path.join(dataDir, 'avatars', 'orphan-fresh.png');
     fs.writeFileSync(fresh, PNG_BYTES);
 
-    // The sweep runs at boot, so a second server against the same data dir triggers it.
+    // The sweep runs at boot, so a second server against the same data dir triggers it — but it runs
+    // asynchronously, and the server answers HTTP before it finishes. Wait for the effect rather than
+    // assuming it has already happened, or this passes or fails depending on machine speed.
     const second = await startServer({ env: { DATA_DIR: dataDir } });
     try {
+      const deadline = Date.now() + 5000;
+      while (fs.existsSync(orphan) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
       assert.ok(!fs.existsSync(orphan), 'the unreferenced file is gone');
       assert.ok(fs.existsSync(fresh), 'a recent file is left alone (it may be mid-upload)');
       assert.ok(fs.existsSync(path.join(dataDir, 'avatars', liveName)), 'the referenced picture survives');

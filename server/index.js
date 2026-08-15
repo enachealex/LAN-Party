@@ -517,6 +517,27 @@ async function main() {
     return !!row;
   }
 
+  /**
+   * May these two people exchange direct messages? Friends always can. Beyond that, sharing a server
+   * counts: the member list offers a private message, and demanding a friend request first would make
+   * that a dead menu item. Server membership is itself deliberate — you are added by an owner or
+   * admin — so it is a meaningful association rather than "any account can message any account".
+   * @param {number} meId @param {string} meUsername @param {number} peerId @param {string} peerUsername
+   * @returns {Promise<boolean>}
+   */
+  async function canDirectMessage(meId, meUsername, peerId, peerUsername) {
+    if (await areFriends(meId, peerId)) return true;
+    const shared = await db.get(
+      `SELECT 1 FROM server_members mine
+         JOIN server_members theirs ON theirs.server_id = mine.server_id
+        WHERE mine.username = ? AND theirs.username = ?
+        LIMIT 1`,
+      meUsername,
+      peerUsername
+    );
+    return !!shared;
+  }
+
   async function hasPendingRequestBetween(userIdA, userIdB) {
     const row = await db.get(
       `SELECT id FROM friend_requests
@@ -1048,7 +1069,7 @@ async function main() {
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });
 
   // Presence / friends / direct messages (routes/social.js).
-  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
+  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
   registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
@@ -1612,7 +1633,13 @@ async function main() {
     });
   }
 
-  server.listen(PORT, () => console.log(`LAN Party server on ${PORT}${serveClient ? ' (serving client)' : ''}`));
+  // Log the port actually bound, not the one requested: with PORT=0 the OS picks one, and the tests
+  // read this line to find the server they just started. In production PORT is set, so this prints
+  // exactly what it always did.
+  server.listen(PORT, () => {
+    const bound = server.address()?.port ?? PORT;
+    console.log(`LAN Party server on ${bound}${serveClient ? ' (serving client)' : ''}`);
+  });
 }
 
 main().catch(err => { console.error('Server failed to start', err); process.exit(1) });
