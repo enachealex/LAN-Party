@@ -1174,6 +1174,9 @@ export default function App() {
   const [newChatGroupName, setNewChatGroupName] = useState('')
   const [pendingFile, setPendingFile] = useState(null)
   const [pendingPreviewUrl, setPendingPreviewUrl] = useState(null)
+  // A GIF picked from the library/Giphy, waiting in the composer: { url, name, type, external }.
+  // Shares the composer's single media slot with pendingFile.
+  const [pendingGif, setPendingGif] = useState(null)
   // Messages quoted into the composer (Teams-style reply): [{ id, author, ts, text }].
   const [pendingQuotes, setPendingQuotes] = useState([])
   const [lightbox, setLightbox] = useState(null) // { items: [...], index }
@@ -4216,8 +4219,11 @@ export default function App() {
   })
   const membersPanelUsers = isHomeView ? groupParticipants : serverMembers
 
+  // Clears the composer's media slot — an attached file or a staged GIF. Called on chat/channel
+  // switches too, so staged media never follows you into a different conversation.
   const clearPendingAttachment = () => {
     setPendingFile(null)
+    setPendingGif(null)
     setUploadError(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
@@ -4906,15 +4912,40 @@ export default function App() {
     }
   }
 
-  // Send a GIF to the current channel or DM/group. Library GIFs (/gifs/, /uploads/) go as an
-  // attachment; external Giphy GIFs go as an inline text URL (rendered by mediaFromText).
-  const sendGif = async (gif) => {
+  // Stage a picked GIF in the composer instead of firing it off immediately, so it can be reviewed
+  // and captioned. Enter / Send then delivers it.
+  const stageGif = (gif) => {
     if (!gif?.url) return
     setShowEmojiPicker(false)
     setShowGifPicker(false)
+    setUploadError(null)
+    // One media slot in the composer. Swapping is fine — but say so, rather than silently dropping
+    // a file the user had already attached.
+    if (pendingFile) {
+      clearPendingAttachment()
+      setToast('Replaced the attached file with the GIF')
+    }
     const isLocal = gif.url.startsWith('/gifs/') || gif.url.startsWith('/uploads/')
-    const attachment = isLocal ? { url: gif.url, name: gif.name || 'gif', type: gif.type || 'image/gif', size: 0 } : null
-    const body = isLocal ? '' : gif.url
+    setPendingGif({ url: gif.url, name: gif.name || 'gif', type: gif.type || 'image/gif', external: !isLocal })
+  }
+
+  // Deliver the staged GIF with whatever was typed alongside it. A library GIF travels as an
+  // attachment; a Giphy GIF is a remote URL, so it rides in the message text (mediaFromText renders
+  // it) and any caption is prepended.
+  const sendStagedGif = async () => {
+    const gif = pendingGif
+    if (!gif) return
+    const typed = text.trim()
+    const attachment = gif.external ? null : { url: gif.url, name: gif.name, type: gif.type, size: 0 }
+    const body = gif.external ? (typed ? `${typed} ${gif.url}` : gif.url) : typed
+    // Clear the composer first: the send is async, and a second Enter must not double-post.
+    setPendingGif(null)
+    setText('')
+    await deliverGifMessage(attachment, body)
+  }
+
+  // Route a GIF message to whatever is on screen: a DM, a local group chat, or a server channel.
+  const deliverGifMessage = async (attachment, body) => {
     if (showHomeChat && homeChat) {
       if (homeChat.type === 'friend' || homeChat.type === 'dm') {
         const peerUsername = homeChat.peerUsername || homeChat.name
@@ -5156,7 +5187,14 @@ export default function App() {
     : []
 
   const renderComposer = (placeholder, onSend) => {
-    const canSend = Boolean(text.trim() || pendingFile) && !uploadingFile
+    const canSend = Boolean(text.trim() || pendingFile || pendingGif) && !uploadingFile
+    // A staged GIF has its own delivery path (it's already hosted, so there's nothing to upload).
+    // Routing both Enter and Send through here keeps the two in step.
+    const handleSend = () => {
+      if (!canSend) return
+      if (pendingGif) { sendStagedGif(); return }
+      onSend()
+    }
     // Treat the selected File like an attachment for type detection (File has .type and .name).
     const pendingIsGif = pendingFile && isGifAttachment(pendingFile)
     const pendingIsImage = pendingFile && !pendingIsGif && isImageAttachment(pendingFile)
@@ -5184,6 +5222,16 @@ export default function App() {
             <button type="button" onClick={clearPendingAttachment} aria-label="Remove attached file">x</button>
           </div>
         )}
+        {pendingGif && (
+          <div className="pending-attachment pending-attachment-media">
+            <span className="pending-attachment-thumb pending-gif-thumb">
+              <img src={emojiSrc(pendingGif.url)} alt="" />
+            </span>
+            <span className="pending-attachment-name">{pendingGif.name}</span>
+            <span className="pending-attachment-size">Press Enter to send{pendingGif.external ? ' · Giphy' : ''}</span>
+            <button type="button" onClick={() => setPendingGif(null)} aria-label="Remove GIF">x</button>
+          </div>
+        )}
         {uploadError && <div className="composer-error">{uploadError}</div>}
         {showEmojiPicker && (
           <EmojiPicker
@@ -5205,7 +5253,7 @@ export default function App() {
           <GifPicker
             gifs={gifLibrary}
             resolveSrc={emojiSrc}
-            onSelectGif={sendGif}
+            onSelectGif={stageGif}
             onFetchGiphy={fetchGiphy}
             onGiphyStatus={giphyStatus}
             onUploadGif={uploadGif}
@@ -5243,10 +5291,10 @@ export default function App() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             placeholder={placeholder}
-            onKeyDown={(e) => { if (e.key === 'Enter') onSend() }}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleSend() }}
             onPaste={handleComposerPaste}
           />
-          <button className="send" onClick={onSend} disabled={!canSend} aria-disabled={!canSend}>
+          <button className="send" onClick={handleSend} disabled={!canSend} aria-disabled={!canSend}>
             {uploadingFile ? 'Uploading...' : <SendIcon />}
           </button>
           <input ref={fileInputRef} className="file-input" type="file" onChange={handleFileSelection} />

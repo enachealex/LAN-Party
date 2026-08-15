@@ -500,6 +500,12 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 .pending-attachment button.pending-attachment-thumb{width:15px;height:15px;padding:0;border-radius:3px;overflow:hidden;flex-shrink:0;background:#000;line-height:0;cursor:zoom-in;border:1px solid rgba(255,255,255,.14)}
 .pending-attachment button.pending-attachment-thumb:hover{background:#000;outline:1px solid rgba(255,255,255,.35)}
 .pending-attachment-thumb img,.pending-attachment-thumb video{width:100%;height:100%;object-fit:cover;display:block}
+/* A staged GIF is there to be looked at before sending, so it gets a real preview rather than the
+   15px chip a file attachment shows. Not a button — there's nothing to zoom into, it's animating. */
+.pending-attachment .pending-gif-thumb{
+  display:block;width:56px;height:56px;padding:0;border-radius:8px;overflow:hidden;
+  flex-shrink:0;background:#000;line-height:0;border:1px solid rgba(255,255,255,.14);
+}
 .composer-error{margin-bottom:8px;padding:8px 10px;border-radius:8px;background:rgba(242,63,67,.12);color:#ffb4b4;font-size:13px}
 
 /* Custom emojis rendered inline in chat (images/GIFs sized to emoji dimensions) */
