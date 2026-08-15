@@ -185,22 +185,62 @@ function mediaUrlFromText(text) {
   const trimmed = (text || '').trim()
   if (!trimmed) return null
   const last = trimmed.split(/\s+/).pop()
-  return /^https?:\/\/\S+$/i.test(last) ? last : null
+  // Absolute for Giphy and other remote media; root-relative for our own /gifs/ and /uploads/ files,
+  // which is how the composer stacks a library GIF as a block instead of using the one attachment slot.
+  return /^(https?:\/\/|\/)\S+$/i.test(last) ? last : null
 }
 
 function mediaFromText(text) {
   const url = mediaUrlFromText(text)
   if (!url) return null
   let pathname = url
-  try {
-    pathname = new URL(url).pathname
-  } catch {
-    return null
+  if (/^https?:\/\//i.test(url)) {
+    try {
+      pathname = new URL(url).pathname
+    } catch {
+      return null
+    }
+  } else {
+    pathname = url.split(/[?#]/)[0] // root-relative: the path is already the path
   }
   const name = pathname.split('/').pop() || url
   const probe = { url, name }
   if (!isMediaAttachment(probe)) return null
   return probe
+}
+
+/**
+ * Split a message body into the ordered blocks it renders as: text, media, text, media… This is what
+ * makes a stacked message possible (type, drop a GIF, type again, drop another) without a schema
+ * change — the body stays plain text, so old messages, search and editing all keep working.
+ *
+ * The rule is per LINE: if a line's last token is a media url, the words before it become a text block
+ * and the url becomes a media block. A url in the middle of a line stays inside the text and renders as
+ * a link — the same call made above, which keeps prose containing links looking like prose.
+ * @param {string} text
+ * @returns {Array<{ type: 'text', text: string } | { type: 'media', media: { url: string, name: string } }>}
+ */
+function messageBlocks(text) {
+  const blocks = []
+  const pushText = (value) => {
+    const trimmed = (value || '').trim()
+    if (!trimmed) return
+    const last = blocks[blocks.length - 1]
+    // Consecutive text lines belong to one paragraph, not one block each.
+    if (last && last.type === 'text') last.text += `\n${trimmed}`
+    else blocks.push({ type: 'text', text: trimmed })
+  }
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = rawLine.trim()
+    const media = mediaFromText(line)
+    if (media) {
+      pushText(line.slice(0, line.length - media.url.length))
+      blocks.push({ type: 'media', media })
+    } else {
+      pushText(line)
+    }
+  }
+  return blocks
 }
 
 /**
@@ -220,9 +260,14 @@ function captionFromText(text) {
 function collectMediaList(messages = []) {
   const list = []
   for (const m of messages) {
-    const media = (m?.attachment && isMediaAttachment(m.attachment)) ? m.attachment : mediaFromText(m?.text)
-    if (media && !isAttachmentExpired(media)) {
-      list.push({ attachment: media, url: attachmentUrl(media), kind: mediaKind(media) })
+    // A stacked message can hold several media blocks, and the lightbox should cycle every one of them.
+    const found = (m?.attachment && isMediaAttachment(m.attachment))
+      ? [m.attachment]
+      : messageBlocks(m?.text).filter((b) => b.type === 'media').map((b) => b.media)
+    for (const media of found) {
+      if (media && !isAttachmentExpired(media)) {
+        list.push({ attachment: media, url: attachmentUrl(media), kind: mediaKind(media) })
+      }
     }
   }
   return list
@@ -496,9 +541,10 @@ function renderMessageText(text, emojiMap, onSaveEmoji, currentUser) {
 // Short one-line preview of a message for the pin bar / pin list / forward confirmation.
 function pinPreview(m) {
   if (!m) return ''
-  const bodyMedia = m.attachment || mediaFromText(m.text)
-  // A captioned GIF previews as its caption; only a media-only message falls through to "🎞 GIF".
-  const caption = m.attachment ? (m.text || '') : captionFromText(m.text)
+  const blocks = m.attachment ? [] : messageBlocks(m.text)
+  const bodyMedia = m.attachment || blocks.find((b) => b.type === 'media')?.media
+  // Any words in the message preview better than "🎞 GIF"; only a media-only message falls through.
+  const caption = m.attachment ? (m.text || '') : blocks.filter((b) => b.type === 'text').map((b) => b.text).join(' ')
   if (caption) return caption.length > 90 ? caption.slice(0, 90) + '…' : caption
   if (bodyMedia) {
     if (isGifAttachment(bodyMedia)) return '🎞 GIF'
@@ -521,14 +567,16 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
   const isOutgoing = message.author === currentUser
   const isToolbarActive = String(activeReactionMessageId) === String(message.id)
   const reactions = message.reactions || {}
-  // An image/gif/video URL in the message body is rendered inline as media, with any words in front
-  // of it shown as its caption rather than leaving the raw url on screen.
-  const textMedia = message.attachment ? null : mediaFromText(message.text)
-  const bodyText = textMedia ? captionFromText(message.text) : message.text
-  // True when the bubble's main content is media (no caption) so it can shrink-wrap tightly.
-  // Reactions are allowed — they render below the media without widening the bubble.
-  const hasMediaContent = Boolean(message.attachment) || Boolean(textMedia)
-  const isMediaOnly = hasMediaContent && !bodyText
+  // The body renders as ordered blocks — text, media, text, media — so one message can stack several
+  // GIFs with words between them.
+  const blocks = message.attachment ? [] : messageBlocks(message.text)
+  const bodyHasText = blocks.some((b) => b.type === 'text')
+  const blockMedia = blocks.filter((b) => b.type === 'media').map((b) => b.media)
+  const textMedia = blockMedia[0] || null
+  // True when the bubble's content is media alone, so it can shrink-wrap tightly. Reactions are
+  // allowed — they render below the media without widening the bubble.
+  const hasMediaContent = Boolean(message.attachment) || blockMedia.length > 0
+  const isMediaOnly = hasMediaContent && !bodyHasText
   const timestamp = formatMessageTime(message.ts || message.createdAt || message.created_at)
   const toggleTimestamp = () => setShowTimestamp((visible) => !visible)
   const copyMessage = async () => {
@@ -668,7 +716,11 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
               title="Reply with quote"
               aria-label="Reply with quote"
             >
-              ❞
+              {/* An SVG rather than the ❞ ornament: that glyph is heavy by design, and its baseline
+                  sits it off-centre in a small square button no matter how it's aligned. */}
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M9.6 5.4c-2.9 1.1-4.9 3.8-4.9 6.9v6.3h6.2v-6.2H7.4c0-1.9 1-3.4 2.7-4.1l-.5-2.9Zm8.5 0c-2.9 1.1-4.9 3.8-4.9 6.9v6.3h6.2v-6.2h-3.5c0-1.9 1-3.4 2.7-4.1l-.5-2.9Z" />
+              </svg>
             </button>
           )}
           <button
@@ -755,14 +807,17 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
               <div className="msg-edit-hint">escape to <button type="button" onClick={cancelEdit}>cancel</button> · enter to <button type="button" onClick={saveEdit}>save</button></div>
             </div>
           ) : (
-            bodyText && (
-              <div className="msg-text">
-                {renderMessageText(bodyText, emojiMap, onSaveEmoji, currentUser)}
-                {message.edited && <span className="msg-edited"> (edited)</span>}
+            // Blocks in order. The "(edited)" marker rides on the last text block so it stays with the
+            // words rather than floating under an image.
+            blocks.map((block, i) => (block.type === 'text' ? (
+              <div className="msg-text" key={`t${i}`}>
+                {renderMessageText(block.text, emojiMap, onSaveEmoji, currentUser)}
+                {message.edited && i === blocks.findLastIndex((b) => b.type === 'text') && <span className="msg-edited"> (edited)</span>}
               </div>
-            )
+            ) : (
+              <AttachmentCard key={`m${i}`} attachment={block.media} onOpenMedia={onOpenMedia} />
+            )))
           )}
-          {textMedia && <AttachmentCard attachment={textMedia} onOpenMedia={onOpenMedia} />}
           <AttachmentCard attachment={message.attachment} onOpenMedia={onOpenMedia} />
           {Object.keys(reactions).length > 0 && (
             <div className="msg-reactions" aria-label="Message reactions">
@@ -1210,9 +1265,10 @@ export default function App() {
   const [newChatGroupName, setNewChatGroupName] = useState('')
   const [pendingFile, setPendingFile] = useState(null)
   const [pendingPreviewUrl, setPendingPreviewUrl] = useState(null)
-  // A GIF picked from the library/Giphy, waiting in the composer: { url, name, type, external }.
-  // Shares the composer's single media slot with pendingFile.
-  const [pendingGif, setPendingGif] = useState(null)
+  // Ordered composer stack: [{ kind: 'text', text } | { kind: 'gif', url, name }]. Built up as you
+  // type and pick GIFs, then flattened into one message body on send, so a single message can be
+  // text / GIF / text / GIF. Uploaded files keep their own slot (pendingFile) — they need uploading.
+  const [composerStack, setComposerStack] = useState([])
   // Messages quoted into the composer (Teams-style reply): [{ id, author, ts, text }].
   const [pendingQuotes, setPendingQuotes] = useState([])
   const [lightbox, setLightbox] = useState(null) // { items: [...], index }
@@ -4326,7 +4382,7 @@ export default function App() {
   // switches too, so staged media never follows you into a different conversation.
   const clearPendingAttachment = () => {
     setPendingFile(null)
-    setPendingGif(null)
+    setComposerStack([])
     setUploadError(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
@@ -5015,36 +5071,51 @@ export default function App() {
     }
   }
 
-  // Stage a picked GIF in the composer instead of firing it off immediately, so it can be reviewed
-  // and captioned. Enter / Send then delivers it.
+  // Stage a picked GIF as the next block in the composer stack. Whatever is currently typed is
+  // committed as a text block first, so the order you built things in is the order they send: type,
+  // add a GIF, type again, add another — the Teams behaviour.
   const stageGif = (gif) => {
     if (!gif?.url) return
     setShowEmojiPicker(false)
     setShowGifPicker(false)
     setUploadError(null)
-    // One media slot in the composer. Swapping is fine — but say so, rather than silently dropping
-    // a file the user had already attached.
+    // An uploaded file is a genuinely different thing (it needs uploading), so it still owns its own
+    // slot and can't be interleaved. Say so rather than silently dropping it.
     if (pendingFile) {
       clearPendingAttachment()
       setToast('Replaced the attached file with the GIF')
     }
-    const isLocal = gif.url.startsWith('/gifs/') || gif.url.startsWith('/uploads/')
-    setPendingGif({ url: gif.url, name: gif.name || 'gif', type: gif.type || 'image/gif', external: !isLocal })
+    setComposerStack((stack) => {
+      const typed = text.trim()
+      const next = typed ? [...stack, { kind: 'text', text: typed }] : [...stack]
+      next.push({ kind: 'gif', url: gif.url, name: gif.name || 'gif' })
+      return next
+    })
+    setText('')
   }
 
-  // Deliver the staged GIF with whatever was typed alongside it. A library GIF travels as an
-  // attachment; a Giphy GIF is a remote URL, so it rides in the message text (mediaFromText renders
-  // it) and any caption is prepended.
-  const sendStagedGif = async () => {
-    const gif = pendingGif
-    if (!gif) return
+  const removeStackPart = (index) => setComposerStack((stack) => stack.filter((_, i) => i !== index))
+
+  /**
+   * Flatten the stack plus whatever is still in the input into one message body. Each part gets its own
+   * line, which is exactly what messageBlocks() reads back as ordered blocks.
+   */
+  const composerStackBody = () => {
+    const parts = composerStack.map((p) => (p.kind === 'text' ? p.text : p.url))
     const typed = text.trim()
-    const attachment = gif.external ? null : { url: gif.url, name: gif.name, type: gif.type, size: 0 }
-    const body = gif.external ? (typed ? `${typed} ${gif.url}` : gif.url) : typed
-    // Clear the composer first: the send is async, and a second Enter must not double-post.
-    setPendingGif(null)
+    if (typed) parts.push(typed)
+    return parts.filter(Boolean).join('\n')
+  }
+
+  // Deliver the stacked message. Everything travels in the body as text + media urls, so a message can
+  // carry several GIFs; the single attachment slot stays reserved for real uploads.
+  const sendStackedMessage = async () => {
+    const body = composerStackBody()
+    if (!body) return
+    // Clear first: the send is async, and a second Enter must not double-post.
+    setComposerStack([])
     setText('')
-    await deliverGifMessage(attachment, body)
+    await deliverGifMessage(null, body)
   }
 
   // Route a GIF message to whatever is on screen: a DM, a local group chat, or a server channel.
@@ -5290,12 +5361,13 @@ export default function App() {
     : []
 
   const renderComposer = (placeholder, onSend) => {
-    const canSend = Boolean(text.trim() || pendingFile || pendingGif) && !uploadingFile
-    // A staged GIF has its own delivery path (it's already hosted, so there's nothing to upload).
-    // Routing both Enter and Send through here keeps the two in step.
+    const canSend = Boolean(text.trim() || pendingFile || composerStack.length) && !uploadingFile
+    // A stack has its own delivery path: everything in it is already hosted, so there is nothing to
+    // upload and the whole thing goes as one body. Routing Enter and Send through here keeps them in
+    // step. A plain typed message with no stack still takes the normal path.
     const handleSend = () => {
       if (!canSend) return
-      if (pendingGif) { sendStagedGif(); return }
+      if (composerStack.length) { sendStackedMessage(); return }
       onSend()
     }
     // Treat the selected File like an attachment for type detection (File has .type and .name).
@@ -5325,14 +5397,29 @@ export default function App() {
             <button type="button" onClick={clearPendingAttachment} aria-label="Remove attached file">x</button>
           </div>
         )}
-        {pendingGif && (
-          <div className="pending-attachment pending-attachment-media">
-            <span className="pending-attachment-thumb pending-gif-thumb">
-              <img src={emojiSrc(pendingGif.url)} alt="" />
-            </span>
-            <span className="pending-attachment-name">{pendingGif.name}</span>
-            <span className="pending-attachment-size">Press Enter to send{pendingGif.external ? ' · Giphy' : ''}</span>
-            <button type="button" onClick={() => setPendingGif(null)} aria-label="Remove GIF">x</button>
+        {/* The stack, in send order. Text you typed before adding a GIF is committed as its own block,
+            so what you see here is exactly what the message will look like. */}
+        {composerStack.length > 0 && (
+          <div className="composer-stack" aria-label="Message being composed">
+            {composerStack.map((part, i) => (
+              <div className={`composer-stack-part ${part.kind}`} key={`${part.kind}-${i}`}>
+                {part.kind === 'text' ? (
+                  <span className="composer-stack-text">{part.text}</span>
+                ) : (
+                  <span className="composer-stack-thumb"><img src={emojiSrc(part.url)} alt={part.name} /></span>
+                )}
+                <button
+                  type="button"
+                  className="composer-stack-remove"
+                  onClick={() => removeStackPart(i)}
+                  aria-label={part.kind === 'text' ? 'Remove this text' : `Remove ${part.name}`}
+                  title="Remove"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <div className="composer-stack-hint">Keep typing to add more below · Enter sends the whole thing</div>
           </div>
         )}
         {uploadError && <div className="composer-error">{uploadError}</div>}
