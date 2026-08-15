@@ -4202,7 +4202,10 @@ export default function App() {
   const activeChannelType = activeChannelObj ? activeChannelObj.type : 'text'
   const activeChannelName = activeChannelObj?.name || activeChannel
   const showHomeChat = isHomeView && homeChat
-  const showMembersButton = !isHomeView || (Boolean(showHomeChat) && homeChat?.type === 'group')
+  // Group DMs only. In a server the side panel's own Members tab covers this, so a topbar button was
+  // a second control for the same list. A group chat has no channel list to share a panel with, so
+  // there the slide-over is still the only way to see who's in it.
+  const showMembersButton = Boolean(showHomeChat) && homeChat?.type === 'group'
   const activeGroupChat = showHomeChat && homeChat?.type === 'group'
     ? (groupChats.find((group) => String(group.id) === String(homeChat.id)) || homeChat)
     : null
@@ -5518,20 +5521,9 @@ export default function App() {
                         <span aria-hidden>📞</span> Call
                       </button>
                     )}
+                    {/* Group DMs only — see showMembersButton. Servers use the side panel's tab. */}
                     {showMembersButton && (
-                      <button
-                        className="members-btn"
-                        onClick={() => {
-                          // In a server the list lives in the side panel's Members tab, so this button
-                          // reveals that instead of opening a second copy in a slide-over. On phones the
-                          // side panel is the nav drawer, so it has to be opened too.
-                          if (isHomeView) { setShowMembersPanel(true); return }
-                          setServerPaneTab('members')
-                          setMobileNavOpen(true)
-                        }}
-                      >
-                        Members
-                      </button>
+                      <button className="members-btn" onClick={() => setShowMembersPanel(true)}>Members</button>
                     )}
                   </div>
                 </div>

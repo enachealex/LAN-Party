@@ -580,9 +580,9 @@ export default function HomeLeftPanel({
           />
           <span className="dc-dm-meta">
             <span className="dc-dm-name" style={item.profile ? nameStyleToCss(item.profile.nameStyle, item.profile.nameFont) : undefined}>{item.name}</span>
-            {item.profile?.tags?.length > 0 && (
-              <span className="dc-dm-tags">{item.profile.tags.map((t) => <span key={`${t.type}-${t.label}`} className={`profile-tag profile-tag-${t.type}`}>{t.label}</span>)}</span>
-            )}
+            {/* Name + message only. Tags used to sit between them and pushed the preview down, which
+                is the one thing a conversation row is for. They still show in the Friends list and on
+                the profile card, where identity is the point. */}
             {preview && <span className="dc-dm-activity">{preview}</span>}
           </span>
           {unread > 0 && (
