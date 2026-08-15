@@ -44,25 +44,40 @@ const SOUND_NAME_MAX = 12; // keep soundboard names short enough to fit a tile
 // Deliberately no SVG (scriptable) and no GIF (the client never produces one, and refusing it keeps
 // hand-crafted animated tiles out).
 const TILE_ICON_TYPES = { 'image/webp': '.webp', 'image/png': '.png', 'image/jpeg': '.jpg' };
+// Avatars additionally allow GIF — animated profile pictures are a thing people want, and the old
+// /files/upload path accepted them, so refusing one here would be a regression. Still no SVG.
+const AVATAR_TYPES = { ...TILE_ICON_TYPES, 'image/gif': '.gif' };
+
+// Raster image signatures, longest-prefix first so 'RIFF….WEBP' can't be mistaken for anything else.
+// `min` is how many leading bytes the check needs, so a small-but-valid GIF isn't rejected for being
+// shorter than the widest signature.
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const IMAGE_SIGNATURES = [
+  { format: 'webp', min: 12, test: (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP' },
+  { format: 'png', min: 8, test: (b) => b.subarray(0, 8).equals(PNG_SIGNATURE) },
+  { format: 'gif', min: 6, test: (b) => ['GIF87a', 'GIF89a'].includes(b.subarray(0, 6).toString('latin1')) },
+  { format: 'jpeg', min: 3, test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+];
+const FORMAT_EXTENSIONS = { png: '.png', jpeg: '.jpg', webp: '.webp', gif: '.gif' };
 
 /**
- * Confirm a file really is one of the accepted image types by its leading bytes. A declared mime type
- * is just a client claim, and these files are served back as <img> sources.
+ * Identify a file by its leading bytes. A declared mime type is only a client claim, and these files
+ * are served back as <img> sources, so the bytes decide both whether we keep the file and what
+ * extension (and therefore Content-Type) it is stored under.
  * @param {string} filePath
- * @returns {Promise<boolean>}
+ * @returns {Promise<'png'|'jpeg'|'webp'|'gif'|null>} null when it isn't a recognised raster image
  */
-async function looksLikeImage(filePath) {
+async function detectImageFormat(filePath) {
   let fh;
   try {
     fh = await fs.promises.open(filePath, 'r');
     const { buffer, bytesRead } = await fh.read(Buffer.alloc(12), 0, 12, 0);
-    if (bytesRead < 12) return false;
-    const png = buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-    const jpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
-    const webp = buffer.subarray(0, 4).toString('latin1') === 'RIFF' && buffer.subarray(8, 12).toString('latin1') === 'WEBP';
-    return png || jpeg || webp;
+    for (const sig of IMAGE_SIGNATURES) {
+      if (bytesRead >= sig.min && sig.test(buffer)) return sig.format;
+    }
+    return null;
   } catch (_) {
-    return false;
+    return null;
   } finally {
     try { await fh?.close(); } catch (_) { /* already closed */ }
   }
@@ -104,6 +119,11 @@ async function main() {
   fs.mkdirSync(entrancesDir, { recursive: true });
   // Custom rail-tile images (a user's Home tile, a server's icon). Persistent for the same reason as
   // the entrance clips: they're part of an identity, so the 7-day upload sweep must not reach them.
+  // Profile pictures. These used to go through /files/upload into uploads/, where the 7-day sweep
+  // deleted them — so an avatar silently vanished about a week after it was set. Persistent now, for
+  // the same reason as the entrance clips and tile icons.
+  const avatarsDir = path.join(DATA_DIR, 'avatars');
+  fs.mkdirSync(avatarsDir, { recursive: true });
   const tileIconsDir = path.join(DATA_DIR, 'tile-icons');
   fs.mkdirSync(tileIconsDir, { recursive: true });
 
@@ -170,6 +190,23 @@ async function main() {
     }),
     limits: { fileSize: TILE_ICON_MAX_BYTES },
     fileFilter: (_req, file, cb) => cb(null, Object.hasOwn(TILE_ICON_TYPES, file.mimetype || '')),
+  });
+
+  // Profile pictures. Larger cap than a tile because these aren't cropped client-side yet, but still
+  // far below the general upload limit — an avatar renders at ~40px.
+  const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
+  const avatarUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, avatarsDir),
+      filename: (_req, file, cb) => {
+        // Provisional extension from the accepted mime type; the receiver re-names it to match the
+        // bytes it actually finds, so a lying Content-Type can't decide how this is served later.
+        const ext = AVATAR_TYPES[file.mimetype] || '.png';
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`);
+      },
+    }),
+    limits: { fileSize: AVATAR_MAX_BYTES },
+    fileFilter: (_req, file, cb) => cb(null, Object.hasOwn(AVATAR_TYPES, file.mimetype || '')),
   });
 
   // Screenshots on feedback/bug reports — images only, capped at 15 MB, stored persistently.
@@ -242,6 +279,10 @@ async function main() {
   app.use('/tile-icons', express.static(tileIconsDir, { redirect: false }));
   // Terminal for the same reason: a reset tile must 404, not receive the SPA shell with a 200.
   app.use('/tile-icons', (req, res) => res.status(404).type('txt').send('Not found'));
+  app.use('/avatars', express.static(avatarsDir, { redirect: false }));
+  // Terminal for the same reason: a removed avatar must 404 rather than fall through to the SPA
+  // catch-all, which would hand an <img> the client's HTML with a 200 and look merely broken.
+  app.use('/avatars', (req, res) => res.status(404).type('txt').send('Not found'));
   // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
@@ -288,6 +329,45 @@ async function main() {
 
   const db = await open({ filename: path.join(DATA_DIR, 'data.sqlite'), driver: sqlite3.Database });
   await migrate(db);
+
+  // Rescue profile pictures that were uploaded before avatars had their own folder. They sit in
+  // uploads/, which the 7-day sweep empties, so without this every existing avatar still disappears —
+  // fixing only NEW uploads would leave the reported bug in place for everyone who already has one.
+  //
+  // Copies rather than moves (the same file may also be referenced by the chat message it was posted
+  // through) and only rewrites a profile after its copy succeeded, so a failure part-way leaves the
+  // old, working url in place. Idempotent: once rewritten, the url no longer matches.
+  async function rescueLegacyAvatars() {
+    let rows;
+    try {
+      rows = await db.all("SELECT username, settings FROM users WHERE settings LIKE '%/uploads/%'");
+    } catch (_) {
+      return; // never block boot on this
+    }
+    let moved = 0;
+    for (const row of rows) {
+      let s;
+      try { s = JSON.parse(row.settings || '{}') || {}; } catch (_) { continue; }
+      const url = s.profile?.avatarUrl;
+      if (typeof url !== 'string' || !url.startsWith('/uploads/')) continue;
+      const source = path.resolve(uploadDir, path.basename(url));
+      if (!source.startsWith(uploadDir + path.sep)) continue;
+      try {
+        if (!fs.existsSync(source)) continue; // already swept — nothing left to rescue
+        const format = await detectImageFormat(source);
+        if (!format) continue; // not an image we can vouch for; leave the url alone
+        const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${FORMAT_EXTENSIONS[format]}`;
+        await fs.promises.copyFile(source, path.join(avatarsDir, filename));
+        s.profile = { ...(s.profile || {}), avatarUrl: `/avatars/${filename}` };
+        await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(s), row.username);
+        moved += 1;
+      } catch (err) {
+        console.warn('[avatars] could not rescue', url, err && err.message);
+      }
+    }
+    if (moved) console.log(`[avatars] moved ${moved} profile picture(s) out of uploads/ so they stop expiring`);
+  }
+  await rescueLegacyAvatars();
 
   const clients = {}; // socketId -> { name, username, serverId }
   const collabSessions = {}; // sessionId (image url) -> { imageUrl, segments: [] } for shared image editing
@@ -503,9 +583,37 @@ async function main() {
   app.post('/user/settings', authMiddleware, async (req, res) => {
     const username = req.user.username;
     const settings = req.body.settings || {};
-    const user = await db.get('SELECT id FROM users WHERE username = ?', username);
+    const user = await db.get('SELECT id, settings AS previous FROM users WHERE username = ?', username);
     if (!user) return res.status(404).json({ error: 'User not found' });
+
+    let before = {};
+    try { before = JSON.parse(user.previous || '{}') || {}; } catch { before = {}; }
+    const storedAvatar = before.profile?.avatarUrl;
+    const hasProfile = typeof settings.profile === 'object' && settings.profile !== null;
+
+    // A client that was already running when rescueLegacyAvatars migrated this user still holds the
+    // old /uploads url in memory, and saving a profile posts the whole profile object — which would
+    // revert the migration and leave the profile pointing at a file the 7-day sweep then deletes.
+    // Nothing legitimately sets an avatar to a /uploads path any more, so the stored copy wins.
+    if (hasProfile && typeof settings.profile.avatarUrl === 'string'
+      && settings.profile.avatarUrl.startsWith('/uploads/')
+      && typeof storedAvatar === 'string' && storedAvatar.startsWith('/avatars/')) {
+      settings.profile = { ...settings.profile, avatarUrl: storedAvatar };
+    }
+
     await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(settings), username);
+
+    // This is a wholesale settings write, so it's also where an avatar stops being referenced —
+    // "Remove" then Save, or replacing the picture with a pasted URL. Clean up the file we were
+    // hosting for them so it doesn't linger forever.
+    //
+    // Deliberately conservative: only when the incoming settings actually carry a profile object, so
+    // an unexpected partial save orphans a file (recoverable) rather than deleting a picture the
+    // profile still points at (not recoverable).
+    if (hasProfile && typeof storedAvatar === 'string' && storedAvatar.startsWith('/avatars/')
+      && storedAvatar !== settings.profile.avatarUrl) {
+      await releaseAvatarFile(storedAvatar);
+    }
     return res.json({ success: true, settings });
   });
 
@@ -568,39 +676,122 @@ async function main() {
     return res.json({ success: true });
   });
 
-  // ---- Rail tile images ----
-  // Shared by the per-user Home tile below and the per-server icon in routes/servers.js.
+  // ---- Managed image uploads (rail tile icons, profile pictures) ----
+  // Both live outside uploads/ so the 7-day sweep can't reach them, and both need the same handling:
+  // multer error mapping, a magic-byte check, and a generated filename. That is all shared here.
 
-  // Delete a file under tileIconsDir, given its public /tile-icons/<name> url.
-  const removeTileIconFile = (url) => {
-    if (!url || !url.startsWith('/tile-icons/')) return;
-    const target = path.resolve(tileIconsDir, path.basename(url));
-    if (!target.startsWith(tileIconsDir + path.sep)) return; // never step outside the folder
+  /**
+   * Delete a file this server manages, given its public url. Refuses anything that doesn't sit
+   * directly inside `dir` under `prefix`, so a crafted url can never reach another path.
+   * @param {string} dir absolute directory the files live in
+   * @param {string} prefix public url prefix, e.g. '/avatars/'
+   * @param {string} url
+   */
+  const removeManagedFile = (dir, prefix, url) => {
+    if (!url || typeof url !== 'string' || !url.startsWith(prefix)) return;
+    const target = path.resolve(dir, path.basename(url));
+    if (!target.startsWith(dir + path.sep)) return; // never step outside the folder
     fs.promises.unlink(target).catch(() => { /* already gone */ });
+  };
+  const removeTileIconFile = (url) => removeManagedFile(tileIconsDir, '/tile-icons/', url);
+
+  /**
+   * Delete an avatar file, but only once nobody references it any more. Avatar urls are visible to
+   * other users (they're in every member list), so someone can paste another person's url into their
+   * own profile; without this check, changing it again would delete a picture still in use elsewhere.
+   * @param {string} url
+   */
+  const releaseAvatarFile = async (url) => {
+    if (typeof url !== 'string' || !/^\/avatars\/[A-Za-z0-9._-]+$/.test(url)) return;
+    // The url shape is checked above, so it carries no LIKE wildcards.
+    const stillUsed = await db.get("SELECT 1 AS n FROM users WHERE settings LIKE '%' || ? || '%' LIMIT 1", url);
+    if (stillUsed) return;
+    removeManagedFile(avatarsDir, '/avatars/', url);
   };
 
   /**
-   * Run a tile-icon upload and hand back the saved file, or answer the request with an error. The
-   * multer errors and the magic-byte check are identical for every tile, so they live here once.
-   * @returns {Promise<{ filename: string, url: string } | null>} null once a response has been sent
+   * Build a single-image upload handler. It runs multer, verifies the bytes really are one of
+   * `formats`, and renames the file so its stored extension matches the format actually detected —
+   * a claimed Content-Type must never decide how the file is served back later.
+   * @param {{ uploader: any, dir: string, urlPrefix: string, formats: string[], maxLabel: string, typeLabel: string }} cfg
+   * @returns {(req: any, res: any) => Promise<{ filename: string, url: string } | null>} resolves
+   *   null once an error response has already been sent
    */
-  const receiveTileIcon = (req, res) => new Promise((resolve) => {
-    tileIconUpload.single('image')(req, res, async (err) => {
+  const makeImageReceiver = ({ uploader, dir, urlPrefix, formats, maxLabel, typeLabel }) => (req, res) => new Promise((resolve) => {
+    uploader.single('image')(req, res, async (err) => {
       if (err) {
-        if (err.code === 'LIMIT_FILE_SIZE') { res.status(413).json({ error: 'Image is larger than 2 MB' }); return resolve(null); }
+        if (err.code === 'LIMIT_FILE_SIZE') { res.status(413).json({ error: `Image is larger than ${maxLabel}` }); return resolve(null); }
         res.status(400).json({ error: err.message || 'Upload failed' });
         return resolve(null);
       }
-      // fileFilter rejects a disallowed mime type by dropping the file, so this covers both a
-      // missing part and a refused type (e.g. an SVG).
-      if (!req.file) { res.status(400).json({ error: 'Tile image must be a PNG, JPEG or WebP' }); return resolve(null); }
-      if (!(await looksLikeImage(req.file.path))) {
+      // fileFilter rejects a disallowed mime type by dropping the file, so a missing req.file covers
+      // both "no part sent" and "type refused" (e.g. an SVG).
+      if (!req.file) { res.status(400).json({ error: typeLabel }); return resolve(null); }
+      const format = await detectImageFormat(req.file.path);
+      if (!format || !formats.includes(format)) {
         await fs.promises.unlink(req.file.path).catch(() => {});
         res.status(400).json({ error: 'That file is not a valid image' });
         return resolve(null);
       }
-      return resolve({ filename: req.file.filename, url: `/tile-icons/${req.file.filename}` });
+      // Align the extension with the detected format if the client's mime type disagreed.
+      let filename = req.file.filename;
+      const wanted = FORMAT_EXTENSIONS[format];
+      if (path.extname(filename).toLowerCase() !== wanted) {
+        const renamed = filename.replace(/\.[^.]*$/, '') + wanted;
+        try {
+          await fs.promises.rename(path.join(dir, filename), path.join(dir, renamed));
+          filename = renamed;
+        } catch (_) { /* keep the original name rather than losing the upload */ }
+      }
+      return resolve({ filename, url: `${urlPrefix}${filename}` });
     });
+  });
+
+  const receiveTileIcon = makeImageReceiver({
+    uploader: tileIconUpload,
+    dir: tileIconsDir,
+    urlPrefix: '/tile-icons/',
+    formats: ['png', 'jpeg', 'webp'], // no GIF: an animated rail tile is a distraction, not a feature
+    maxLabel: '2 MB',
+    typeLabel: 'Tile image must be a PNG, JPEG or WebP',
+  });
+
+  const receiveAvatar = makeImageReceiver({
+    uploader: avatarUpload,
+    dir: avatarsDir,
+    urlPrefix: '/avatars/',
+    formats: ['png', 'jpeg', 'webp', 'gif'],
+    maxLabel: '5 MB',
+    typeLabel: 'Profile picture must be a PNG, JPEG, WebP or GIF',
+  });
+
+  // Read the caller's stored avatar url, but only when it's one of OUR files — a pasted external
+  // https:// avatar or a legacy /uploads/ one must never be handed to the unlink path.
+  const currentAvatarFile = async (username) => {
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    const url = s.profile?.avatarUrl;
+    return typeof url === 'string' && url.startsWith('/avatars/') ? url : '';
+  };
+
+  // Upload the caller's profile picture. Written straight onto the profile (like the entrance clip)
+  // so the file and the pointer to it are never out of step, and so closing the editor without
+  // saving can't leave an uploaded file that nothing references.
+  app.post('/profile/avatar', authMiddleware, async (req, res) => {
+    const saved = await receiveAvatar(req, res);
+    if (!saved) return undefined; // receiveAvatar already answered
+    const previous = await currentAvatarFile(req.user.username);
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', req.user.username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    s.profile = { ...(s.profile || {}), avatarUrl: saved.url };
+    await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(s), req.user.username);
+    // New file, then the pointer, then drop the old one: a crash can orphan a file but can never
+    // leave the profile pointing at something that isn't there. The release runs after the settings
+    // write so the reference count it checks is already up to date.
+    if (previous && previous !== saved.url) await releaseAvatarFile(previous);
+    return res.json({ success: true, url: saved.url });
   });
 
   // Read the caller's stored Home tile url (used to clean up the file it replaces).

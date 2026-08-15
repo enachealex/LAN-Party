@@ -2048,21 +2048,40 @@ export default function App() {
     }
   }
 
+  // Profile pictures go to their own endpoint, NOT the general /files/upload one: anything stored
+  // under uploads/ is deleted by the 7-day sweep, which used to make an avatar vanish after a week.
+  const AVATAR_MAX_BYTES = 5 * 1024 * 1024 // must match the server's cap
   const uploadProfileAvatar = async (file) => {
     const t = token || localStorage.getItem('lanparty_token')
     if (!t || !file) return
-    if (!file.type.startsWith('image/')) { setUploadError('Profile picture must be an image.'); return }
-    if (file.size > MAX_FILE_SIZE) { setUploadError('File is larger than 100 MB.'); return }
+    // Failures report as a toast, NOT via setUploadError: that message only renders under the message
+    // composer, which isn't on screen while the settings panel is open — so a rejected picture looked
+    // like a dead button, and the message later reappeared attached to an unrelated action. The server
+    // now enforces a type allowlist and a 5 MB cap (a HEIC phone photo hits both), so these paths are
+    // reachable in normal use and have to be visible.
+    if (!file.type.startsWith('image/')) { setToast('Profile picture must be an image.'); return }
+    if (file.size > AVATAR_MAX_BYTES) { setToast('Profile picture must be under 5 MB.'); return }
     try {
       const fd = new FormData()
-      fd.append('file', file)
-      const res = await fetch(`${SERVER_URL}/files/upload`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Upload failed')
-      updateProfileDraft({ avatarUrl: data.attachment.url })
-      setToast('Profile picture updated — Save Profile to apply')
+      fd.append('image', file)
+      const res = await fetch(`${SERVER_URL}/profile/avatar`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
+      const data = await res.json().catch(() => ({})) // a 413 from a proxy may not carry JSON
+      if (!res.ok) throw new Error(data.error || 'Could not save that picture')
+      // The endpoint writes it onto the profile immediately (same as the entrance clip), so mirror it
+      // into the live profile as well as the draft — otherwise Cancel would show a stale picture.
+      updateProfileDraft({ avatarUrl: data.url })
+      setProfile((p) => ({ ...(p || {}), avatarUrl: data.url }))
+      // …and into BOTH settings copies. They hold their own `profile` snapshot taken when the panel
+      // opened: applySettings ends by calling setProfile(settings.profile), so picking a colour scheme
+      // would otherwise snap the picture back to the pre-upload one, and the next wholesale save would
+      // write that stale url — releasing the file we just stored and leaving a 404 behind.
+      const mirrorAvatar = (s) => (s ? { ...s, profile: { ...(s.profile || {}), avatarUrl: data.url } } : s)
+      setUserSettings(mirrorAvatar)
+      setEditingSettings(mirrorAvatar)
+      setUploadError(null) // don't let a previous failure resurface under the message composer
+      setToast('Profile picture updated')
     } catch (err) {
-      setUploadError(err.message)
+      setToast(err.message || 'Could not save that picture')
     }
   }
 
