@@ -22,11 +22,25 @@ const ICON_BASE = import.meta.env.BASE_URL + 'icons/'
 const HOME_ICON_URL = ICON_BASE + 'home.png'
 const MICROPHONE_ICON_URL = ICON_BASE + 'microphone.png'
 const HEADPHONES_ICON_URL = ICON_BASE + 'headphones.png'
-const SETTINGS_ICON_URL = ICON_BASE + 'settings.png'
 const ADD_SERVER_ICON_URL = ICON_BASE + 'add-server.png'
 const DOWNLOAD_APPS_ICON_URL = ICON_BASE + 'download-apps.png'
 
 const SPEAKER_ICON_PATH = 'M12 3a9 9 0 0 0-9 9v3a3 3 0 0 0 3 3h1v-6H6a7 7 0 0 1 14 0v6h1a3 3 0 0 0 3-3v-3a9 9 0 0 0-9-9Zm-1 14h2v3h-2v-3Z'
+
+// Cogwheel for the settings button. The asset it replaced (icons/settings.png) was a person
+// silhouette, so the button read as "my profile" when it opens settings for the whole app. Inline SVG
+// rather than another PNG: it stays crisp at any size and inherits the control's colour states.
+function CogIcon() {
+  return (
+    <svg className="dc-control-icon dc-settings-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => (
+        <rect key={deg} x="10.8" y="1.4" width="2.4" height="5" rx="1" transform={`rotate(${deg} 12 12)`} />
+      ))}
+      {/* evenodd so the centre is punched out rather than painted with a background colour. */}
+      <path fillRule="evenodd" d="M12 5a7 7 0 1 0 0 14 7 7 0 1 0 0-14Zm0 3.9a3.1 3.1 0 1 0 0 6.2 3.1 3.1 0 1 0 0-6.2Z" />
+    </svg>
+  )
+}
 
 function ChannelSpeakerIcon() {
   return (
@@ -533,8 +547,8 @@ export default function AppLeftPane({
             </span>
           </button>
           <div className="dc-user-controls">
-            <button type="button" className="dc-control-btn" title="Profile / Settings" onClick={onOpenSettings}>
-              <img src={SETTINGS_ICON_URL} alt="" className="dc-control-icon dc-settings-icon" draggable={false} />
+            <button type="button" className="dc-control-btn" title="Settings" aria-label="Settings" onClick={onOpenSettings}>
+              <CogIcon />
             </button>
           </div>
         </div>
