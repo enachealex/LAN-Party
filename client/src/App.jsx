@@ -5729,8 +5729,8 @@ export default function App() {
                       </div>
                       <div className="voice-ctrl-wrap" ref={activityMenuRef}>
                         {showActivityMenu && (
-                          <div className="voice-quality-menu activity-launcher" role="menu" aria-label="Activities">
-                            <div className="voice-quality-title">🎉 Activities</div>
+                          <div className="voice-quality-menu activity-launcher" role="menu" aria-label="Things To Do">
+                            <div className="voice-quality-title">🎉 Things To Do</div>
                             {ACTIVITY_TYPES.map((a) => (
                               <button key={a.id} type="button" role="menuitem" className="activity-launch-opt" onClick={() => startActivity(a.id)}>
                                 <span className="activity-launch-icon">{a.icon}</span>
@@ -5742,7 +5742,7 @@ export default function App() {
                             ))}
                           </div>
                         )}
-                        <button className={`voice-ctrl${activity ? ' toggled' : ''}`} onClick={() => setShowActivityMenu((v) => !v)} title="Activities" aria-label="Activities" aria-pressed={!!activity} aria-haspopup="menu">
+                        <button className={`voice-ctrl${activity ? ' toggled' : ''}`} onClick={() => setShowActivityMenu((v) => !v)} title="Things To Do" aria-label="Things To Do" aria-pressed={!!activity} aria-haspopup="menu">
                           <ActivitiesIcon />
                         </button>
                       </div>

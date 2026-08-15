@@ -33,7 +33,7 @@ export default function ActivityPanel({ activity, me, onEvent, onClose }) {
     <div className="activity-panel">
       <div className="activity-head">
         <span className="activity-head-title">{meta?.icon} {meta?.label} <span className="activity-by">· started by {by}</span></span>
-        <button type="button" className="activity-close" onClick={onClose} title="End this activity for everyone" aria-label="End activity">✕ End</button>
+        <button type="button" className="activity-close" onClick={onClose} title={`End ${meta?.label || 'this'} for everyone`} aria-label="End for everyone">✕ End</button>
       </div>
       <div className="activity-body">
         {type === 'music' && <MusicActivity state={state} me={me} onEvent={onEvent} />}
