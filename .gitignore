@@ -18,6 +18,11 @@ server/data.sqlite-journal
 server/uploads/
 server/gifs/
 server/sounds/
+server/entrances/
+server/tile-icons/
+server/app-bundles/
+server/feedback-media/
+server/downloads/
 data/
 
 # Logs

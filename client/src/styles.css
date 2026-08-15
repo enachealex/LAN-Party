@@ -73,6 +73,10 @@ body,html,#root{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-
   border-radius:12px;
 }
 .dc-server-icon{width:48px;height:48px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;color:#fff;transition:transform 120ms ease,filter 120ms ease}
+/* A user-supplied tile image. Already cropped square on upload, so `cover` fills the tile without
+   distortion; the default house icon keeps `contain` so its transparent margin is preserved. */
+.dc-tile-custom{object-fit:cover;object-position:center;background:#1e1f22}
+img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 /* Android-style notification badge: sits on top of the tile, straddling its top-right corner. */
 .dc-rail-badge{position:absolute;top:-4px;right:8px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#f23f43;color:#fff;font-size:11px;font-weight:800;line-height:18px;text-align:center;border:2px solid #1e1f22;box-sizing:content-box;z-index:6;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,.4)}
 .dc-rail-separator{width:32px;height:2px;background:#35363c;border-radius:1px;margin:4px 0 10px}
@@ -1854,6 +1858,12 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .dc-member-row{min-height:44px}
   .dc-members-invite{min-height:44px}
 
+  /* Crop picker: the dialog is edge-anchored by the .auth-modal rule above, so only the controls
+     need phone sizing. Buttons stretch to fill the row. The close button needs the parent class in
+     its selector — its desktop 32px rule is declared later in the file and would otherwise win. */
+  .crop-btn-cancel,.crop-btn-save{flex:1;min-height:44px}
+  .crop-modal .crop-modal-close{width:44px;height:44px}
+
   /* Tab strips: allow horizontal scrolling instead of squashing or overflowing. */
   .profile-settings-tabs,.app-dir-tabs,.emoji-tabs{
     overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;flex-wrap:nowrap;
@@ -2073,6 +2083,33 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 /* The Account Removal heading lives inside the danger zone (below its divider), so it needs the
    section-title look without the extra top margin a standalone heading carries. */
 .profile-danger-title{margin:0 0 2px}
+
+/* ---------------------------------------------------------------------------
+   Square crop picker for rail tile images.
+   ------------------------------------------------------------------------- */
+/* Two-class selector so it outranks the bare .auth-modal sizing regardless of rule order. */
+.auth-modal.crop-modal{width:min(92vw,380px);padding:0}
+.crop-modal-inner{padding:16px;display:flex;flex-direction:column;gap:12px}
+.crop-modal-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.crop-modal-title{font-weight:800;font-size:16px}
+.crop-modal-close{width:32px;height:32px;border:none;border-radius:8px;background:transparent;color:var(--text);font-size:15px;cursor:pointer}
+.crop-modal-close:hover{background:rgba(255,255,255,.08)}
+/* The frame IS the crop: whatever shows inside this square is what gets saved. */
+.crop-frame{
+  position:relative;width:100%;aspect-ratio:1/1;overflow:hidden;border-radius:18px;
+  background:#0c0f13;border:1px solid rgba(255,255,255,.12);cursor:grab;touch-action:none;
+}
+.crop-frame:active{cursor:grabbing}
+.crop-frame-img{position:absolute;top:50%;left:50%;max-width:none;user-select:none;-webkit-user-drag:none}
+.crop-frame-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px}
+.crop-zoom{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--muted)}
+.crop-zoom input[type=range]{flex:1;accent-color:var(--accent-end)}
+.crop-modal-hint{font-size:12.5px;color:var(--muted);line-height:1.45}
+.crop-modal-error{font-size:12.5px;color:#ffb4b4}
+.crop-modal-actions{display:flex;justify-content:flex-end;gap:8px}
+.crop-btn-cancel{padding:9px 14px;border-radius:9px;border:1px solid rgba(255,255,255,.14);background:transparent;color:var(--text);font-weight:700;cursor:pointer}
+.crop-btn-save{padding:9px 14px;border-radius:9px;border:none;background:linear-gradient(90deg,var(--accent-start),var(--accent-end));color:#021022;font-weight:800;cursor:pointer}
+.crop-btn-cancel:disabled,.crop-btn-save:disabled{opacity:.55;cursor:default}
 
 /* ---------------------------------------------------------------------------
    Startup splash. Sits above the app but BELOW the mobile install gate (10000),

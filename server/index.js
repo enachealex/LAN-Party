@@ -40,6 +40,34 @@ const FILE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // uploads are deleted 7 days after
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // sweep hourly
 const SOUND_NAME_MAX = 12; // keep soundboard names short enough to fit a tile
 
+// Raster image types accepted for rail tile icons, mapped to the extension we store them under.
+// Deliberately no SVG (scriptable) and no GIF (the client never produces one, and refusing it keeps
+// hand-crafted animated tiles out).
+const TILE_ICON_TYPES = { 'image/webp': '.webp', 'image/png': '.png', 'image/jpeg': '.jpg' };
+
+/**
+ * Confirm a file really is one of the accepted image types by its leading bytes. A declared mime type
+ * is just a client claim, and these files are served back as <img> sources.
+ * @param {string} filePath
+ * @returns {Promise<boolean>}
+ */
+async function looksLikeImage(filePath) {
+  let fh;
+  try {
+    fh = await fs.promises.open(filePath, 'r');
+    const { buffer, bytesRead } = await fh.read(Buffer.alloc(12), 0, 12, 0);
+    if (bytesRead < 12) return false;
+    const png = buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const jpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    const webp = buffer.subarray(0, 4).toString('latin1') === 'RIFF' && buffer.subarray(8, 12).toString('latin1') === 'WEBP';
+    return png || jpeg || webp;
+  } catch (_) {
+    return false;
+  } finally {
+    try { await fh?.close(); } catch (_) { /* already closed */ }
+  }
+}
+
 function isStrongPassword(pw) {
   if (typeof pw !== 'string') return false;
   // at least 8 chars, 1 lower, 1 upper, 1 digit, 1 special char
@@ -74,6 +102,10 @@ async function main() {
   // part of a profile, so they must outlive the 7-day upload sweep.
   const entrancesDir = path.join(DATA_DIR, 'entrances');
   fs.mkdirSync(entrancesDir, { recursive: true });
+  // Custom rail-tile images (a user's Home tile, a server's icon). Persistent for the same reason as
+  // the entrance clips: they're part of an identity, so the 7-day upload sweep must not reach them.
+  const tileIconsDir = path.join(DATA_DIR, 'tile-icons');
+  fs.mkdirSync(tileIconsDir, { recursive: true });
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -121,6 +153,23 @@ async function main() {
       },
     }),
     limits: { fileSize: ENTRANCE_MAX_BYTES },
+  });
+
+  // Rail tile images. The client crops to a square and re-encodes before uploading, so what arrives
+  // is a ~20KB thumbnail; the cap is generous only to leave room for a PNG fallback from an old
+  // browser. SVG is refused outright further down — it can carry script, and these are <img> sources.
+  const TILE_ICON_MAX_BYTES = 2 * 1024 * 1024;
+  const tileIconUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, tileIconsDir),
+      filename: (_req, file, cb) => {
+        // Generated name, never the client's: the extension comes from the mime type we accepted.
+        const ext = TILE_ICON_TYPES[file.mimetype] || '.png';
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`);
+      },
+    }),
+    limits: { fileSize: TILE_ICON_MAX_BYTES },
+    fileFilter: (_req, file, cb) => cb(null, Object.hasOwn(TILE_ICON_TYPES, file.mimetype || '')),
   });
 
   // Screenshots on feedback/bug reports — images only, capped at 15 MB, stored persistently.
@@ -190,6 +239,9 @@ async function main() {
   // Terminal for this mount: a deleted/missing clip must 404 rather than fall through to the SPA
   // catch-all, which would hand an <audio> element the client's HTML with a 200.
   app.use('/entrances', (req, res) => res.status(404).type('txt').send('Not found'));
+  app.use('/tile-icons', express.static(tileIconsDir, { redirect: false }));
+  // Terminal for the same reason: a reset tile must 404, not receive the SPA shell with a 200.
+  app.use('/tile-icons', (req, res) => res.status(404).type('txt').send('Not found'));
   // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
@@ -516,6 +568,79 @@ async function main() {
     return res.json({ success: true });
   });
 
+  // ---- Rail tile images ----
+  // Shared by the per-user Home tile below and the per-server icon in routes/servers.js.
+
+  // Delete a file under tileIconsDir, given its public /tile-icons/<name> url.
+  const removeTileIconFile = (url) => {
+    if (!url || !url.startsWith('/tile-icons/')) return;
+    const target = path.resolve(tileIconsDir, path.basename(url));
+    if (!target.startsWith(tileIconsDir + path.sep)) return; // never step outside the folder
+    fs.promises.unlink(target).catch(() => { /* already gone */ });
+  };
+
+  /**
+   * Run a tile-icon upload and hand back the saved file, or answer the request with an error. The
+   * multer errors and the magic-byte check are identical for every tile, so they live here once.
+   * @returns {Promise<{ filename: string, url: string } | null>} null once a response has been sent
+   */
+  const receiveTileIcon = (req, res) => new Promise((resolve) => {
+    tileIconUpload.single('image')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') { res.status(413).json({ error: 'Image is larger than 2 MB' }); return resolve(null); }
+        res.status(400).json({ error: err.message || 'Upload failed' });
+        return resolve(null);
+      }
+      // fileFilter rejects a disallowed mime type by dropping the file, so this covers both a
+      // missing part and a refused type (e.g. an SVG).
+      if (!req.file) { res.status(400).json({ error: 'Tile image must be a PNG, JPEG or WebP' }); return resolve(null); }
+      if (!(await looksLikeImage(req.file.path))) {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+        res.status(400).json({ error: 'That file is not a valid image' });
+        return resolve(null);
+      }
+      return resolve({ filename: req.file.filename, url: `/tile-icons/${req.file.filename}` });
+    });
+  });
+
+  // Read the caller's stored Home tile url (used to clean up the file it replaces).
+  const currentHomeTileUrl = async (username) => {
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    const url = s.homeTileUrl;
+    return typeof url === 'string' && url.startsWith('/tile-icons/') ? url : '';
+  };
+
+  // Set the caller's Home rail tile image. Personal — it isn't shown to anyone else — so it lives in
+  // settings rather than on a shared row. Written immediately so it survives without a profile Save.
+  app.post('/profile/home-tile', authMiddleware, async (req, res) => {
+    const saved = await receiveTileIcon(req, res);
+    if (!saved) return undefined; // receiveTileIcon already answered
+    const previous = await currentHomeTileUrl(req.user.username);
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', req.user.username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    s.homeTileUrl = saved.url;
+    await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(s), req.user.username);
+    // New file first, then the pointer, then drop the old one: a crash can leave an orphaned file but
+    // never a settings entry pointing at nothing.
+    if (previous && previous !== saved.url) removeTileIconFile(previous);
+    return res.json({ success: true, url: saved.url });
+  });
+
+  // Reset the caller's Home tile back to the default icon.
+  app.delete('/profile/home-tile', authMiddleware, async (req, res) => {
+    const previous = await currentHomeTileUrl(req.user.username);
+    const row = await db.get('SELECT settings FROM users WHERE username = ?', req.user.username);
+    let s = {};
+    try { s = JSON.parse(row?.settings || '{}') || {}; } catch { s = {}; }
+    delete s.homeTileUrl;
+    await db.run('UPDATE users SET settings = ? WHERE username = ?', JSON.stringify(s), req.user.username);
+    if (previous) removeTileIconFile(previous);
+    return res.json({ success: true });
+  });
+
   // Change the current user's username. Username is used as a natural key across many tables, so the
   // rename must cascade in a transaction; then we issue a fresh JWT (it carries the username).
   app.post('/user/username', authMiddleware, async (req, res) => {
@@ -686,12 +811,12 @@ async function main() {
       const username = clients[sid]?.username;
       const role = await roleOf(serverId, username);
       const channels = await visibleChannelsFor(serverId, allChannels, username, role);
-      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, channels }, members: roster, myRole: role });
+      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, iconUrl: srv.icon_url || null, channels }, members: roster, myRole: role });
     }
   }
 
   // Servers / channels / membership (routes/servers.js).
-  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput });
+  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
   registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir });

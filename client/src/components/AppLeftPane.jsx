@@ -201,6 +201,10 @@ export default function AppLeftPane({
   serverUnreadTotals = {},
   paneTab = 'channels',   // which view the server side panel is showing: 'channels' | 'members'
   onPaneTabChange,
+  homeTileUrl = null,     // custom Home tile image (per-user); null = the default house icon
+  resolveTileSrc = (u) => u,
+  onChangeTileImage,      // (target) => void, where target is { kind: 'home' } | { kind: 'server', id, name }
+  onResetTileImage,
 }) {
   const isStaff = myRole === 'owner' || myRole === 'admin'
   const showMembersTab = paneTab === 'members'
@@ -275,15 +279,25 @@ export default function AppLeftPane({
     <aside ref={dcLeftRef} className="dc-left" aria-label="Navigation">
       <div className="dc-server-rail">
         <RailIcon
-          title="Home"
+          title={homeTileUrl ? 'Home — right-click to change the tile image' : 'Home'}
           home
           active={selectedServerId === 'home'}
           voiceActive={showVoiceOnHome}
           badge={selectedServerId === 'home' ? 0 : totalUnreadMessages}
           onClick={() => onSelectServer?.('home')}
+          onContextMenu={(e) => openCtxMenu(e, { kind: 'home', hasIcon: !!homeTileUrl })}
+          longPress={longPressProps((e) => openCtxMenu(e, { kind: 'home', hasIcon: !!homeTileUrl }))}
           {...voiceTileProps}
         >
-          <img src={HOME_ICON_URL} alt="" className="dc-home-img" draggable={false} width={48} height={48} />
+          {/* A custom tile is cropped square on upload, so it only needs covering the tile. */}
+          <img
+            src={homeTileUrl ? resolveTileSrc(homeTileUrl) : HOME_ICON_URL}
+            alt=""
+            className={`dc-home-img ${homeTileUrl ? 'dc-tile-custom' : ''}`}
+            draggable={false}
+            width={48}
+            height={48}
+          />
         </RailIcon>
 
         <div className="dc-rail-separator" />
@@ -296,13 +310,18 @@ export default function AppLeftPane({
             voiceActive={inVoice && voiceRailTarget === s.id}
             badge={serverUnreadTotals[s.id] || 0}
             onClick={() => onSelectServer?.(s.id)}
-            onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null })}
-            longPress={longPressProps((e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null }))}
+            onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl })}
+            longPress={longPressProps((e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl }))}
             {...voiceTileProps}
           >
-            <span className="dc-server-icon" style={{ background: SERVER_COLORS[i % SERVER_COLORS.length] }}>
-              {serverInitials(s.name)}
-            </span>
+            {/* A server icon is shared by every member; without one the tile falls back to initials. */}
+            {s.iconUrl ? (
+              <img src={resolveTileSrc(s.iconUrl)} alt="" className="dc-server-icon dc-tile-custom" draggable={false} />
+            ) : (
+              <span className="dc-server-icon" style={{ background: SERVER_COLORS[i % SERVER_COLORS.length] }}>
+                {serverInitials(s.name)}
+              </span>
+            )}
           </RailIcon>
         ))}
 
@@ -548,8 +567,17 @@ export default function AppLeftPane({
             if (staff && !isDemo) {
               items.push(
                 <button key="rename" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameServer?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename server</button>,
-                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id, ctxMenu.name) }}>➕ Invite people</button>
+                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id, ctxMenu.name) }}>➕ Invite people</button>,
+                // The icon is shared, so only staff can set it — and everyone in the server sees it.
+                <button key="icon" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onChangeTileImage?.({ kind: 'server', id: ctxMenu.id, name: ctxMenu.name }) }}>
+                  🖼️ {ctxMenu.hasIcon ? 'Change icon' : 'Set icon'}
+                </button>
               )
+              if (ctxMenu.hasIcon) {
+                items.push(
+                  <button key="icon-reset" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetTileImage?.({ kind: 'server', id: ctxMenu.id, name: ctxMenu.name }) }}>↩️ Reset icon</button>
+                )
+              }
             }
             if (role !== 'owner' && !isDemo) {
               items.push(
@@ -568,6 +596,19 @@ export default function AppLeftPane({
               </>
             )
           })()}
+
+          {ctxMenu.kind === 'home' && (
+            <>
+              <div className="dc-ctx-title">Home</div>
+              {/* Personal: this image is only ever shown to you. */}
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onChangeTileImage?.({ kind: 'home' }) }}>
+                🖼️ {ctxMenu.hasIcon ? 'Change tile image' : 'Set tile image'}
+              </button>
+              {ctxMenu.hasIcon && (
+                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetTileImage?.({ kind: 'home' }) }}>↩️ Reset to default</button>
+              )}
+            </>
+          )}
 
           {ctxMenu.kind === 'channel' && (
             <>

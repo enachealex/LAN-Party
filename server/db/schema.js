@@ -192,6 +192,15 @@ const MIGRATIONS = [
       await addColumn(db, 'apps', 'bundle_dir', 'TEXT');
     },
   },
+  {
+    // Custom server tile icon (a /tile-icons/<file> url). Shared: set by owner/admin, seen by every
+    // member, so it belongs on the server row rather than in each viewer's settings. NULL = fall back
+    // to the coloured initials. The per-user Home tile image is settings.homeTileUrl instead.
+    name: '0004_server_icon',
+    up: async (db) => {
+      await addColumn(db, 'servers', 'icon_url', 'TEXT');
+    },
+  },
 ];
 
 /**

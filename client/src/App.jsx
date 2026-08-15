@@ -30,6 +30,7 @@ import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
 import MicTest from './components/MicTest'
 import BootSplash from './components/BootSplash'
+import ImageCropModal from './components/ImageCropModal'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
@@ -910,6 +911,11 @@ export default function App() {
   // Which view the server side panel shows: 'channels' | 'members'. Group-DM members still use the
   // right-side panel above, since that view has no channel list to share a panel with.
   const [serverPaneTab, setServerPaneTab] = useState('channels')
+  // Custom rail tile image being chosen: { target, file }. `target` is { kind: 'home' } or
+  // { kind: 'server', id, name }; `file` is the picked original, cropped in the modal before upload.
+  const [tileCrop, setTileCrop] = useState(null)
+  const tileFileInputRef = useRef(null)
+  const tileTargetRef = useRef(null) // survives the trip out to the OS file dialog and back
   const [memberMenu, setMemberMenu] = useState(null) // right-click manage menu: { x, y, username, name, role }
   const [deferredPrompt, setDeferredPrompt] = useState(null)
   const [showInstallPanel, setShowInstallPanel] = useState(false)
@@ -2055,6 +2061,64 @@ export default function App() {
     } catch (err) {
       setUploadError(err.message)
     }
+  }
+
+  // ---- Custom rail tile images (Home tile + server icons) ----
+
+  // Open the OS picker for a tile. The chosen file goes to the crop modal, never straight to upload:
+  // the tile is square, so an uncropped photo would be silently centre-cropped by CSS instead of by
+  // the person who picked it.
+  const openTileImagePicker = (target) => {
+    tileTargetRef.current = target
+    if (tileFileInputRef.current) {
+      tileFileInputRef.current.value = '' // re-picking the same file must still fire onChange
+      tileFileInputRef.current.click()
+    }
+  }
+
+  const onTileFilePicked = (e) => {
+    const file = e.target.files && e.target.files[0]
+    const target = tileTargetRef.current
+    if (!file || !target) return
+    if (!file.type.startsWith('image/')) { setToast('Tile image must be an image file.'); return }
+    setTileCrop({ target, file })
+  }
+
+  // Upload the cropped square. The modal hands over a small re-encoded file, so this is a plain POST.
+  const uploadTileImage = async (cropped) => {
+    const target = tileCrop?.target
+    if (!target || !cropped) return
+    const t = token || localStorage.getItem('lanparty_token')
+    const path = target.kind === 'home' ? '/profile/home-tile' : `/servers/${target.id}/icon`
+    const fd = new FormData()
+    fd.append('image', cropped)
+    const res = await fetch(`${SERVER_URL}${path}`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { setToast(data.error || 'Could not save the tile image'); return }
+    if (target.kind === 'home') {
+      // Mirror it into both settings copies: `userSettings` drives the rail, and the settings modal
+      // saves `editingSettings` wholesale — a stale copy there would wipe the tile on the next save.
+      setUserSettings((s) => ({ ...(s || {}), homeTileUrl: data.url }))
+      setEditingSettings((s) => (s ? { ...s, homeTileUrl: data.url } : s))
+      setToast('Home tile updated')
+    } else {
+      // The server broadcasts servers:updated, so the rail (and every other member's) refreshes itself.
+      setToast(`${target.name || 'Server'} icon updated`)
+    }
+    setTileCrop(null)
+  }
+
+  const resetTileImage = async (target) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    const path = target.kind === 'home' ? '/profile/home-tile' : `/servers/${target.id}/icon`
+    const res = await fetch(`${SERVER_URL}${path}`, { method: 'DELETE', headers: { Authorization: `Bearer ${t}` } })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { setToast(data.error || 'Could not reset the tile image'); return }
+    if (target.kind === 'home') {
+      setUserSettings((s) => { const next = { ...(s || {}) }; delete next.homeTileUrl; return next })
+      setEditingSettings((s) => { if (!s) return s; const next = { ...s }; delete next.homeTileUrl; return next })
+    }
+    setToast('Tile image reset')
   }
 
   // Set avatar from a pasted image URL.
@@ -5237,6 +5301,22 @@ export default function App() {
         />
       )}
 
+      {/* Tile image picker + cropper. The input is hidden; the rail's context menus drive it. */}
+      <input
+        ref={tileFileInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        style={{ display: 'none' }}
+        onChange={onTileFilePicked}
+      />
+      <ImageCropModal
+        open={!!tileCrop}
+        file={tileCrop?.file || null}
+        title={tileCrop?.target?.kind === 'home' ? 'Crop your Home tile' : `Crop the ${tileCrop?.target?.name || 'server'} icon`}
+        onCancel={() => setTileCrop(null)}
+        onConfirm={uploadTileImage}
+      />
+
       {showInstallGate && (
         <MobileInstallGate
           deferredPrompt={deferredPrompt}
@@ -5314,6 +5394,10 @@ export default function App() {
         members={serverMembers}
         paneTab={serverPaneTab}
         onPaneTabChange={setServerPaneTab}
+        homeTileUrl={userSettings?.homeTileUrl || null}
+        resolveTileSrc={emojiSrc}
+        onChangeTileImage={openTileImagePicker}
+        onResetTileImage={resetTileImage}
         socketId={socket?.id}
         onSelectMember={openMemberProfile}
         myRole={serverState?.myRole || 'member'}

@@ -2,16 +2,16 @@
 // and channels, private-channel member lists, and membership (roster/invite/kick/role/leave).
 // Role checks and the state broadcasts are shared with the socket layer, so they are injected.
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile }) {
   // The rail shows only the servers the user owns or has been invited to. New users start with an
   // empty rail (no server is auto-joined at registration) and land on the home view.
   app.get('/servers', authMiddleware, async (req, res) => {
     const me = req.user.username;
     const mine = await db.all(
-      'SELECT s.id, s.name, s.owner, m.role FROM server_members m JOIN servers s ON s.id = m.server_id WHERE m.username = ? ORDER BY s.rowid ASC',
+      'SELECT s.id, s.name, s.owner, s.icon_url, m.role FROM server_members m JOIN servers s ON s.id = m.server_id WHERE m.username = ? ORDER BY s.rowid ASC',
       me
     );
-    const out = mine.map((s) => ({ id: s.id, name: s.name, owner: s.owner || null, role: s.role }));
+    const out = mine.map((s) => ({ id: s.id, name: s.name, owner: s.owner || null, role: s.role, iconUrl: s.icon_url || null }));
     return res.json({ servers: out });
   });
 
@@ -131,11 +131,42 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ server: { id: serverId, name } });
   });
 
+  // Set a server's tile icon (owner/admin). Shared, not per-viewer: everyone in the rail sees it, so
+  // it lives on the server row and every member is told to refresh.
+  app.post('/servers/:serverId/icon', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: "The public server's icon can't be changed" });
+    const srv = await db.get('SELECT id, icon_url FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    // Permission BEFORE the upload, so a non-admin's bytes are never written to disk.
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can change the icon' });
+    const saved = await receiveTileIcon(req, res);
+    if (!saved) return undefined; // receiveTileIcon already answered
+    await db.run('UPDATE servers SET icon_url = ? WHERE id = ?', saved.url, serverId);
+    if (srv.icon_url && srv.icon_url !== saved.url) removeTileIconFile(srv.icon_url);
+    io.emit('servers:updated'); // every member's rail re-reads the list
+    await pushServerState(serverId);
+    return res.json({ success: true, url: saved.url });
+  });
+
+  // Clear a server's tile icon, falling back to the coloured initials (owner/admin).
+  app.delete('/servers/:serverId/icon', authMiddleware, async (req, res) => {
+    const serverId = req.params.serverId;
+    const srv = await db.get('SELECT id, icon_url FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can change the icon' });
+    await db.run('UPDATE servers SET icon_url = NULL WHERE id = ?', serverId);
+    if (srv.icon_url) removeTileIconFile(srv.icon_url);
+    io.emit('servers:updated');
+    await pushServerState(serverId);
+    return res.json({ success: true });
+  });
+
   // Delete a server (owner only; the default commons is protected).
   app.delete('/servers/:serverId', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
     if (serverId === DEMO_ID) return res.status(400).json({ error: 'The default server cannot be deleted' });
-    const srv = await db.get('SELECT id, owner FROM servers WHERE id = ?', serverId);
+    const srv = await db.get('SELECT id, owner, icon_url FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
     if (srv.owner !== req.user.username) return res.status(403).json({ error: 'Only the owner can delete this server' });
     const members = await db.all('SELECT username FROM server_members WHERE server_id = ?', serverId);
@@ -145,6 +176,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     await db.run('DELETE FROM server_emojis WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
+    if (srv.icon_url) removeTileIconFile(srv.icon_url); // otherwise the icon outlives its server
     for (const m of members) io.to(`user:${m.username}`).emit('servers:updated'); // drop it from every member's rail
     return res.json({ success: true });
   });
