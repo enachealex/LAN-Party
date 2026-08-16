@@ -256,6 +256,28 @@ function captionFromText(text) {
   return trimmed.slice(0, trimmed.length - media.url.length).trim()
 }
 
+/**
+ * The gist of a quoted message: its words, plus a small thumbnail when the message was media. A quoted
+ * GIF used to show its raw url, which is unreadable and usually longer than the quote box itself.
+ * Shared by the staged reply above the composer and the quote block inside a sent bubble.
+ */
+function QuoteBody({ text, className }) {
+  const blocks = messageBlocks(text)
+  const media = blocks.find((b) => b.type === 'media')?.media
+  if (!media) return <div className={className}>{text}</div>
+  const words = blocks.filter((b) => b.type === 'text').map((b) => b.text).join(' ')
+  const kind = isGifAttachment(media) ? 'GIF' : isVideoAttachment(media) ? 'Video' : 'Image'
+  return (
+    <div className={`${className} quote-has-media`}>
+      <span className="quote-thumb">
+        <img src={emojiSrc(media.url)} alt="" loading="lazy" />
+      </span>
+      {/* Any caption reads better than the file type; the type is the fallback for media-only quotes. */}
+      <span className="quote-thumb-label">{words || kind}</span>
+    </div>
+  )
+}
+
 // Ordered list of every media item in a message array (attachments + media URLs) for lightbox cycling.
 function collectMediaList(messages = []) {
   const list = []
@@ -786,7 +808,7 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
                     <span className="msg-quote-author">{q.author}</span>
                     {formatMessageTime(q.ts) && <span className="msg-quote-time">{formatMessageTime(q.ts)}</span>}
                   </div>
-                  <div className="msg-quote-text">{q.text}</div>
+                  <QuoteBody text={q.text} className="msg-quote-text" />
                 </div>
               ))}
             </div>
@@ -5460,7 +5482,7 @@ export default function App() {
                     <span className="composer-quote-author">{q.author}</span>
                     {formatMessageTime(q.ts) && <span className="composer-quote-time">{formatMessageTime(q.ts)}</span>}
                   </div>
-                  <div className="composer-quote-text">{q.text}</div>
+                  <QuoteBody text={q.text} className="composer-quote-text" />
                 </div>
                 <button type="button" className="composer-quote-remove" onClick={() => removePendingQuote(q.id)} aria-label={`Stop replying to ${q.author}`}>✕</button>
               </div>

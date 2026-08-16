@@ -1,6 +1,60 @@
 const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification, Tray, Menu, nativeImage, ipcMain } = require('electron')
 const path = require('path')
+const fs = require('fs')
 const { autoUpdater } = require('electron-updater')
+
+// ---------------------------------------------------------------------------
+// Preferences — deliberately LOCAL to this machine, not synced with the account.
+// "Start with Windows" is a property of this computer, and someone may well want the app resident on
+// their desktop but not on a shared laptop. Kept in userData so an app update never clears it.
+// ---------------------------------------------------------------------------
+const PREFS_DEFAULTS = {
+  runInBackground: true, // closing the window hides to the tray instead of quitting
+  openAtLogin: false,    // launch (hidden) when the user signs in
+}
+let prefs = { ...PREFS_DEFAULTS }
+
+function prefsPath() {
+  return path.join(app.getPath('userData'), 'preferences.json')
+}
+
+function loadPrefs() {
+  try {
+    const raw = fs.readFileSync(prefsPath(), 'utf8')
+    const saved = JSON.parse(raw)
+    // Only known keys, and only booleans: a hand-edited or partly-written file must not break startup.
+    for (const key of Object.keys(PREFS_DEFAULTS)) {
+      if (typeof saved?.[key] === 'boolean') prefs[key] = saved[key]
+    }
+  } catch (_) {
+    // No file yet (first run) or unreadable — defaults stand.
+  }
+}
+
+function savePrefs() {
+  try {
+    fs.writeFileSync(prefsPath(), JSON.stringify(prefs, null, 2))
+  } catch (err) {
+    console.error('[prefs] could not save:', err && err.message)
+  }
+}
+
+// Windows/macOS login item. `--hidden` is how the app knows to start in the tray rather than popping a
+// window in your face the moment you sign in.
+function applyOpenAtLogin() {
+  if (!app.isPackaged) return // an unpackaged dev run would register the electron binary itself
+  try {
+    app.setLoginItemSettings({ openAtLogin: prefs.openAtLogin, args: ['--hidden'] })
+  } catch (err) {
+    console.error('[prefs] could not set the login item:', err && err.message)
+  }
+}
+
+// True when this launch came from the login item, so the window should stay hidden.
+function startedHidden() {
+  if (process.argv.includes('--hidden')) return true
+  try { return app.getLoginItemSettings().wasOpenedAtLogin === true } catch (_) { return false }
+}
 
 // The desktop app is a thin native shell around the LIVE hosted web app. Because it loads the same
 // origin the browser + PWA use, conversations and chats are always in sync — nothing is stored on
@@ -76,23 +130,81 @@ ipcMain.on('overlay:resize', (_e, { dw, dh } = {}) => {
   overlayWindow.setSize(Math.max(200, Math.round(w + (dw || 0))), Math.max(130, Math.round(h + (dh || 0))))
 })
 
+// The tray icon must be a file the app package actually CONTAINS. build/ is electron-builder's
+// buildResources directory, whose contents are used to make the installer and are NOT copied into the
+// app — listing build/icon.png under `files` does not change that. Loading it there yielded an empty
+// image, and a Tray built from an empty image is an invisible tray entry: the app looks like it has no
+// tray at all. assets/ is a normal packaged folder, with build/ kept only as a dev-time fallback.
+function trayImage() {
+  const candidates = [
+    path.join(__dirname, 'assets', 'tray.png'),
+    path.join(__dirname, 'build', 'icon.png'), // unpackaged dev runs
+  ]
+  for (const file of candidates) {
+    const img = nativeImage.createFromPath(file)
+    if (!img.isEmpty()) return img.resize({ width: 16, height: 16 })
+  }
+  return null
+}
+
+// Built fresh on every change so the checkboxes show current state.
+function trayMenuTemplate() {
+  return [
+    { label: 'Show LAN Party', click: showFromTray },
+    { type: 'separator' },
+    {
+      label: 'Run in background',
+      type: 'checkbox',
+      checked: prefs.runInBackground,
+      // Off means closing the window really quits. If the window is already hidden when this is turned
+      // off, bring it back first — otherwise the app is running with no window and no way to reach it.
+      click: (item) => {
+        prefs.runInBackground = item.checked
+        savePrefs()
+        refreshTray()
+        if (!prefs.runInBackground && mainWindow && !mainWindow.isVisible()) showFromTray()
+      },
+    },
+    {
+      label: process.platform === 'darwin' ? 'Start at login' : 'Start with Windows',
+      type: 'checkbox',
+      checked: prefs.openAtLogin,
+      click: (item) => {
+        prefs.openAtLogin = item.checked
+        savePrefs()
+        applyOpenAtLogin()
+        refreshTray()
+      },
+    },
+    { type: 'separator' },
+    { label: 'Quit LAN Party', click: () => { isQuitting = true; app.quit() } },
+  ]
+}
+
+function refreshTray() {
+  if (!tray) return
+  tray.setContextMenu(Menu.buildFromTemplate(trayMenuTemplate()))
+  tray.setToolTip(prefs.runInBackground ? 'LAN Party — click to reopen' : 'LAN Party')
+}
+
 function createTray() {
   if (tray) return
   // If the tray can't be created there is no way back from a hidden window, so failure is recorded
   // (tray stays null) and the close handler then lets the window close normally instead of trapping
   // the app in an invisible state.
   try {
-    let img = nativeImage.createFromPath(path.join(__dirname, 'build', 'icon.png'))
-    if (!img.isEmpty()) img = img.resize({ width: 16, height: 16 })
+    const img = trayImage()
+    if (!img) {
+      // Refusing to build an iconless tray on purpose: it produces an invisible entry the user cannot
+      // click, which is indistinguishable from the app having vanished.
+      tray = null
+      console.error('[tray] no usable tray icon found; closing will quit instead of hiding')
+      return
+    }
     tray = new Tray(img)
-    tray.setToolTip('LAN Party — click to reopen')
-    tray.setContextMenu(Menu.buildFromTemplate([
-      { label: 'Show LAN Party', click: showFromTray },
-      { type: 'separator' },
-      { label: 'Quit LAN Party', click: () => { isQuitting = true; app.quit() } },
-    ]))
     tray.on('click', showFromTray)
     tray.on('double-click', showFromTray)
+    refreshTray()
   } catch (err) {
     tray = null
     console.error('[tray] could not create tray icon; closing will quit instead of hiding:', err && err.message)
@@ -100,6 +212,9 @@ function createTray() {
 }
 
 function createWindow() {
+  // A login-item launch starts in the tray: it exists to be already connected when you sit down, not
+  // to throw a window at you. The renderer still loads and stays connected while hidden.
+  const hidden = startedHidden() && prefs.runInBackground
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -108,6 +223,8 @@ function createWindow() {
     backgroundColor: '#0b0d10',
     autoHideMenuBar: true,
     title: 'LAN Party',
+    show: !hidden,
+    skipTaskbar: hidden && process.platform === 'win32',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -122,10 +239,10 @@ function createWindow() {
   mainWindow.loadURL(APP_URL)
   mainWindow.on('closed', () => { mainWindow = null })
 
-  // Closing the window hides it to the tray (keeps calls/chat alive) instead of quitting. Without a
-  // tray icon there'd be no way to get the window back, so in that case let the close proceed.
+  // Closing the window hides it to the tray (keeps calls/chat alive) instead of quitting — but only
+  // when the user has asked for that, and only when there is a tray icon to get the window back from.
   mainWindow.on('close', (e) => {
-    if (!isQuitting && tray) { e.preventDefault(); hideToTray() }
+    if (!isQuitting && tray && prefs.runInBackground) { e.preventDefault(); hideToTray() }
   })
 
   // Keep app + OAuth flows inside the window; send everything else (links people paste in chat,
@@ -224,6 +341,9 @@ if (!gotLock) {
   app.on('second-instance', () => { showFromTray() })
 
   app.whenReady().then(() => {
+    // Preferences first: the window's initial visibility and the close behaviour both depend on them.
+    loadPrefs()
+    applyOpenAtLogin() // re-assert on every start, in case the login item was removed elsewhere
     configureMedia()
     createWindow()
     createTray()
@@ -237,9 +357,8 @@ if (!gotLock) {
   // Mark a real quit (tray "Quit", auto-update restart, OS shutdown) so the close handler lets it through.
   app.on('before-quit', () => { isQuitting = true })
 
-  // Do NOT quit when the window is closed — the app lives in the tray and keeps running so the user
-  // stays in their call. Quitting happens only via the tray menu / auto-update / before-quit.
-  // Exception: with no tray icon there's nothing left to interact with, so don't linger as a
-  // process the user can't see or reach.
-  app.on('window-all-closed', () => { if (!tray) app.quit() })
+  // Staying resident is the point of "run in background": the app keeps the call and chat alive in the
+  // tray. With that switched off — or with no tray icon to reach it from — closing the window means
+  // quitting, rather than lingering as a process the user can neither see nor stop.
+  app.on('window-all-closed', () => { if (!tray || !prefs.runInBackground) app.quit() })
 }
