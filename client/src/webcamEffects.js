@@ -15,22 +15,63 @@
 //   { kind: 'image', url }               person over an image background
 //   { kind: 'hide', colors|url }         cover the whole frame (person hidden)
 
-const MP_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation'
+// The segmentation model is served from OUR origin first. It used to be fetched from a public CDN on
+// demand, which meant ~6MB of wasm + model arrived only when you switched blur on: measured 2.9s to
+// the first result on a good connection, and on a LAN with no internet — the situation this app is
+// built for — it never arrived at all, so blur silently drew the raw camera forever.
+//
+// The CDN stays as a fallback, but PINNED. It was previously an unversioned url, so jsdelivr served
+// whatever was newest; a dependency that can change under you without a deploy is exactly how
+// something that worked stops working on its own.
+const MP_VERSION = '0.1.1675465747'
+const MP_CDN_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@${MP_VERSION}`
+const MP_LOCAL_BASE = (typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env.BASE_URL : '/') + 'vendor/selfie-segmentation'
+
 let mpLoader = null
+// Which base actually worked, so locateFile() fetches the wasm/model from the same place as the script
+// rather than mixing a local loader with CDN assets.
+let mpBase = MP_LOCAL_BASE
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement('script')
+    el.src = src
+    el.crossOrigin = 'anonymous'
+    el.async = true
+    el.onload = () => (window.SelfieSegmentation ? resolve() : reject(new Error('SelfieSegmentation missing after load')))
+    el.onerror = () => reject(new Error(`failed to load ${src}`))
+    document.head.appendChild(el)
+  })
+}
 
 function loadMediaPipe() {
   if (typeof window !== 'undefined' && window.SelfieSegmentation) return Promise.resolve(window.SelfieSegmentation)
   if (mpLoader) return mpLoader
-  mpLoader = new Promise((resolve, reject) => {
-    const s = document.createElement('script')
-    s.src = `${MP_BASE}/selfie_segmentation.js`
-    s.crossOrigin = 'anonymous'
-    s.async = true
-    s.onload = () => (window.SelfieSegmentation ? resolve(window.SelfieSegmentation) : reject(new Error('SelfieSegmentation missing after load')))
-    s.onerror = () => { mpLoader = null; reject(new Error('Failed to load MediaPipe Selfie Segmentation')) }
-    document.head.appendChild(s)
-  })
+  mpLoader = (async () => {
+    try {
+      await loadScript(`${MP_LOCAL_BASE}/selfie_segmentation.js`)
+      mpBase = MP_LOCAL_BASE
+    } catch (localErr) {
+      // Self-hosted copy missing (e.g. an older deploy) — fall back rather than losing effects entirely.
+      console.warn('[effects] local segmentation assets unavailable, falling back to CDN:', localErr.message)
+      await loadScript(`${MP_CDN_BASE}/selfie_segmentation.js`)
+      mpBase = MP_CDN_BASE
+    }
+    return window.SelfieSegmentation
+  })().catch((err) => { mpLoader = null; throw err })
   return mpLoader
+}
+
+/** Where the model/wasm are being served from — surfaced for diagnostics. */
+export function effectsAssetBase() { return mpBase }
+
+/**
+ * Download and initialise the segmentation model ahead of time. Called when the effects menu opens so
+ * that switching blur on is instant instead of showing raw camera for the first few seconds.
+ * @returns {Promise<boolean>} true once the model is ready
+ */
+export async function warmUpEffects() {
+  try { await loadMediaPipe(); return true } catch (_) { return false }
 }
 
 // True when the browser can turn a canvas back into a MediaStreamTrack. Required for effects.
@@ -52,6 +93,8 @@ export class WebcamEffectProcessor {
     this.lastResult = 0
     this.segInterval = 1000 / 24 // throttle segmentation to ~24fps to spare CPU
     this.stallMs = 500           // if no segmentation result for this long, show raw (never freeze)
+    this.recoverMs = 4000        // …and if it stays stalled this long, rebuild the segmenter
+    this.maxRecoveries = 3       // then give up and say so, rather than thrashing forever
     this.video = null
     this.canvas = null
     this.ctx = null
@@ -60,6 +103,20 @@ export class WebcamEffectProcessor {
     this.height = 720
     this.rawTrack = null
     this.outputTrack = null
+    // 'idle' | 'loading' | 'active' | 'unavailable'. Reported so the UI can say "preparing blur"
+    // instead of showing an unblurred camera and leaving the user to guess.
+    this.status = 'idle'
+    this.onStatus = null
+    this.lastError = null
+    this._recovering = false
+    this._recoveries = 0
+  }
+
+  _setStatus(status, error) {
+    if (this.status === status && !error) return
+    this.status = status
+    this.lastError = error || null
+    try { this.onStatus?.(status, error || null) } catch (_) { /* never let a listener break the loop */ }
   }
 
   get isRunning() { return this.running }
@@ -79,13 +136,25 @@ export class WebcamEffectProcessor {
       this.bgImageUrl = null
     }
     this.desc = next
-    if (this._needsSegmentation()) { try { await this._ensureSegmenter() } catch (e) { /* falls back to raw */ } }
+    if (this._needsSegmentation()) {
+      this._setStatus('loading')
+      try {
+        await this._ensureSegmenter()
+        // 'active' is only claimed once a real result lands (see _onSeg) — the model being constructed
+        // is not the same as it producing masks.
+      } catch (e) {
+        // Previously swallowed, which is why a broken model looked like "blur just does nothing".
+        this._setStatus('unavailable', e && e.message ? e.message : 'Could not load the background model')
+      }
+    } else {
+      this._setStatus('idle')
+    }
   }
 
   async _ensureSegmenter() {
     if (this.segmenter) return
     const SelfieSegmentation = await loadMediaPipe()
-    this.segmenter = new SelfieSegmentation({ locateFile: (f) => `${MP_BASE}/${f}` })
+    this.segmenter = new SelfieSegmentation({ locateFile: (f) => `${mpBase}/${f}` })
     this.segmenter.setOptions({ modelSelection: 1, selfieMode: false })
     this.segmenter.onResults((r) => this._onSeg(r))
   }
@@ -157,6 +226,9 @@ export class WebcamEffectProcessor {
         }
         // Watchdog: if results stall (or haven't arrived yet), show the raw camera so we never freeze.
         if (now - this.lastResult > this.stallMs) this._drawSimple()
+        // A stall that lasts is not a hiccup. Rebuild the segmenter once rather than quietly showing an
+        // unblurred camera for the rest of the call — that is the failure the user actually sees.
+        if (this.lastResult > 0 && now - this.lastResult > this.recoverMs) this._recoverSegmenter()
       } else {
         this._drawSimple()
       }
@@ -174,6 +246,30 @@ export class WebcamEffectProcessor {
   }
 
   // Non-segmentation draw: 'hide' → fill the frame with the background; otherwise raw passthrough.
+  // Tear the segmenter down and build a fresh one. MediaPipe can wedge (a lost GL context, a killed
+  // worker); when it does, every later send() resolves without ever calling onResults, so the pipeline
+  // looks alive while quietly producing nothing.
+  async _recoverSegmenter() {
+    if (this._recovering || !this.running) return
+    if (this._recoveries >= this.maxRecoveries) {
+      this._setStatus('unavailable', 'Background effects stopped responding on this device')
+      return
+    }
+    this._recovering = true
+    this._recoveries += 1
+    this._setStatus('loading')
+    try {
+      try { this.segmenter?.close?.() } catch (_) { /* already gone */ }
+      this.segmenter = null
+      await this._ensureSegmenter()
+      this.lastResult = performance.now() // give the rebuilt one a fresh grace period
+    } catch (e) {
+      this._setStatus('unavailable', e && e.message ? e.message : 'Could not restart background effects')
+    } finally {
+      this._recovering = false
+    }
+  }
+
   _drawSimple() {
     const ctx = this.ctx
     if (!ctx) return
@@ -188,6 +284,8 @@ export class WebcamEffectProcessor {
   _onSeg(results) {
     if (!this.ctx || !this._needsSegmentation()) return
     this.lastResult = performance.now()
+    this._recoveries = 0        // a working result clears the recovery budget
+    this._setStatus('active')   // masks are arriving — the effect is genuinely on screen now
     const ctx = this.ctx
     const w = this.canvas.width, h = this.canvas.height
     ctx.save()

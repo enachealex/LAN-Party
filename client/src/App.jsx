@@ -34,7 +34,7 @@ import ImageCropModal from './components/ImageCropModal'
 import PrivateMessageModal from './components/PrivateMessageModal'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
-import { WebcamEffectProcessor, effectsSupported } from './webcamEffects'
+import { WebcamEffectProcessor, effectsSupported, warmUpEffects } from './webcamEffects'
 import { SfuSession } from './sfu'
 
 // API/socket origin. In dev, talk to the local server; in a production build, default to the
@@ -998,6 +998,9 @@ export default function App() {
   const [bgCoverId, setBgCoverId] = useState('bg-slate') // which background cover "Hide me" fills with
   const [showEffectsMenu, setShowEffectsMenu] = useState(false)
   const [effectsError, setEffectsError] = useState(null) // set when effects can't load (e.g. offline)
+  // Live state of the segmentation pipeline: 'idle' | 'loading' | 'active' | 'unavailable'. Without
+  // this a failing model just showed an unblurred camera, which reads as "blur is broken".
+  const [effectsStatus, setEffectsStatus] = useState('idle')
   const effectsRef = useRef(null)      // WebcamEffectProcessor instance
   const rawCamStreamRef = useRef(null) // unprocessed getUserMedia camera stream (kept alive for effects)
   // Camera device picker + live self-preview shown in the "turn on camera" popup.
@@ -3947,6 +3950,11 @@ export default function App() {
         return effectsRef.current.outputTrack
       }
       effectsRef.current = new WebcamEffectProcessor()
+      effectsRef.current.onStatus = (status, error) => {
+        setEffectsStatus(status)
+        // Only a hard failure becomes an error banner; 'loading' is normal and says so in the menu.
+        setEffectsError(status === 'unavailable' ? (error || 'Background effects are unavailable') : null)
+      }
       const track = await effectsRef.current.start(raw, desc)
       setEffectsError(null)
       return track
@@ -4107,6 +4115,9 @@ export default function App() {
   const toggleCamera = async () => {
     if (!localStreamRef.current) return
     if (videoOn) { stopCamera(); return }
+    // Start fetching the segmentation model as the menu opens. It is ~6MB, so warming it here is the
+    // difference between blur appearing instantly and showing an unblurred camera while it downloads.
+    warmUpEffects().catch(() => {})
     setShowEffectsMenu((v) => !v)
   }
 
@@ -5893,6 +5904,10 @@ export default function App() {
                         {showEffectsMenu && (
                           <div className="voice-effects-menu" role="menu" aria-label="Webcam effects">
                             <div className="voice-quality-title">{videoOn ? 'Camera background' : 'Camera preview'}</div>
+                            {/* Says what the pipeline is doing. A model that is still downloading looks
+                                identical to one that is broken — both show an unblurred camera. */}
+                            {effectsStatus === 'loading' && <div className="voice-effects-status loading">Preparing background effects…</div>}
+                            {effectsStatus === 'unavailable' && <div className="voice-effects-status error">{effectsError || 'Background effects are unavailable'}</div>}
                             {!videoOn && <PreviewVideo stream={previewStream} />}
                             {videoDevices.length > 0 && (
                               <select className="voice-cam-select" value={selectedCameraId || ''} onChange={(e) => changeCamera(e.target.value)} aria-label="Select camera">
@@ -5951,7 +5966,7 @@ export default function App() {
                         {videoOn && (
                           <button
                             className={`voice-ctrl${webcamEffect !== 'none' ? ' toggled' : ''}`}
-                            onClick={() => setShowEffectsMenu((v) => !v)}
+                            onClick={() => { warmUpEffects().catch(() => {}); setShowEffectsMenu((v) => !v) }}
                             title="Change background"
                             aria-label="Change camera background"
                             aria-pressed={webcamEffect !== 'none'}

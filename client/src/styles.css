@@ -2279,3 +2279,9 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .boot-step-failed .boot-step-mark{color:#f0a070}
 .boot-step-aside{font-size:12px;color:var(--muted);opacity:.75}
 .boot-splash-note{margin-top:16px;font-size:12.5px;color:#f0a070;line-height:1.5}
+
+/* Effects pipeline status inside the camera menu. Blur that is still loading and blur that is broken
+   both look like "no blur", so the menu has to say which it is. */
+.voice-effects-status{font-size:12px;line-height:1.4;margin:2px 0 8px;padding:6px 8px;border-radius:8px}
+.voice-effects-status.loading{color:var(--muted);background:rgba(255,255,255,.05)}
+.voice-effects-status.error{color:#ffb4b4;background:rgba(224,87,77,.12)}
