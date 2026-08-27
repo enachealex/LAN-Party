@@ -1142,6 +1142,10 @@ export default function App() {
   const [toast, setToast] = useState(null) // brief bottom notice (invites, role changes)
   // External streaming (Twitch/YouTube/Kik): my announcement + the announce form + in-app viewer.
   const [myExternalStream, setMyExternalStream] = useState(null) // { platform, channel, title, game }
+  // Streams this viewer has dismissed from Live now. Purely local — hiding someone's card never
+  // touches their stream. Session-scoped on purpose: ids are socket ids, so a stream that comes back
+  // later is a new id and reappears, which is what you want from "hide this one".
+  const [hiddenStreamIds, setHiddenStreamIds] = useState(() => new Set())
   const [showAnnounceForm, setShowAnnounceForm] = useState(false)
   const [announceForm, setAnnounceForm] = useState({ platform: 'twitch', channel: '', title: '', game: '' })
   const [externalViewer, setExternalViewer] = useState(null) // stream entry being watched in-app
@@ -3729,6 +3733,18 @@ export default function App() {
     setMyExternalStream(null)
   }
 
+  // Is this card my own announcement? Compared by socket id rather than display name, which is not
+  // unique. The server keys external entries as `ext-<socketId>`.
+  const isMyAnnouncement = (stream) => Boolean(socket?.id) && stream?.id === `ext-${socket.id}`
+
+  // The X on a card. On your own announcement it takes the announcement down (this is what replaced
+  // the "Stop announcing" button); on anyone else's it just hides the card for you.
+  const dismissStream = (stream) => {
+    if (isMyAnnouncement(stream)) { unannounceStream(); return }
+    setHiddenStreamIds((prev) => new Set(prev).add(stream.id))
+  }
+  const unhideAllStreams = () => setHiddenStreamIds(new Set())
+
   // Extract a YouTube video id from a URL or bare id ('' if it looks like a channel id instead).
   const parseYouTube = (input) => {
     const s = String(input || '').trim()
@@ -6171,8 +6187,10 @@ export default function App() {
 
       {/* Watch / Discover — who's live right now (in-app screen shares + Twitch/YouTube/Kik) */}
       {showDiscover && (() => {
-        const inAppStreams = discoverStreams.filter((s) => s.kind !== 'external')
-        const externalStreamsList = discoverStreams.filter((s) => s.kind === 'external')
+        const visibleStreams = discoverStreams.filter((s) => !hiddenStreamIds.has(s.id))
+        const hiddenCount = discoverStreams.length - visibleStreams.length
+        const inAppStreams = visibleStreams.filter((s) => s.kind !== 'external')
+        const externalStreamsList = visibleStreams.filter((s) => s.kind === 'external')
         const PLATFORM_META = { twitch: { label: 'Twitch', cls: 'twitch' }, youtube: { label: 'YouTube', cls: 'youtube' }, kik: { label: 'Kik', cls: 'kik' } }
         return (
         <div className="discover-overlay" onClick={() => setShowDiscover(false)}>
@@ -6180,9 +6198,9 @@ export default function App() {
             <div className="discover-head">
               <div className="discover-title">📡 Live now</div>
               <div className="discover-head-actions">
-                {myExternalStream ? (
-                  <button type="button" className="discover-announce stop" onClick={unannounceStream}>⏹ Stop announcing</button>
-                ) : (
+                {/* No "stop announcing" here any more: your own card carries an X that takes it down,
+                    which keeps every card's remove affordance in the same place. */}
+                {!myExternalStream && (
                   <button type="button" className="discover-announce" onClick={() => setShowAnnounceForm((v) => !v)}>📣 I'm live elsewhere</button>
                 )}
                 <button type="button" className="discover-close" onClick={() => setShowDiscover(false)} aria-label="Close">✕</button>
@@ -6203,6 +6221,12 @@ export default function App() {
                 <button type="button" className="discover-watch announce-go" onClick={announceStream}>🔴 Announce my stream</button>
               </div>
             )}
+            {hiddenCount > 0 && (
+              <div className="discover-hidden-note">
+                {hiddenCount} stream{hiddenCount === 1 ? '' : 's'} hidden for you
+                <button type="button" className="discover-unhide" onClick={unhideAllStreams}>Show {hiddenCount === 1 ? 'it' : 'them'} again</button>
+              </div>
+            )}
             {discoverStreams.length === 0 && !showAnnounceForm && (
               <div className="discover-empty">No one is live right now. Hit <strong>Go Live</strong> in a voice channel to share your screen, or <strong>📣 I'm live elsewhere</strong> to announce your Twitch/YouTube/Kik stream.</div>
             )}
@@ -6212,6 +6236,15 @@ export default function App() {
                 <div className="discover-grid">
                   {inAppStreams.map((s) => (
                     <div key={s.id} className="discover-card">
+                      <button
+                        type="button"
+                        className="discover-card-x"
+                        onClick={(e) => { e.stopPropagation(); dismissStream(s) }}
+                        title={isMyAnnouncement(s) ? 'Stop announcing your stream' : `Hide ${s.name || 'this stream'} for me`}
+                        aria-label={isMyAnnouncement(s) ? 'Stop announcing your stream' : `Hide ${s.name || 'this stream'} for me`}
+                      >
+                        ✕
+                      </button>
                       <div className="discover-thumb">
                         <span className="discover-thumb-avatar">{(s.name || '?').trim().slice(0, 1).toUpperCase()}</span>
                         <div className="discover-badges"><span className="discover-badge live">🔴 LIVE</span></div>
@@ -6233,6 +6266,15 @@ export default function App() {
                 <div className="discover-grid">
                   {externalStreamsList.map((s) => (
                     <div key={s.id} className="discover-card">
+                      <button
+                        type="button"
+                        className="discover-card-x"
+                        onClick={(e) => { e.stopPropagation(); dismissStream(s) }}
+                        title={isMyAnnouncement(s) ? 'Stop announcing your stream' : `Hide ${s.name || 'this stream'} for me`}
+                        aria-label={isMyAnnouncement(s) ? 'Stop announcing your stream' : `Hide ${s.name || 'this stream'} for me`}
+                      >
+                        ✕
+                      </button>
                       <div className={`discover-thumb ext-${s.platform}`}>
                         <span className="discover-thumb-avatar">{(s.name || '?').trim().slice(0, 1).toUpperCase()}</span>
                         <div className="discover-badges"><span className={`discover-badge platform ${s.platform}`}>{PLATFORM_META[s.platform]?.label || s.platform} · LIVE</span></div>
