@@ -1,0 +1,9 @@
+node_modules/
+# Generated Gradle project + build output — reproducible via `npm run build`.
+twa/
+dist/
+# Signing key and its password. NEVER commit these — and never lose them: without the key no user
+# can install an update. Keep a backup (e.g. the .jks file + password in a password manager).
+*.jks
+*.keystore
+keystore.env

@@ -1,0 +1,9 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.thejumpvault.lanparty",
+        "sha256_cert_fingerprints": ["42:6B:08:1E:22:F8:60:55:8D:C5:EF:0D:4F:1F:F5:C0:16:10:C9:50:EC:81:5C:63:52:64:1D:B2:43:93:2F:88"]
+      }
+    }]
+
