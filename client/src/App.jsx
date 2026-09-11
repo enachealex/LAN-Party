@@ -176,7 +176,7 @@ function mediaKind(attachment) {
 // pseudo-attachment so it renders inline (and joins the lightbox). Returns null otherwise.
 // Inline media inside a message body. Two shapes count: a bare url on its own, and a caption followed
 // by a url — "look at this <url>". The second shape is what the GIF picker sends when you type
-// alongside an external Giphy pick, and it is also how people paste links; it used to fall through to
+// alongside an external Tenor pick, and it is also how people paste links; it used to fall through to
 // a raw underlined link, which looked broken next to every other GIF in the channel.
 //
 // A url in the MIDDLE of a sentence is deliberately still just a link. Promoting that to a full-width
@@ -185,7 +185,7 @@ function mediaUrlFromText(text) {
   const trimmed = (text || '').trim()
   if (!trimmed) return null
   const last = trimmed.split(/\s+/).pop()
-  // Absolute for Giphy and other remote media; root-relative for our own /gifs/ and /uploads/ files,
+  // Absolute for Tenor and other remote media; root-relative for our own /gifs/ and /uploads/ files,
   // which is how the composer stacks a library GIF as a block instead of using the one attachment slot.
   return /^(https?:\/\/|\/)\S+$/i.test(last) ? last : null
 }
@@ -5201,12 +5201,12 @@ export default function App() {
     if (socket) socket.emit('message', { serverId: currentServerId(), channelId: activeChannel, text: body, attachment })
   }
 
-  // Is Giphy configured on the server (has an API key)?
-  const giphyStatus = async () => {
+  // Is Tenor configured on the server (has an API key)?
+  const tenorStatus = async () => {
     const t = token || localStorage.getItem('lanparty_token')
     if (!t) return false
     try {
-      const res = await fetch(`${SERVER_URL}/giphy/status`, { headers: { Authorization: `Bearer ${t}` } })
+      const res = await fetch(`${SERVER_URL}/tenor/status`, { headers: { Authorization: `Bearer ${t}` } })
       if (!res.ok) return false
       const data = await res.json()
       return !!data.configured
@@ -5215,21 +5215,22 @@ export default function App() {
     }
   }
 
-  // Fetch a page of Giphy results (trending when query is empty) via our server proxy.
-  // Returns the raw Giphy { data, pagination } shape the SDK <Grid> expects.
-  const fetchGiphy = async (query, offset = 0) => {
-    const empty = { data: [], pagination: { total_count: 0, count: 0, offset: 0 } }
+  // Fetch a page of Tenor results (featured/trending when query is empty) via our server proxy.
+  // Tenor paginates with an opaque `pos` cursor, echoed back as `next` for infinite scroll.
+  // Returns { results: [{ id, url, preview, description }], next }.
+  const fetchTenor = async (query, pos = '') => {
+    const empty = { results: [], next: '' }
     const t = token || localStorage.getItem('lanparty_token')
     if (!t) return empty
     const q = (query || '').trim()
-    const path = q
-      ? `/giphy/search?q=${encodeURIComponent(q)}&offset=${offset}`
-      : `/giphy/trending?offset=${offset}`
+    const params = new URLSearchParams(pos ? { pos } : {})
+    if (q) params.set('q', q)
+    const path = `${q ? '/tenor/search' : '/tenor/featured'}${params.toString() ? `?${params}` : ''}`
     try {
       const res = await fetch(`${SERVER_URL}${path}`, { headers: { Authorization: `Bearer ${t}` } })
       if (!res.ok) return empty
       const data = await res.json()
-      return { data: data.data || [], pagination: data.pagination || empty.pagination }
+      return { results: data.results || [], next: data.next || '' }
     } catch {
       return empty
     }
@@ -5493,8 +5494,8 @@ export default function App() {
             gifs={gifLibrary}
             resolveSrc={emojiSrc}
             onSelectGif={stageGif}
-            onFetchGiphy={fetchGiphy}
-            onGiphyStatus={giphyStatus}
+            onFetchTenor={fetchTenor}
+            onTenorStatus={tenorStatus}
             onUploadGif={uploadGif}
             onDeleteGif={deleteGif}
             onClose={() => setShowGifPicker(false)}

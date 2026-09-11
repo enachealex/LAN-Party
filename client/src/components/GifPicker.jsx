@@ -1,15 +1,16 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import longPressProps from '../longPress'
-import { Grid } from '@giphy/react-components'
 import FloatingMenu from './FloatingMenu'
 
 // GIF picker shown above the composer (opened from the GIF button next to Emoji).
-// Sections: 'giphy' (search the Giphy library) and 'custom' (the shared uploaded library).
+// Sections: 'tenor' (search the Tenor library via our server proxy) and 'custom' (the shared
+// uploaded library). Tenor GIFs render in our own grid — no third-party SDK — so we control
+// layout, the hover-name tooltip, and click handling.
 export default function GifPicker({
   gifs = [],
   onSelectGif,
-  onFetchGiphy,
-  onGiphyStatus,
+  onFetchTenor,
+  onTenorStatus,
   onUploadGif,
   onDeleteGif,
   resolveSrc = (u) => u,
@@ -19,18 +20,25 @@ export default function GifPicker({
   // Portaled right-click menu node — exempt from the outside-click close (see FloatingMenu).
   const menuRef = useRef(null)
   const gifUploadRef = useRef(null)
-  const giphyGridWrapRef = useRef(null)
-  const [section, setSection] = useState('giphy')
+  const tenorGridWrapRef = useRef(null)
+  const [section, setSection] = useState('tenor')
   const [gifQuery, setGifQuery] = useState('')
-  const [giphyQuery, setGiphyQuery] = useState('')
-  const [debouncedGiphyQuery, setDebouncedGiphyQuery] = useState('')
-  const [giphyConfigured, setGiphyConfigured] = useState(null) // null = unknown, true/false once checked
-  const [gridWidth, setGridWidth] = useState(320)
+  const [tenorQuery, setTenorQuery] = useState('')
+  const [debouncedTenorQuery, setDebouncedTenorQuery] = useState('')
+  const [tenorConfigured, setTenorConfigured] = useState(null) // null = unknown, true/false once checked
+  const [tenorResults, setTenorResults] = useState([])
+  const [tenorLoading, setTenorLoading] = useState(false)
   // Right-click context menu on a custom GIF: { id, x, y }.
   const [gifMenu, setGifMenu] = useState(null)
-  // Name tooltip shown after dwelling on a Giphy GIF: { text, left, top } relative to the picker.
+  // Name tooltip shown after dwelling on a Tenor GIF: { text, left, top } relative to the picker.
   const [gifTooltip, setGifTooltip] = useState(null)
   const tooltipTimerRef = useRef(null)
+  // Tenor's opaque next-page cursor and the in-flight guard, kept in refs so the scroll
+  // handler always sees fresh values without re-subscribing. reqId discards stale responses
+  // when the query changes mid-flight.
+  const tenorNextRef = useRef('')
+  const tenorLoadingRef = useRef(false)
+  const tenorReqIdRef = useRef(0)
 
   // Close on outside click / Esc.
   useEffect(() => {
@@ -53,33 +61,66 @@ export default function GifPicker({
     return gifs.filter((g) => (g.name || '').toLowerCase().includes(q))
   }, [gifs, gifQuery])
 
-  // Debounce the Giphy search box (drives the <Grid> remount + fetch).
+  // Debounce the Tenor search box so we fetch on a settled query, not each keystroke.
   useEffect(() => {
-    const handle = setTimeout(() => setDebouncedGiphyQuery(giphyQuery.trim()), 400)
+    const handle = setTimeout(() => setDebouncedTenorQuery(tenorQuery.trim()), 400)
     return () => clearTimeout(handle)
-  }, [giphyQuery])
+  }, [tenorQuery])
 
-  // Check whether Giphy is configured (has a server-side key) when the section is first opened.
+  // Check whether Tenor is configured (has a server-side key) when the section is first opened.
   useEffect(() => {
-    if (section !== 'giphy' || giphyConfigured !== null || !onGiphyStatus) return
+    if (section !== 'tenor' || tenorConfigured !== null || !onTenorStatus) return
     let cancelled = false
-    onGiphyStatus().then((ok) => { if (!cancelled) setGiphyConfigured(!!ok) })
+    onTenorStatus().then((ok) => { if (!cancelled) setTenorConfigured(!!ok) })
     return () => { cancelled = true }
-  }, [section, giphyConfigured, onGiphyStatus])
+  }, [section, tenorConfigured, onTenorStatus])
 
-  // Size the Giphy Grid to its container width.
-  useEffect(() => {
-    if (section !== 'giphy' || giphyConfigured !== true) return
-    const el = giphyGridWrapRef.current
-    if (el && el.clientWidth) setGridWidth(el.clientWidth)
-  }, [section, giphyConfigured])
+  // Fetch one page. pos='' starts a fresh result set; a cursor appends the next page. reqId
+  // ties the response to the query that asked for it, so a late reply can't clobber a newer one.
+  const fetchTenorPage = async (query, pos, reqId) => {
+    tenorLoadingRef.current = true
+    setTenorLoading(true)
+    let payload = { results: [], next: '' }
+    try { payload = (await onFetchTenor?.(query, pos)) || payload } catch { /* keep empty */ }
+    if (tenorReqIdRef.current !== reqId) { tenorLoadingRef.current = false; return }
+    setTenorResults((prev) => (pos ? [...prev, ...payload.results] : payload.results))
+    tenorNextRef.current = payload.next || ''
+    tenorLoadingRef.current = false
+    setTenorLoading(false)
+  }
 
-  // After dwelling on a Giphy GIF for ~2s, show its name as a small tooltip — the only hover
-  // affordance on the grid (the Giphy attribution overlay is disabled). Delegated listeners on
-  // the grid wrapper; the name comes from the alt text the Grid puts on each GIF's <img>.
+  // Load the first page whenever the section opens or the (debounced) query changes.
   useEffect(() => {
-    if (section !== 'giphy' || giphyConfigured !== true) return
-    const wrap = giphyGridWrapRef.current
+    if (section !== 'tenor' || tenorConfigured !== true) return
+    const reqId = ++tenorReqIdRef.current
+    tenorNextRef.current = ''
+    setTenorResults([])
+    fetchTenorPage(debouncedTenorQuery, '', reqId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section, tenorConfigured, debouncedTenorQuery])
+
+  // Infinite scroll: pull the next page as the user nears the bottom of the picker's scroller.
+  useEffect(() => {
+    if (section !== 'tenor' || tenorConfigured !== true) return
+    const scroller = rootRef.current?.querySelector('.emoji-picker-scroll')
+    if (!scroller) return
+    const onScroll = () => {
+      if (tenorLoadingRef.current || !tenorNextRef.current) return
+      if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 260) {
+        fetchTenorPage(debouncedTenorQuery, tenorNextRef.current, tenorReqIdRef.current)
+      }
+    }
+    scroller.addEventListener('scroll', onScroll)
+    return () => scroller.removeEventListener('scroll', onScroll)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section, tenorConfigured, debouncedTenorQuery])
+
+  // After dwelling on a Tenor GIF for ~2s, show its name as a small styled tooltip — the only
+  // hover affordance on the grid. Delegated listeners on the grid wrapper; the name is the
+  // cell image's alt text.
+  useEffect(() => {
+    if (section !== 'tenor' || tenorConfigured !== true) return
+    const wrap = tenorGridWrapRef.current
     const root = rootRef.current
     if (!wrap || !root) return
     const hide = () => {
@@ -89,7 +130,7 @@ export default function GifPicker({
     }
     const sameCell = (e, cell) => e.relatedTarget instanceof Node && cell.contains(e.relatedTarget)
     const onOver = (e) => {
-      const cell = e.target.closest('.giphy-gif')
+      const cell = e.target.closest('.gif-cell')
       if (!cell || sameCell(e, cell)) return
       hide()
       tooltipTimerRef.current = setTimeout(() => {
@@ -106,7 +147,7 @@ export default function GifPicker({
       }, 2000)
     }
     const onOut = (e) => {
-      const cell = e.target.closest('.giphy-gif')
+      const cell = e.target.closest('.gif-cell')
       if (cell && !sameCell(e, cell)) hide()
     }
     const scroller = root.querySelector('.emoji-picker-scroll')
@@ -121,14 +162,8 @@ export default function GifPicker({
       scroller?.removeEventListener('scroll', hide)
       hide()
     }
-  }, [section, giphyConfigured])
+  }, [section, tenorConfigured])
 
-  // Fetch through our server proxy (keeps the API key server-side). Memoized per query so
-  // the Grid only refetches on a new search, not on unrelated re-renders.
-  const fetchGiphyGifs = useCallback(
-    (offset) => onFetchGiphy?.(debouncedGiphyQuery, offset),
-    [onFetchGiphy, debouncedGiphyQuery]
-  )
   const handleGifUpload = (event) => {
     const file = event.target.files?.[0]
     if (file) onUploadGif?.(file, (file.name || 'gif').replace(/\.[^.]+$/, ''))
@@ -149,39 +184,42 @@ export default function GifPicker({
       <div className="emoji-picker-scroll">
         <div className="emoji-group">
           <div className="gif-sections">
-            <button type="button" className={`gif-section-tab${section === 'giphy' ? ' active' : ''}`} onClick={() => setSection('giphy')}>Giphy</button>
+            <button type="button" className={`gif-section-tab${section === 'tenor' ? ' active' : ''}`} onClick={() => setSection('tenor')}>Tenor</button>
             <button type="button" className={`gif-section-tab${section === 'custom' ? ' active' : ''}`} onClick={() => setSection('custom')}>Custom</button>
           </div>
 
-          {section === 'giphy' && (
+          {section === 'tenor' && (
             <>
               <input
                 className="gif-search"
-                placeholder="Search Giphy"
-                value={giphyQuery}
-                onChange={(e) => setGiphyQuery(e.target.value)}
+                placeholder="Search Tenor"
+                value={tenorQuery}
+                onChange={(e) => setTenorQuery(e.target.value)}
               />
-              {giphyConfigured === false ? (
-                <div className="emoji-empty">Giphy isn't configured yet. Add a Giphy API key on the server to enable it.</div>
-              ) : giphyConfigured === null ? (
+              {tenorConfigured === false ? (
+                <div className="emoji-empty">Tenor isn't configured yet. Add a Tenor API key on the server to enable it.</div>
+              ) : tenorConfigured === null ? (
                 <div className="emoji-empty">Loading…</div>
               ) : (
-                <div className="giphy-grid-wrap" ref={giphyGridWrapRef}>
-                  <Grid
-                    key={debouncedGiphyQuery}
-                    width={gridWidth}
-                    columns={3}
-                    gutter={6}
-                    fetchGifs={fetchGiphyGifs}
-                    noLink
-                    hideAttribution
-                    onGifClick={(gif, e) => {
-                      e.preventDefault()
-                      const url = gif.images?.original?.url || gif.images?.downsized_medium?.url || ''
-                      onSelectGif?.({ url, name: gif.title || 'gif', type: 'image/gif' })
-                    }}
-                  />
-                  <div className="giphy-attribution">Powered by GIPHY</div>
+                <div className="giphy-grid-wrap" ref={tenorGridWrapRef}>
+                  {tenorResults.length === 0 && !tenorLoading ? (
+                    <div className="emoji-empty">{debouncedTenorQuery ? 'No GIFs match your search.' : 'No GIFs to show.'}</div>
+                  ) : (
+                    <div className="gif-grid">
+                      {tenorResults.map((g) => (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className="gif-cell"
+                          onClick={() => onSelectGif?.({ url: g.url, name: g.description || 'gif', type: 'image/gif' })}
+                        >
+                          <img src={g.preview} alt={g.description || 'GIF'} loading="lazy" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {tenorLoading && <div className="emoji-empty">Loading…</div>}
+                  <div className="giphy-attribution">Powered by Tenor</div>
                 </div>
               )}
             </>

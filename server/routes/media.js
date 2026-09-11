@@ -9,44 +9,65 @@ const SERVER_DIR = path.join(__dirname, '..'); // *.key files live in server/, n
 
 /** @param {{ app: any, db: any, authMiddleware: any, io: any, JWT_SECRET: string }} deps */
 function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET }) {
-  // --- Giphy proxy ---
-  // The Giphy API key comes from the GIPHY_API_KEY env var, or a `server/giphy.key` file.
-  // The key stays server-side; clients only see the proxied results.
-  function getGiphyKey() {
-    if (process.env.GIPHY_API_KEY && process.env.GIPHY_API_KEY.trim()) return process.env.GIPHY_API_KEY.trim();
-    try { return fs.readFileSync(path.join(SERVER_DIR, 'giphy.key'), 'utf8').trim(); } catch { return ''; }
+  // --- Tenor proxy (Google Tenor API v2) ---
+  // The Tenor API key comes from the TENOR_API_KEY env var, or a `server/tenor.key` file.
+  // The key stays server-side; clients only ever see the normalized, proxied results.
+  function getTenorKey() {
+    if (process.env.TENOR_API_KEY && process.env.TENOR_API_KEY.trim()) return process.env.TENOR_API_KEY.trim();
+    try { return fs.readFileSync(path.join(SERVER_DIR, 'tenor.key'), 'utf8').trim(); } catch { return ''; }
   }
 
-  app.get('/giphy/status', authMiddleware, (req, res) => res.json({ configured: !!getGiphyKey() }));
+  app.get('/tenor/status', authMiddleware, (req, res) => res.json({ configured: !!getTenorKey() }));
 
-  // Trending + search return Giphy's raw { data, pagination, meta } so the client SDK <Grid>
-  // (fed via this proxy) can render + paginate. offset/limit drive infinite scroll.
-  async function proxyGiphy(res, endpoint, params) {
-    const key = getGiphyKey();
-    if (!key) return res.status(503).json({ error: 'Giphy is not configured', configured: false });
-    const qs = new URLSearchParams({ api_key: key, rating: 'pg-13', ...params }).toString();
+  // Normalize a Tenor result into the minimal shape our own GIF grid renders: a small preview
+  // for the cell, a full-size url to send, and a name for the alt text / hover tooltip.
+  function mapTenorResult(r) {
+    const f = (r && r.media_formats) || {};
+    const full = f.mediumgif?.url || f.gif?.url || f.tinygif?.url || '';
+    if (!full) return null;
+    return {
+      id: r.id,
+      url: full,
+      preview: f.tinygif?.url || f.nanogif?.url || full,
+      description: r.content_description || r.title || 'GIF',
+    };
+  }
+
+  // Featured (trending) + search. Tenor paginates with an opaque `pos` cursor (not a numeric
+  // offset); we echo it back to the client as `next` so infinite scroll can resume.
+  async function proxyTenor(res, endpoint, params) {
+    const key = getTenorKey();
+    if (!key) return res.status(503).json({ error: 'Tenor is not configured', configured: false });
+    const qs = new URLSearchParams({
+      key,
+      client_key: 'lanparty',
+      contentfilter: 'medium', // roughly pg-13
+      media_filter: 'gif,mediumgif,tinygif,nanogif',
+      ...params,
+    }).toString();
     try {
-      const r = await fetch(`https://api.giphy.com/v1/gifs/${endpoint}?${qs}`);
+      const r = await fetch(`https://tenor.googleapis.com/v2/${endpoint}?${qs}`);
       const data = await r.json();
-      if (!r.ok) return res.status(502).json({ error: data?.meta?.msg || 'Giphy error' });
-      return res.json({ data: data.data || [], pagination: data.pagination || {}, meta: data.meta || {} });
+      if (!r.ok) return res.status(502).json({ error: data?.error?.message || data?.error || 'Tenor error' });
+      const results = (data.results || []).map(mapTenorResult).filter(Boolean);
+      return res.json({ results, next: data.next || '' });
     } catch (err) {
-      return res.status(502).json({ error: 'Giphy request failed' });
+      return res.status(502).json({ error: 'Tenor request failed' });
     }
   }
 
-  app.get('/giphy/trending', authMiddleware, async (req, res) => {
+  app.get('/tenor/featured', authMiddleware, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    return proxyGiphy(res, 'trending', { limit, offset });
+    const pos = (req.query.pos || '').toString();
+    return proxyTenor(res, 'featured', pos ? { limit, pos } : { limit });
   });
 
-  app.get('/giphy/search', authMiddleware, async (req, res) => {
+  app.get('/tenor/search', authMiddleware, async (req, res) => {
     const q = (req.query.q || '').toString().trim();
-    if (!q) return res.json({ data: [], pagination: { total_count: 0, count: 0, offset: 0 } });
+    if (!q) return res.json({ results: [], next: '' });
     const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    return proxyGiphy(res, 'search', { q, limit, offset, lang: 'en' });
+    const pos = (req.query.pos || '').toString();
+    return proxyTenor(res, 'search', pos ? { q, limit, pos } : { q, limit });
   });
 
   // --- Music (YouTube) — ported from DiscordMusicActivity ---
