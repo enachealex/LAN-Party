@@ -26,6 +26,10 @@ Both are gitignored. Keep a backup of the `.jks` file and put the password in a 
    and signature-verified against the key.
 3. Upload `dist/LAN-Party.apk` to the server's `DATA_DIR/downloads/` — it's served at
    `/downloads/LAN-Party.apk`, which the landing page links to.
+4. Check the PUBLIC download is the new build: its sha256 must match `dist/LAN-Party.apk`.
+   Cloudflare caches `.apk` files at the edge (`cf-cache-status: HIT`, browsers keep it 4h), so
+   right after replacing the file it can still serve the old one — if the hash is stale, purge
+   `https://lanparty.thejumpvault.com/downloads/LAN-Party.apk` in the Cloudflare dashboard.
 
 Unlike the desktop app, there's no auto-update feed: the web app itself updates on every deploy, so a
 new APK is only needed when the shell changes (name, icon, colors, package settings).
