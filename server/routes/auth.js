@@ -1,14 +1,14 @@
 // Authentication + account lifecycle: register, availability check, login, /auth/me, password
-// reset (forgot/reset), account deactivation (request + confirm), logout, and the dev mock-emails
-// list. deleteUserCompletely lives here since deactivation is its only caller.
+// reset (forgot/reset), account deactivation (request + confirm) and logout. deleteUserCompletely
+// lives here since deactivation is its only caller.
 const bcrypt = require('bcryptjs');
 const { rateLimit } = require('../rateLimit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('../email');
 
-/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, mockEmails: any[] }} deps */
-function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, mockEmails }) {
+/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean }} deps */
+function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword }) {
   app.post('/auth/register', rateLimit({ id: 'register', windowMs: 60 * 60_000, max: 10 }), async (req, res) => {
     const { username, email, password, passwordConfirm } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
@@ -196,7 +196,6 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     }
   });
 
-  app.get('/mock-emails', (req, res) => res.json({ emails: mockEmails }));
 }
 
 module.exports = { registerAuthRoutes };

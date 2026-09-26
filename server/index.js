@@ -394,7 +394,6 @@ async function main() {
   const liveStreams = {}; // socketId -> { name, serverId, channelId, camera, screen } for Watch/Discover
   const externalStreams = {}; // socketId -> { name, platform, channel, title, game } — "I'm live on Twitch/YouTube/Kik"
   const EXTERNAL_PLATFORMS = ['twitch', 'youtube', 'kik'];
-  const mockEmails = [];
 
   // The list of people currently "live" for the Watch/Discover panel: in-app screen shares
   // (kind:'screen') plus external Twitch/YouTube/Kik streams (kind:'external').
@@ -612,7 +611,7 @@ async function main() {
   }
 
   // Auth + account lifecycle (routes/auth.js).
-  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, mockEmails });
+  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword });
 
   app.get('/user/settings', authMiddleware, async (req, res) => {
     const username = req.user.username;
@@ -1084,7 +1083,7 @@ async function main() {
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });
 
   // Presence / friends / direct messages (routes/social.js).
-  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
+  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
   const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.

@@ -4,7 +4,7 @@ Everything Vault Player needs to sign a LAN Party user in automatically and mirr
 
 **LAN Party origin (prod):** `https://lanparty.thejumpvault.com`
 **Shared secret:** `VAULT_SSO_SECRET` — 32 random bytes, hex. On the LAN Party host it lives in
-`/mnt/retroboard-data/lan-party/vault-sso.key` (mode 600) and in the gitignored
+`/srv/apps/lan-party/vault-sso.key` (mode 600) and in the gitignored
 `ecosystem.config.cjs`. Both services run on the same host, so read it **server-side** straight into the relay's gitignored
 `deploy/vault.env` — it never needs to pass through a chat window, a client build or a repo.
 Rotation: regenerate 32 bytes, update `vault-sso.key` + `ecosystem.config.cjs`, restart `lan-party`,
@@ -130,7 +130,7 @@ Authorization: Bearer <the same JWT>
 | `user.displayName` | string | What to show in the UI. |
 | `user.avatarUrl` | string \| null | **Relative path.** Resolve against the LAN Party origin: `https://lanparty.thejumpvault.com` + value. `null` when they've never uploaded one. |
 | `user.avatarColor` | string | `#rrggbb`. Use as the tile colour behind their initial when `avatarUrl` is null. |
-| `user.status` | enum | `available` \| `idle` \| `dnd` \| `offline`. Point-in-time; LAN Party does not push updates to you. |
+| `user.status` | enum | `available` \| `busy` \| `away` \| `offline`. Point-in-time; LAN Party does not push updates to you. |
 | `user.email` | string \| null | **Only ever the asserted user's own address.** |
 | `friends[]` | array | Same shape **minus `email`** — a friend's address is never exposed. Sorted by username. Empty array if they have none. |
 

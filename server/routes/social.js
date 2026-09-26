@@ -1,9 +1,9 @@
 // Social graph + direct messaging: presence, friend check/list, friend requests (send / accept /
-// decline / cancel / incoming / outgoing / pending-count), and 1:1 DMs (conversations, thread,
+// decline / cancel / incoming / outgoing), and 1:1 DMs (conversations, thread,
 // read, send, delete). Leans on shared helpers (friend-graph, DM-unread, presence broadcasts) that
 // also serve the socket layer, so they are injected rather than moved.
 /** @param {Record<string, any>} deps */
-function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes }) {
+function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes }) {
   app.post('/user/presence', authMiddleware, async (req, res) => {
     const status = normalizePresence(req.body?.status);
     const username = req.user.username;
@@ -101,13 +101,6 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     const target = await db.get('SELECT username FROM users WHERE id = ?', fr.to_user_id);
     if (target) await emitPendingUpdate(target.username);
     return res.json({ success: true });
-  });
-
-  app.get('/friends/requests/pending-count', authMiddleware, async (req, res) => {
-    const me = await getUserByUsername(req.user.username);
-    if (!me) return res.status(404).json({ error: 'User not found' });
-    const count = await getPendingCountForUserId(me.id);
-    return res.json({ count });
   });
 
   app.post('/friends/request', authMiddleware, async (req, res) => {

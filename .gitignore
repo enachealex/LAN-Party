@@ -12,6 +12,15 @@ server/spotify.key
 server/smtp.key
 server/vaultline.key
 desktop/certs/
+# Host-only files the production box keeps beside the checkout: pm2 config (holds JWT_SECRET and
+# VAULT_SSO_SECRET), the raw secrets, and deploy leftovers
+/ecosystem.config.cjs
+/ecosystem.config.cjs.*
+/.jwt_secret
+/vault-sso.key
+/.npmcache/
+/bin/
+client/dist.*/
 
 # Runtime data (user accounts, uploads, sounds, gifs live on the server's disk)
 server/data.sqlite

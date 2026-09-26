@@ -1,143 +1,163 @@
 # Deploying LAN Party
 
-This documents the **actual production setup** for lanparty.thejumpvault.com, plus a short appendix
-for standing up a fresh host. The app is one Node (Express + Socket.IO + SQLite) server that also
-serves the built React client — everything on one origin.
+How production actually runs at lanparty.thejumpvault.com, and how to ship to it. It is one Node
+server (Express + Socket.IO + SQLite) that also serves the built React client, all on one origin.
+
+The host is shared with other services. Read `HOMELAB-SERVER.md` (in the GitHub folder next to this
+repo, and at `/srv/apps/README.md` on the box) before changing anything outside `/srv/apps/lan-party`:
+it has the storage layout, the port map, and the network incidents behind the rules below.
 
 ---
 
-## How production actually runs
+## Production at a glance
 
-| Piece | Reality |
+| Piece | Where |
 |---|---|
-| Host | A home-LAN SBC (`aenache2015`), **not** a cloud VPS |
-| App | pm2 process **`lan-party`**, bare Node (`node index.js`), **PORT 5280** |
-| Repo on host | `/mnt/retroboard-data/lan-party` |
-| Public access | A **Cloudflare tunnel** (pm2 `lanparty-tunnel`) maps `lanparty.thejumpvault.com` → `127.0.0.1:5280`. No nginx, no certbot, no inbound ports — the tunnel is an *outbound* connection, which also means "site up" ≠ "host reachable over SSH" |
-| Data | `DATA_DIR=/mnt/retroboard-data/lan-party/data` (SQLite DB + uploads/gifs/sounds/downloads/feedback-media) |
-| Client | Built **on the dev machine** and shipped as `client/dist` — the host does not build (its `client/node_modules` has no vite) |
-| Landing / app | Landing page at `/`, app at `/app` (client built with `VITE_BASE=/app/`) |
-| Desktop feed | electron-updater generic feed at `/downloads/` (serves `DATA_DIR/downloads`) |
-| Secrets | Gitignored key files next to the server: `giphy.key`, `youtube.key`, `spotify.key`, `smtp.key`, `vaultline.key` — or the matching env vars |
+| Host | `huckleberry` on the home LAN, `192.168.1.33` (static). SSH over the LAN only: `ssh -i ~/.ssh/id_ed25519 huckleberry@192.168.1.33`. The old SBC (`192.168.1.2`) is retired. |
+| Code | `/srv/apps/lan-party` (a git checkout of `main`) |
+| App | pm2 process **`lan-party`**, started from the host-only `ecosystem.config.cjs` (gitignored; holds the env, secrets included), on port **5280** (all interfaces, so the LAN can reach it directly) |
+| Data | `DATA_DIR=/mnt/data/lan-party/data`: SQLite DB, uploads, avatars, sounds, GIFs, app bundles, `downloads/` (desktop feed + APK), feedback media |
+| Backups | `/mnt/data/lan-party/backups` (release backups); DB snapshots sit beside the DB as `data.sqlite.bak-*` |
+| Public access | pm2 **`lanparty-tunnel`**, a Cloudflare tunnel (`~/.cloudflared/lanparty.yml`) mapping `lanparty.thejumpvault.com` → `127.0.0.1:5280`. No inbound ports for the web. A tunnel UUID must run on exactly one machine. |
+| Client | Built on the dev machine and shipped as `client/dist`; the host never builds it |
+| Paths | Landing page at `/`, the app at `/app` (client built with `VITE_BASE=/app/`), desktop feed at `/downloads/` |
 
-## Routine deploy (web changes)
-
-Run the gate first, from `server/`:
+## Before any deploy
 
 ```bash
-npm run verify        # typecheck + full test suite (~5s). Do not deploy red.
+cd server && npm run verify    # typecheck + full test suite. Do not deploy red.
+cd client && npm run check     # typecheck
 ```
 
-**Client-only change** (no `server/*.js` touched) — no restart, nobody gets disconnected:
+Commit and push to `main` first: the host deploys by `git pull`. Nothing deploys on push.
+
+**Quoting tip:** PowerShell → ssh → bash mangles quotes (SQL especially). Write anything non-trivial
+as a script locally, `scp` it to `/tmp`, run it with `bash`, then delete it.
+
+## Client-only change
+
+No restart, so nobody's call drops. Build with PowerShell, since Git Bash rewrites `/app/` into a
+Windows path:
+
+```powershell
+cd client; $env:VITE_BASE='/app/'; npm run build   # dist/index.html must reference /app/assets/…
+```
+
+Ship it into place atomically (from `client/dist`, in Git Bash):
 
 ```bash
-# dev machine — PowerShell builds because Git Bash mangles VITE_BASE=/app/ into a Windows path
-$env:VITE_BASE='/app/'; cd client; npm run build
-
-# ship the dist (from client/dist, Git Bash)
-MSYS_NO_PATHCONV=1 tar -czf - . | ssh retroboard \
-  'D=/mnt/retroboard-data/lan-party/client/dist; rm -rf "$D"/*; mkdir -p "$D"; tar -C "$D" -xzf -'
-
-ssh retroboard 'cd /mnt/retroboard-data/lan-party && git pull --ff-only origin main'
+MSYS_NO_PATHCONV=1 tar -czf - . | ssh -i ~/.ssh/id_ed25519 huckleberry@192.168.1.33 \
+  'cd /srv/apps/lan-party/client && rm -rf dist.new && mkdir dist.new && tar -C dist.new -xzf - \
+   && rm -rf dist.old && mv dist dist.old && mv dist.new dist'
 ```
 
-**Server change** — pull, then restart (restart drops live call/voice sockets, so prefer quiet hours):
+`dist.old` is the instant rollback (swap it back). The build stamps its version (`git sha + date`,
+with `+dirty` for uncommitted changes), which Settings → Feedback reports.
+
+## Server change
 
 ```bash
-ssh retroboard 'cd /mnt/retroboard-data/lan-party && git pull --ff-only origin main && pm2 restart lan-party --update-env'
+ssh -i ~/.ssh/id_ed25519 huckleberry@192.168.1.33 \
+  'cd /srv/apps/lan-party && git pull --ff-only origin main && pm2 restart lan-party'
 ```
 
-**New server runtime dependency** — the host does NOT reinstall deps on deploy; a new `require`
-will crash on restart unless you install first, and order matters:
+A restart drops live voice and socket connections for a few seconds, so prefer quiet hours.
+
+**New runtime dependency:** the host does not reinstall on deploy, and a missing `require` crashes
+on restart. Install first, prove it loads, then restart. If the install fails, don't restart: the
+running process keeps serving the old code.
 
 ```bash
-ssh retroboard 'cd /mnt/retroboard-data/lan-party && git pull --ff-only origin main \
-  && cd server && npm install --omit=dev && node -e "require(\"the-new-dep\")" \
-  && pm2 restart lan-party --update-env'
-# if the install fails, do NOT restart — the running process keeps serving the old code
+cd /srv/apps/lan-party/server && npm install --omit=dev && node -e "require('the-new-dep')" && pm2 restart lan-party
 ```
 
-**Schema change** — add a **new** named migration to `server/db/schema.js` `MIGRATIONS` (never edit
-a shipped one; use the `addColumn()` helper for columns). Migrations run once at boot and are
-recorded in `schema_migrations`. Back up first:
+**Env change:** edit `ecosystem.config.cjs` on the host (back it up first), then
+`pm2 restart ecosystem.config.cjs --update-env`.
+
+## Schema change
+
+Append a **new** named migration to `MIGRATIONS` in `server/db/schema.js`. Never edit one that has
+shipped; use the `addColumn()` helper for columns. Migrations run once at boot and are recorded in
+`schema_migrations`.
+
+Back up the DB before pulling. `VACUUM INTO` takes a consistent copy while the app keeps running:
 
 ```bash
-ssh retroboard 'cd /mnt/retroboard-data/lan-party && cp data/data.sqlite data/data.sqlite.bak-$(date +%Y%m%d-%H%M%S)'
+cd /srv/apps/lan-party/server && node -e '
+  const s = require("sqlite3"); const db = new s.Database(process.argv[1], s.OPEN_READONLY);
+  db.run("VACUUM INTO ?", process.argv[2], (e) => { if (e) { console.error(e.message); process.exit(1) } db.close() })' \
+  /mnt/data/lan-party/data/data.sqlite /mnt/data/lan-party/data/data.sqlite.bak-$(date +%Y%m%d-%H%M%S)
 ```
 
-## Desktop installer release (shell changes only)
+After the restart, check the migration is listed in `schema_migrations` and that per-table
+`count(*)` matches before and after. A 200 is not proof on this box.
 
-The Windows app is a thin Electron shell around the live site — web changes reach installed apps on
-reload with **no release**. Only changes under `desktop/` need one:
+## Verify from the outside
+
+Always through the **public hostname**, never only `127.0.0.1:5280` (a whole deploy once went to the
+retired box and "passed" on localhost):
 
 ```bash
-cd desktop && npm run build     # → dist/LAN-Party-Setup.exe + latest.yml + .blockmap
-# upload the .exe and .blockmap BEFORE latest.yml (the feed must never point at a missing file)
-scp dist/LAN-Party-Setup.exe dist/LAN-Party-Setup.exe.blockmap retroboard:/mnt/retroboard-data/lan-party/data/downloads/
-scp dist/latest.yml retroboard:/mnt/retroboard-data/lan-party/data/downloads/
+curl -s https://lanparty.thejumpvault.com/app/ | grep -oE '/app/assets/index-[^"]*\.js'   # the new hash
+ssh … 'pm2 logs lan-party --err --lines 20 --nostream'                                    # no new errors
 ```
 
-Installed apps auto-update on next startup check.
+If the public site is slow from home, look at the `cf-ray` header's suffix before suspecting the app.
+This free-plan zone is served from Cloudflare's PDX or ATL data centres, and PDX → the home ISP is
+sometimes very slow (seen 2026-09-26: 5–30 KB/s even for cached files). Also check the box's link:
+`cat /sys/class/net/enp42s0/speed` should say `1000`.
 
-## Verify after deploying
+## Desktop and Android releases
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' https://lanparty.thejumpvault.com/        # 200
-curl -s https://lanparty.thejumpvault.com/app/ | grep -oE 'assets/index-[^"]*\.js' # new hash?
-ssh retroboard 'pm2 logs lan-party --err --lines 5 --nostream'                     # no new errors
-```
+Web changes reach installed apps on their next load; nothing to release. Only changes under
+`desktop/` or `android/` need one:
 
-## Environment variables
+- **Windows:** [desktop/README.md](desktop/README.md). Upload the installer and blockmap first and
+  `latest.yml` last, into `/mnt/data/lan-party/data/downloads/`. Never set `publisherName` on an
+  unsigned build (it silently broke every update before 1.4.0).
+- **Android:** [android/README.md](android/README.md). The signing key cannot be replaced; losing it
+  means users must uninstall to update.
 
-Set on the pm2 process (see `pm2 env <id>`); most have key-file fallbacks.
+Leave `/downloads` cacheable. Marked `private`, every request (even a partial or abandoned one)
+pulled the whole installer through the home uplink.
 
-| Var | Prod value / purpose |
+## Voice and video
+
+Chosen automatically per join:
+
+- **SFU (mediasoup)**, preferred: everyone uploads once and the server forwards. Media does **not**
+  use the tunnel; it goes straight to the host on its own ports:
+  - `SFU_ANNOUNCED_IPS='<public IP>,192.168.1.33'`, **public address first**. The i-th address is
+    bound to `SFU_PORT + i`: remote clients use **40000** (UDP+TCP, forwarded on the router to
+    `.33`), LAN clients use **40001** directly. `ufw` allows both. Never rely on auto-detect, which
+    would also advertise Docker bridge addresses.
+  - If the home's public IP changes, remote media stops until `SFU_ANNOUNCED_IPS` is updated.
+  - `mediasoup` is a native module installed on the host. If it's missing, or `SFU_DISABLED=1`,
+    every client uses the mesh and nothing breaks.
+- **P2P mesh**, the fallback: STUN only in production, so peers on hard NATs can't connect unless
+  a TURN relay is added (coturn per `deploy/turnserver.conf.example`, then the `TURN_*` vars).
+
+## Environment variables and key files
+
+Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file in `server/`.
+
+| Var / file | Purpose |
 |---|---|
-| `JWT_SECRET` | required — signing key for logins (rotating logs everyone out) |
-| `PORT` | 5280 |
-| `DATA_DIR` | `/mnt/retroboard-data/lan-party/data` |
-| `CLIENT_DIST` | `/mnt/retroboard-data/lan-party/client/dist` |
-| `CLIENT_ORIGIN` | `https://lanparty.thejumpvault.com` |
-| `STUN_URLS` / `TURN_URLS` / `TURN_USERNAME` / `TURN_CREDENTIAL` | WebRTC ICE served to clients via `/webrtc/ice` — rotating needs no client rebuild |
-| `GIPHY_API_KEY` / `YOUTUBE_API_KEY` / `SPOTIFY_CLIENT_ID`+`SECRET` | optional integrations (or `server/*.key` files) |
-| `VAULTLINE_API_KEY` / `VAULTLINE_API_BASE` | feedback forwarding (prod uses `server/vaultline.key` → loopback `http://127.0.0.1:4100`) |
-| SMTP: `SMTP_HOST/PORT/USER/PASS/FROM/SECURE` | transactional email (prod uses `server/smtp.key`) |
+| `JWT_SECRET` | Required. Signs logins; rotating it logs everyone out. |
+| `PORT`, `DATA_DIR`, `CLIENT_DIST`, `CLIENT_ORIGIN` | `5280`, `/mnt/data/lan-party/data`, `/srv/apps/lan-party/client/dist`, `https://lanparty.thejumpvault.com` |
+| `PUBLIC_APP_URL` | Public base URL for links the server hands out, e.g. feedback screenshots in Vaultline tickets |
+| `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED` | Voice networking, above |
+| `STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build |
+| `TENOR_API_KEY` / `tenor.key` | GIF search |
+| `YOUTUBE_API_KEY` / `youtube.key` | Watch Together search |
+| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI` / `spotify.key` | Spotify |
+| `smtp.key` | Transactional email (shared Gmail SMTP) |
+| `vaultline.key` | Feedback → Vaultline, over loopback `:4100` |
+| `VAULT_SSO_SECRET` (also `/srv/apps/lan-party/vault-sso.key`) | Vault Player SSO; see [docs/VAULT-PLAYER-INTEGRATION.md](docs/VAULT-PLAYER-INTEGRATION.md) |
 
----
+Music playback also needs `yt-dlp` on the PATH (`/usr/local/bin/yt-dlp` on the host).
 
-## Appendix: fresh host from scratch
+## Scale
 
-1. Clone; `cd server && npm install --omit=dev`.
-2. Build the client somewhere with dev deps: `VITE_BASE=/app/ npm run build` in `client/`.
-3. Run: `DATA_DIR=... JWT_SECRET=$(openssl rand -hex 32) PORT=5280 pm2 start index.js --name lan-party`
-   then `pm2 save && pm2 startup`.
-4. Expose it (either):
-   - **Cloudflare tunnel** (what prod does): `cloudflared tunnel` with an ingress rule
-     `hostname → http://127.0.0.1:5280`, run under pm2. No inbound firewall holes needed.
-   - Classic reverse proxy: nginx + certbot per `deploy/nginx.conf.example` (forwards WebSocket
-     upgrade, 100 MB uploads).
-5. Music playback needs `yt-dlp` on PATH.
-
-## Voice/video
-
-Two paths, chosen automatically per join:
-
-- **SFU (mediasoup)** — preferred. Each participant uploads their tracks once and the server fans
-  them out (O(n) per client), so rooms scale well past the mesh's limit. Media flows over **one
-  port, `SFU_PORT` (default 40000, UDP+TCP), NOT the Cloudflare tunnel** — straight to the host.
-  - `SFU_ANNOUNCED_IPS` must list the address(es) clients should send media to. **Prod pins it to
-    `192.168.1.2`** (the SBC's LAN IP) in `ecosystem.config.cjs` — do NOT rely on auto-detect, which
-    would also advertise the unreachable Docker bridge IPs (172.x).
-  - **LAN clients work with zero setup.** **Remote clients** additionally need: (a) the public IP
-    added to `SFU_ANNOUNCED_IPS`, and (b) UDP **and** TCP port 40000 forwarded on the router to the
-    SBC. Until then, remote users transparently fall back to the mesh.
-  - `mediasoup` is a native module — `npm install` on the host before restart (it ships a prebuilt
-    x86_64 binary; needs python3+make+g++ only if it must build). If it's missing or fails, or you
-    set `SFU_DISABLED=1`, the app runs fine and every client uses the mesh.
-- **P2P mesh** — the fallback (and what old/other-network clients use). TURN makes it work across
-  NATs: coturn per `deploy/turnserver.conf.example` (UDP/TCP 3478 + relay range), then set the
-  `TURN_*` vars. Media is peer-to-peer, never transiting the app server or tunnel.
-
-## Scale notes
-
-- SQLite + local disk = single host by design. For HA you'd move to Postgres + object storage.
+SQLite on local disk means one host, by design. High availability would mean Postgres plus object
+storage.

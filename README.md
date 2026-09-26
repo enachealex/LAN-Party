@@ -1,26 +1,29 @@
 # LAN Party
 
-A self-hosted, Discord-style communication app for game nights: servers & channels, text chat with
-uploads/GIFs/reactions, peer-to-peer voice & video calls with background effects, screen sharing
-("Go Live") with a watch/discover directory, a soundboard, collaborative image editing, and shared
-in-call Activities (Watch Together, Whiteboard, Polls, Tic-Tac-Toe).
+A self-hosted, Discord-style communication app for game nights, live at
+**https://lanparty.thejumpvault.com** (landing page at `/`, the app at `/app`).
 
-**Stack:** Node.js (Express + Socket.IO + SQLite) server · React (Vite) client · WebRTC mesh for
-calls · optional Electron desktop wrapper and Expo mobile skeleton.
+**Stack:** Node.js (Express + Socket.IO + SQLite) server · React (Vite) client · mediasoup SFU for
+calls, with a peer-to-peer WebRTC mesh as the fallback · Electron desktop app for Windows ·
+Trusted Web Activity APK for Android.
 
 ## Features
 
-- **Servers & channels** — create servers and text/voice channels; fully isolated per server.
-- **Text chat** — file uploads (auto-expire after 7 days), GIF library + Giphy, custom emojis,
-  reactions, edit/delete, right-click collaborative image editing.
-- **Voice & video** — P2P mesh calls (DTLS-SRTP encrypted), Teams-style pre-join screen (camera
-  preview, background blur/covers/"hide me", mic/speaker pickers, live mic meter), responsive
-  gallery grid with paging, deafen, per-device audio selection.
-- **Go Live + Discover** — share your screen at a chosen quality; everyone can find live streams
-  in the 📡 directory and jump in to watch.
-- **Soundboard** — shared clips broadcast to the voice room.
-- **Activities** — one shared activity per voice room, auto-synced for everyone: Watch Together
-  (synced YouTube), Whiteboard, Quick Poll, Tic-Tac-Toe.
+- **Servers & channels**: text and voice channels, private channels, owner/admin roles, invites,
+  custom server icons.
+- **Chat**: file uploads (deleted after 7 days), GIFs (Tenor plus your own library), custom emojis,
+  reactions with customizable quick reactions, quoted replies, pins, and edits and deletes that are
+  saved and shown to everyone.
+- **Friends, DMs and group chats**: friend requests, presence, direct messages and server-backed
+  group chats (rename, add people, leave), with your own sections in the conversation list.
+- **Voice & video**: SFU calls that scale past a handful of people, a pre-join screen with camera
+  preview and background blur/covers (processed on your device), mic/speaker pickers, deafen.
+- **Go Live + Discover**: share your screen at a chosen quality; everyone can find live streams in
+  the 📡 directory and jump in.
+- **Soundboard, entrance sounds, Activities** (Watch Together, Music, Movie Night, Whiteboard,
+  Polls, Tic-Tac-Toe) and **collaborative image editing**.
+- **Apps directory**: links or uploaded web-app bundles, hosted by LAN Party.
+- **Feedback** tab that files tickets in Vaultline, and **Vault Player** single sign-on.
 
 ## Run locally
 
@@ -28,25 +31,35 @@ calls · optional Electron desktop wrapper and Expo mobile skeleton.
 # 1) server (http://localhost:3000)
 cd server && npm install && npm start
 
-# 2) client (http://localhost:5173) — in a second terminal
+# 2) client (http://localhost:5173), in a second terminal
 cd client && npm install && npm run dev
 ```
 
-Register an account at http://localhost:5173 and you're in. Optional: put a Giphy API key in
-`server/giphy.key` (or `GIPHY_API_KEY` env) to enable the Giphy tab.
+Register an account at http://localhost:5173 and you're in. Optional integrations read a key file
+next to the server or an env var: `server/tenor.key` (`TENOR_API_KEY`) for GIF search,
+`youtube.key`, `spotify.key`, `smtp.key`, `vaultline.key`. See [DEPLOY.md](DEPLOY.md).
+
+Checks before shipping:
+
+```bash
+cd server && npm run verify   # typecheck + the full test suite
+cd client && npm run check    # typecheck
+```
 
 ## Deploy
 
-See **[DEPLOY.md](DEPLOY.md)** — single-origin hosting (the server serves the built client),
-Docker/pm2, nginx + HTTPS, and TURN setup for reliable calls across networks.
-Device/privacy policy: **[DEVICE-PRIVACY.md](DEVICE-PRIVACY.md)**.
+**[DEPLOY.md](DEPLOY.md)** covers the production host, routine deploys, schema changes, voice
+networking and environment variables. The desktop and Android apps have their own release notes in
+[desktop/README.md](desktop/README.md) and [android/README.md](android/README.md).
+Device and privacy policy: **[DEVICE-PRIVACY.md](DEVICE-PRIVACY.md)**.
 
 ## Repository layout
 
 | Path | What it is |
 | --- | --- |
-| `server/` | Express + Socket.IO + SQLite backend (also serves the built client) |
-| `client/` | React (Vite) web app |
-| `desktop/` | Electron wrapper (scaffold + self-signed code-signing script) |
-| `mobile/` | Expo skeleton (future native features, e.g. RTMP streaming) |
-| `deploy/` | nginx + coturn example configs |
+| `server/` | Express + Socket.IO + SQLite backend; also serves the built client and the landing page |
+| `client/` | React (Vite) web app, also installable as a PWA |
+| `desktop/` | Electron shell for Windows: tray, call overlay, screen-share picker, auto-update |
+| `android/` | Bubblewrap Trusted Web Activity that builds the Android APK |
+| `deploy/` | Example coturn config, for the optional TURN relay |
+| `docs/` | Integration specs (Vault Player SSO) |
