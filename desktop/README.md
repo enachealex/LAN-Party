@@ -13,6 +13,11 @@ What the shell adds on top of the web app (`main.js`):
 - **Media**: camera, microphone, screen share (`desktopCapturer`), notifications, fullscreen and
   speaker selection — granted to LAN Party's own origin only; sign-in pop-ups and any other
   page get nothing. External links open in the user's browser (web and mail links only).
+- **Screen-share picker** (since 1.5.0): Electron has no built-in picker on Windows, so a share
+  used to be the primary screen, no questions asked. `picker.html` + `picker.js` (bridge:
+  `picker-preload.js`) list screens and app windows with previews that refresh every 3 s;
+  Cancel, Escape or closing the window cancels the share. Video only: the web client asks for
+  `audio: false`.
 - **Auto-update** via `electron-updater` from `https://lanparty.thejumpvault.com/downloads/`.
 
 ## Run it
@@ -25,6 +30,10 @@ npm run dev    # against a local client dev server (http://localhost:5173) — s
 ```
 
 Since Electron 42 the Electron binary downloads on the first `npm start`, not during `npm install`.
+
+For automated tests, set `LANPARTY_NO_ACTIVATE=1`: the app's windows (including the screen-share
+picker) then appear without taking the keyboard focus. Add `--remote-debugging-port=<port>` to
+drive the pages over CDP.
 
 ## Releasing a new version
 

@@ -61,6 +61,9 @@ function startedHidden() {
 // this device; the server is the single source of truth. Override for local dev with LANPARTY_URL.
 const APP_URL = process.env.LANPARTY_URL || 'https://lanparty.thejumpvault.com/app/'
 const APP_ORIGIN = new URL(APP_URL).origin
+// Test runs set LANPARTY_NO_ACTIVATE=1 so the app's windows appear without taking the keyboard focus
+// from whatever else is going on at this computer.
+const NO_ACTIVATE = process.env.LANPARTY_NO_ACTIVATE === '1'
 
 // True for a URL (or origin string) on LAN Party itself.
 function isAppUrl(value) {
@@ -237,7 +240,7 @@ function createWindow() {
     backgroundColor: '#0b0d10',
     autoHideMenuBar: true,
     title: 'LAN Party',
-    show: !hidden,
+    show: !hidden && !NO_ACTIVATE,
     skipTaskbar: hidden && process.platform === 'win32',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -251,6 +254,7 @@ function createWindow() {
   })
 
   mainWindow.loadURL(APP_URL)
+  if (NO_ACTIVATE && !hidden) mainWindow.once('ready-to-show', () => mainWindow && mainWindow.showInactive())
   mainWindow.on('closed', () => { mainWindow = null })
 
   // Closing the window hides it to the tray (keeps calls/chat alive) instead of quitting — but only
@@ -300,11 +304,104 @@ function configureMedia() {
   if (typeof ses.setDisplayMediaRequestHandler === 'function') {
     ses.setDisplayMediaRequestHandler((request, callback) => {
       if (!isAppUrl(request.securityOrigin)) return callback({})
-      desktopCapturer.getSources({ types: ['screen', 'window'] })
-        .then((sources) => callback(sources.length ? { video: sources[0] } : {}))
+      pickShareSource()
+        .then((source) => callback(source ? { video: source } : {}))
         .catch(() => callback({}))
-    }, { useSystemPicker: true }) // OS picker on supported platforms; falls back to first source
+    }, { useSystemPicker: true }) // macOS 15+ uses the OS picker instead; everywhere else, ours
   }
+}
+
+// ---------------------------------------------------------------------------
+// Screen-share picker. Chrome has its own picker but Electron doesn't, and its system picker is
+// macOS 15+ only, so on Windows a share used to be whatever desktopCapturer listed first (the primary
+// screen) with no say in it. This window lists screens and app windows with live previews; what you
+// pick is what's shared, and closing it cancels the share.
+// ---------------------------------------------------------------------------
+let picker = null // { window, sources: Map<id, DesktopCapturerSource>, resolve }
+
+async function listShareSources() {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen', 'window'],
+    thumbnailSize: { width: 400, height: 225 },
+    fetchWindowIcons: true,
+  })
+  // Our own floating call overlay and the picker itself are never what anyone means to share.
+  const ours = new Set()
+  for (const w of [overlayWindow, picker && picker.window]) {
+    if (w && !w.isDestroyed()) ours.add(w.getMediaSourceId())
+  }
+  return sources.filter((s) => !ours.has(s.id))
+}
+
+function settlePicker(source) {
+  if (!picker) return
+  const { window, resolve } = picker
+  picker = null
+  resolve(source)
+  if (!window.isDestroyed()) window.close()
+}
+
+ipcMain.handle('picker:sources', async (e) => {
+  if (!picker || e.sender !== picker.window.webContents) return []
+  const sources = await listShareSources()
+  if (!picker) return [] // cancelled while we were listing
+  picker.sources = new Map(sources.map((s) => [s.id, s]))
+  return sources.map((s) => ({
+    id: s.id,
+    name: s.name,
+    kind: s.id.startsWith('screen:') ? 'screen' : 'window',
+    thumbnail: s.thumbnail && !s.thumbnail.isEmpty() ? s.thumbnail.toDataURL() : null,
+    icon: s.appIcon && !s.appIcon.isEmpty() ? s.appIcon.toDataURL() : null,
+  }))
+})
+// Only an id from the list this picker was shown counts; anything else is ignored.
+ipcMain.on('picker:choose', (e, id) => {
+  if (!picker || e.sender !== picker.window.webContents) return
+  const source = picker.sources.get(String(id))
+  if (source) settlePicker(source)
+})
+ipcMain.on('picker:cancel', (e) => {
+  if (picker && e.sender === picker.window.webContents) settlePicker(null)
+})
+
+// Resolves with the chosen source, or null if the picker was cancelled or closed.
+function pickShareSource() {
+  // One share request at a time: a second one while the picker is open is refused, not queued.
+  if (picker) { picker.window.focus(); return Promise.resolve(null) }
+  return new Promise((resolve) => {
+    const parent = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : undefined
+    const window = new BrowserWindow({
+      parent,
+      modal: Boolean(parent),
+      width: 780,
+      height: 580,
+      minWidth: 520,
+      minHeight: 400,
+      title: 'Share your screen',
+      backgroundColor: '#1e1f22',
+      autoHideMenuBar: true,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      show: false,
+      webPreferences: {
+        preload: path.join(__dirname, 'picker-preload.js'),
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+      },
+    })
+    picker = { window, sources: new Map(), resolve }
+    // Closing it with the X (or Alt+F4) is a cancel.
+    window.on('closed', () => {
+      if (picker && picker.window === window) { picker = null; resolve(null) }
+    })
+    // A local page that never navigates or opens anything.
+    window.webContents.on('will-navigate', (event) => event.preventDefault())
+    window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    window.once('ready-to-show', () => (NO_ACTIVATE ? window.showInactive() : window.show()))
+    window.loadFile(path.join(__dirname, 'picker.html'))
+  })
 }
 
 // Check for a new shell version at startup (and periodically), download it in the background, and
