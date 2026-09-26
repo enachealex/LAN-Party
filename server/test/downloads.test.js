@@ -1,5 +1,6 @@
-// The desktop installer / updater feed must not be cacheable by Cloudflare: a cached 111 MB installer
-// was served from the edge at a few KB/s, so /downloads has to go straight through the tunnel.
+// The desktop installer / updater feed. It must stay cacheable by Cloudflare: marked private, every
+// request (a partial or abandoned one included) pulled the full 111 MB installer through the home
+// uplink, instead of the edge serving it from cache after a cheap 304 revalidation.
 const { test, before, after, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -17,12 +18,19 @@ describe('/downloads', () => {
   });
   after(() => server?.stop());
 
-  test('installer and feed are marked private so the CDN streams them instead of caching', async () => {
+  test('installer and feed stay cacheable, with an ETag so the CDN can revalidate cheaply', async () => {
     for (const file of ['LAN-Party-Setup.exe', 'latest.yml']) {
       const res = await fetch(`${server.base}/downloads/${file}`);
       assert.equal(res.status, 200, file);
-      assert.match(res.headers.get('cache-control') || '', /\bprivate\b/, `${file} Cache-Control`);
+      assert.doesNotMatch(res.headers.get('cache-control') || '', /\b(private|no-store)\b/, `${file} Cache-Control`);
+      const etag = res.headers.get('etag');
+      assert.ok(etag, `${file} has an ETag`);
       await res.arrayBuffer();
+      // An explicit Cache-Control, or fetch adds "no-cache" to any conditional request (per the Fetch
+      // spec), and the server rightly answers that with a full 200. The CDN's revalidation sends none.
+      const again = await fetch(`${server.base}/downloads/${file}`, { headers: { 'If-None-Match': etag, 'Cache-Control': 'max-age=0' } });
+      assert.equal(again.status, 304, `${file} revalidates to a 304`);
+      await again.arrayBuffer();
     }
   });
 

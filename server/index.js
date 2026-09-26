@@ -290,14 +290,11 @@ async function main() {
   // catch-all, which would hand an <img> the client's HTML with a 200 and look merely broken.
   app.use('/avatars', (req, res) => res.status(404).type('txt').send('Not found'));
   // Desktop installer + electron-updater feed. The updater fetches /downloads/latest.yml at startup.
-  // `private` keeps Cloudflare from caching these. It caches .exe/.apk by extension, and a cached
-  // 111 MB installer came out of the edge at 4-16 KB/s (measured 2026-09-26: hours per download),
-  // while the same file streamed straight through the tunnel ran at 7-10 MB/s. Nothing here needs a
-  // CDN, and the updater wants a fresh latest.yml every time anyway.
-  app.use('/downloads', express.static(downloadsDir, {
-    redirect: false,
-    setHeaders: (res) => res.setHeader('Cache-Control', 'private, no-cache'),
-  }));
+  // Leave these cacheable. Cloudflare caches .exe/.apk by extension and revalidates with the ETag, so
+  // a download costs the origin a 304. Marked private, every request (even a partial or abandoned one)
+  // pulled the whole 111 MB installer through the home uplink. The updater's range requests were
+  // the worst case.
+  app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
   app.use('/feedback-media', express.static(feedbackDir, { redirect: false }));
   // Uploaded mini-apps. The CSP `sandbox` directive (WITHOUT allow-same-origin) forces every bundle
