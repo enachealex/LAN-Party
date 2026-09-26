@@ -169,6 +169,7 @@ export default function AppLeftPane({
   onFriendVoiceChat,
   onViewProfile,
   onRemoveFriend,
+  onLeaveGroup,
   askPrompt,
   savedHomeLayout,
   onHomeLayoutChange,
@@ -518,6 +519,7 @@ export default function AppLeftPane({
               onFriendVoiceChat={onFriendVoiceChat}
               onViewProfile={onViewProfile}
               onRemoveFriend={onRemoveFriend}
+              onLeaveGroup={onLeaveGroup}
               askPrompt={askPrompt}
               savedHomeLayout={savedHomeLayout}
               onHomeLayoutChange={onHomeLayoutChange}

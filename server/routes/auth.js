@@ -127,6 +127,17 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       await db.run('DELETE FROM friendships WHERE user_id = ? OR friend_user_id = ?', userId, userId);
       await db.run('DELETE FROM friend_requests WHERE from_user_id = ? OR to_user_id = ?', userId, userId);
       await db.run('DELETE FROM direct_messages WHERE sender_id = ? OR recipient_id = ?', userId, userId);
+      // Group chats: drop their messages and membership, hand ownership to the longest-standing
+      // member, and delete any group nobody is left in.
+      await db.run('DELETE FROM group_messages WHERE sender_id = ?', userId);
+      await db.run('DELETE FROM group_members WHERE user_id = ?', userId);
+      await db.run(
+        `UPDATE group_chats SET owner_id = (SELECT user_id FROM group_members gm WHERE gm.group_id = group_chats.id ORDER BY joined_at ASC LIMIT 1)
+          WHERE owner_id = ? AND EXISTS (SELECT 1 FROM group_members gm WHERE gm.group_id = group_chats.id)`,
+        userId
+      );
+      await db.run('DELETE FROM group_messages WHERE group_id NOT IN (SELECT group_id FROM group_members)');
+      await db.run('DELETE FROM group_chats WHERE id NOT IN (SELECT group_id FROM group_members)');
       await db.run('DELETE FROM auth_tokens WHERE user_id = ?', userId);
       await db.run('DELETE FROM users WHERE id = ?', userId);
       await db.run('COMMIT');

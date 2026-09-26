@@ -20,6 +20,7 @@ const { createSfu } = require('./services/sfu');
 const { registerMediaRoutes } = require('./routes/media');
 const { registerAuthRoutes } = require('./routes/auth');
 const { registerSocialRoutes } = require('./routes/social');
+const { registerGroupRoutes } = require('./routes/groups');
 const { registerVaultRoutes } = require('./routes/vault');
 const { registerServerRoutes } = require('./routes/servers');
 const { registerLibraryRoutes } = require('./routes/library');
@@ -1087,6 +1088,7 @@ async function main() {
 
   // Presence / friends / direct messages (routes/social.js).
   registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, getPendingCountForUserId, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
+  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
   registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
@@ -1386,9 +1388,19 @@ async function main() {
       io.to(`channel:${row.server_id}:${row.channel_id}`).emit('pins:updated', { serverId: row.server_id, channelId: row.channel_id, pins: await channelPins(row.server_id, row.channel_id, socketUser) });
     });
 
-    // Toggle a persisted reaction. scope 'channel' (broadcast to channel) or 'dm' (both peers).
+    // Toggle a persisted reaction. scope 'channel' (broadcast to channel), 'dm' (both peers) or
+    // 'group' (every member of the group chat).
     socket.on('reaction:toggle', async ({ scope = 'channel', messageId, emoji } = {}) => {
       if (!socketUser || !messageId || typeof emoji !== 'string' || !emoji) return;
+      if (scope === 'group') {
+        const me = await getUserByUsername(socketUser);
+        const groupId = me && await groups.groupOfMessageForMember(messageId, me.id);
+        if (!groupId) return; // only members
+        const raw = await toggleReaction('group_messages', messageId, socketUser, emoji);
+        if (raw == null) return;
+        await groups.emitToMembers(groupId, 'reaction:updated', { scope: 'group', groupId, messageId, reactions: raw });
+        return;
+      }
       if (scope === 'dm') {
         const dm = await db.get('SELECT sender_id, recipient_id FROM direct_messages WHERE id = ?', messageId);
         if (!dm) return;

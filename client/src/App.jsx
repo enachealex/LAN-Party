@@ -97,6 +97,32 @@ function oldestMessagesFirst(messages = []) {
   return [...messages].sort((a, b) => messageTimeValue(a) - messageTimeValue(b))
 }
 
+// A group with no name is called after its other members: "ann, ben, cat +2".
+function groupDisplayName(group, me) {
+  if (group?.name) return group.name
+  const others = (group?.members || []).map((m) => m.name).filter((n) => n && n !== me)
+  if (others.length === 0) return 'Just you'
+  return others.length <= 3 ? others.join(', ') : `${others.slice(0, 3).join(', ')} +${others.length - 3}`
+}
+
+// A server group summary in the shape the conversation list and chat view use. `rawName` is what's
+// stored (possibly empty); `name` is what's shown.
+function toGroupChat(group, me) {
+  const members = group.members || []
+  return {
+    ...group,
+    rawName: group.name || '',
+    name: groupDisplayName(group, me),
+    avatar: '#5865f2',
+    participants: members,
+    preview: group.lastMessage?.text || `${members.length} members`,
+  }
+}
+
+// Group chat ids are 'grp-...'; DM conversation keys are the peer's numeric user id. Anything that
+// scans every conversation for a DM message id must skip group keys, since the two id spaces overlap.
+const isGroupChatKey = (key) => String(key).startsWith('grp-')
+
 function formatMessageTime(ts) {
   const value = Number(ts)
   if (!value) return ''
@@ -1294,6 +1320,10 @@ export default function App() {
   const [showNewChatModal, setShowNewChatModal] = useState(false)
   const [newChatSelectedIds, setNewChatSelectedIds] = useState([])
   const [newChatGroupName, setNewChatGroupName] = useState('')
+  // Set when the New Message picker is being used to add people to this group instead.
+  const [addToGroupId, setAddToGroupId] = useState(null)
+  const [groupBusy, setGroupBusy] = useState(false)
+  const leavingGroupsRef = useRef(new Set()) // groups we're leaving on purpose (no "removed" toast)
   const [pendingFile, setPendingFile] = useState(null)
   const [pendingPreviewUrl, setPendingPreviewUrl] = useState(null)
   // Ordered composer stack: [{ kind: 'text', text } | { kind: 'gif', url, name }]. Built up as you
@@ -1341,6 +1371,9 @@ export default function App() {
   useEffect(() => {
     homeChatRef.current = homeChat
   }, [homeChat])
+  // Socket handlers are bound once per connection, so they read the group list through a ref.
+  const groupChatsRef = useRef([])
+  useEffect(() => { groupChatsRef.current = groupChats }, [groupChats])
 
   // Mirror call state for socket callbacks + tick the in-call timer once connected.
   useEffect(() => { callRef.current = call }, [call])
@@ -1631,11 +1664,12 @@ export default function App() {
           if (savedView.activeChannel) setActiveChannel(savedView.activeChannel)
         }
         connect(data.user.username, t)
-        const [loadedFriends, loadedConversations] = await Promise.all([
+        const [loadedFriends, loadedConversations, loadedGroups] = await Promise.all([
           loadFriendsData(t),
           loadMessagesData(t),
+          loadGroupsData(t),
         ])
-        restoreSavedView({ username: data.user.username, friendsList: loadedFriends, conversations: loadedConversations, groups: groupChats, authToken: t })
+        restoreSavedView({ username: data.user.username, friendsList: loadedFriends, conversations: loadedConversations, groups: loadedGroups, authToken: t })
       } catch (err) {
         console.warn('Restore session failed', err)
         localStorage.removeItem('lanparty_token')
@@ -1690,6 +1724,28 @@ export default function App() {
       console.warn('loadMessagesData failed', err)
     }
     return []
+  }
+
+  // The group chats this user is in, with their unread counts (the open group never shows a badge).
+  const loadGroupsData = async (authToken) => {
+    const t = authToken || token
+    if (!t) return []
+    try {
+      const res = await fetch(`${SERVER_URL}/groups`, { headers: { Authorization: `Bearer ${t}` } })
+      if (!res.ok) return []
+      const data = await res.json()
+      const me = localStorage.getItem('lanparty_user') || name
+      const groups = (data.groups || []).map((g) => toGroupChat(g, me))
+      setGroupChats(groups)
+      const open = homeChatRef.current?.type === 'group' ? String(homeChatRef.current.id) : null
+      setGroupUnread(Object.fromEntries(
+        groups.filter((g) => g.unreadCount > 0 && String(g.id) !== open).map((g) => [g.id, g.unreadCount])
+      ))
+      return groups
+    } catch (err) {
+      console.warn('loadGroupsData failed', err)
+      return []
+    }
   }
 
   const applyFriendPresence = (username, status) => {
@@ -1808,15 +1864,14 @@ export default function App() {
     }
 
     if (savedChat.type === 'group') {
-      const group = groups.find((item) => String(item.id) === String(savedChat.id)) || savedChat
-      setGroupChats((prev) => {
-        if (prev.some((item) => String(item.id) === String(group.id))) return prev
-        return [{ ...group, preview: group.preview || 'Group chat' }, ...prev]
-      })
+      // Only reopen a group you're still in. That also drops the old browser-only groups ('group-...').
+      const group = (groups || []).find((item) => String(item.id) === String(savedChat.id))
+      if (!group) return
       setSelectedGroupId(group.id)
       setSelectedFriendId(null)
       setSelectedDmId(null)
-      setHomeChat({ type: 'group', id: group.id, name: group.name || savedChat.name })
+      setHomeChat({ type: 'group', id: group.id, name: group.name })
+      loadGroupHistory(group.id, authToken)
     }
   }
 
@@ -2503,6 +2558,72 @@ export default function App() {
     }
   }
 
+  // A group's history. Fetching it also marks it read on the server, which clears the badge in your
+  // other windows (group:read).
+  const loadGroupHistory = async (groupId, authToken) => {
+    const t = authToken || token || localStorage.getItem('lanparty_token')
+    if (!t || !groupId) return
+    const key = chatStorageKey(groupId)
+    const seq = (chatHistoryLoadSeqRef.current[key] || 0) + 1
+    chatHistoryLoadSeqRef.current[key] = seq
+    try {
+      const res = await fetch(`${SERVER_URL}/groups/${encodeURIComponent(groupId)}/messages?markRead=1`, {
+        headers: { Authorization: `Bearer ${t}` },
+      })
+      if (!res.ok || chatHistoryLoadSeqRef.current[key] !== seq) return
+      const data = await res.json()
+      setHomeMessages((prev) => ({ ...prev, [key]: oldestMessagesFirst(data.messages || []) }))
+    } catch (err) {
+      console.warn('loadGroupHistory failed', err)
+    }
+  }
+
+  // Authenticated JSON call for the group endpoints. Throws with the server's message on failure.
+  const groupRequest = async (method, path, body) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    const res = await fetch(`${SERVER_URL}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${t}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || 'Something went wrong')
+    return data
+  }
+
+  // Insert or refresh one group in the list (from a create/rename/add, or a group:updated push).
+  const upsertGroupChat = (group) => {
+    const me = localStorage.getItem('lanparty_user') || name
+    const chat = toGroupChat(group, me)
+    setGroupChats((prev) => {
+      const i = prev.findIndex((g) => String(g.id) === String(chat.id))
+      if (i < 0) return [chat, ...prev]
+      const next = [...prev]
+      next[i] = chat
+      return next
+    })
+    setHomeChat((prev) => (prev?.type === 'group' && String(prev.id) === String(chat.id) ? { ...prev, name: chat.name } : prev))
+    return chat
+  }
+
+  // Forget a group you left or were removed from, closing it if it's open.
+  const dropGroupChat = (groupId) => {
+    const without = (prev) => {
+      if (!(groupId in prev)) return prev
+      const next = { ...prev }
+      delete next[groupId]
+      return next
+    }
+    setGroupChats((prev) => prev.filter((g) => String(g.id) !== String(groupId)))
+    setGroupUnread(without)
+    setHomeMessages(without)
+    if (homeChatRef.current?.type === 'group' && String(homeChatRef.current.id) === String(groupId)) {
+      setHomeChat(null)
+      setSelectedGroupId(null)
+      setShowMembersPanel(false)
+    }
+  }
+
   const totalUnreadWithGroups = totalUnreadMessages + Object.values(groupUnread).reduce((a, b) => a + b, 0)
 
   // Apply user settings to CSS variables
@@ -2708,13 +2829,22 @@ export default function App() {
     })
 
     // Persisted reaction changed — apply the authoritative counts (mine computed for this user).
-    s.on('reaction:updated', ({ scope, messageId, reactions }) => {
+    s.on('reaction:updated', ({ scope, groupId, messageId, reactions }) => {
       const formatted = formatReactions(reactions, userName)
+      if (scope === 'group') {
+        setHomeMessages((prev) => {
+          const key = chatStorageKey(groupId)
+          if (!prev[key]) return prev
+          return { ...prev, [key]: prev[key].map((m) => (String(m.id) === String(messageId) ? { ...m, reactions: formatted } : m)) }
+        })
+        return
+      }
       if (scope === 'dm') {
         setHomeMessages((prev) => {
           let changed = false
           const next = {}
           for (const key of Object.keys(prev)) {
+            if (isGroupChatKey(key)) { next[key] = prev[key]; continue }
             next[key] = prev[key].map((m) => {
               if (String(m.id) === String(messageId)) { changed = true; return { ...m, reactions: formatted } }
               return m
@@ -2739,6 +2869,7 @@ export default function App() {
         let changed = false
         const next = {}
         for (const key of Object.keys(prev)) {
+          if (isGroupChatKey(key)) { next[key] = prev[key]; continue }
           next[key] = prev[key].map((m) => {
             if (String(m.id) !== String(id)) return m
             changed = true
@@ -2754,6 +2885,7 @@ export default function App() {
       let changed = false
       const next = {}
       for (const key of Object.keys(prev)) {
+        if (isGroupChatKey(key)) { next[key] = prev[key]; continue }
         const arr = prev[key]
         const filtered = arr.filter((m) => String(m.id) !== String(id))
         if (filtered.length !== arr.length) changed = true
@@ -2761,6 +2893,63 @@ export default function App() {
       }
       return changed ? next : prev
     }))
+
+    // ---- Group chats: every change arrives here, for every member ----
+    const isOpenGroup = (groupId) => homeChatRef.current?.type === 'group' &&
+      String(homeChatRef.current.id) === String(groupId) && selectedServerIdRef.current === 'home'
+    const clearGroupBadge = (groupId) => setGroupUnread((prev) => {
+      if (!(groupId in prev)) return prev
+      const next = { ...prev }
+      delete next[groupId]
+      return next
+    })
+    s.on('group:updated', ({ group } = {}) => {
+      if (!group?.id) return
+      upsertGroupChat(group)
+      if (isOpenGroup(group.id)) return
+      const n = group.unreadCount || 0
+      if (n) setGroupUnread((prev) => (prev[group.id] === n ? prev : { ...prev, [group.id]: n }))
+      else clearGroupBadge(group.id)
+    })
+    s.on('group:removed', ({ groupId } = {}) => {
+      if (!groupId) return
+      const group = groupChatsRef.current.find((g) => String(g.id) === String(groupId))
+      const onPurpose = leavingGroupsRef.current.delete(String(groupId))
+      dropGroupChat(groupId)
+      if (!onPurpose && group) setToast(`You were removed from ${group.name}`)
+    })
+    s.on('group:message', ({ groupId, message } = {}) => {
+      if (!groupId || !message) return
+      appendHomeMessage(groupId, message)
+      updateGroupConversationPreview(groupId, message)
+      const me = localStorage.getItem('lanparty_user') || userName
+      if (message.author === me) return
+      const reading = isOpenGroup(groupId) && !document.hidden
+      playUiSound(reading ? 'receive' : 'notify')
+      if (reading) {
+        fetch(`${SERVER_URL}/groups/${encodeURIComponent(groupId)}/read`, {
+          method: 'POST', headers: { Authorization: `Bearer ${authToken}` },
+        }).catch(() => {})
+        return
+      }
+      setGroupUnread((prev) => ({ ...prev, [groupId]: (prev[groupId] || 0) + 1 }))
+      const group = groupChatsRef.current.find((g) => String(g.id) === String(groupId))
+      maybeNotify('group', { author: message.author, groupId, groupName: group?.name, preview: (message.text || '').slice(0, 120) || 'Sent an attachment' })
+    })
+    s.on('group:read', ({ groupId } = {}) => { if (groupId) clearGroupBadge(groupId) })
+    s.on('group:message-edited', ({ groupId, id, text } = {}) => setHomeMessages((prev) => {
+      const key = chatStorageKey(groupId)
+      if (!prev[key]) return prev
+      return { ...prev, [key]: prev[key].map((m) => (String(m.id) === String(id) ? { ...m, text, edited: true } : m)) }
+    }))
+    s.on('group:message-deleted', ({ groupId, id } = {}) => {
+      setHomeMessages((prev) => {
+        const key = chatStorageKey(groupId)
+        if (!prev[key]) return prev
+        return { ...prev, [key]: prev[key].filter((m) => String(m.id) !== String(id)) }
+      })
+      loadGroupsData(authToken) // it may have been the message the conversation list previews
+    })
 
     // Someone in the channel fired a soundboard clip — play it locally (replacing any current one).
     s.on('soundboard:play', ({ soundId, url }) => playSoundUrl(url, soundId))
@@ -2882,11 +3071,12 @@ export default function App() {
 
       // finally connect sockets with token
       connect(data.user.username, data.token)
-      const [loadedFriends, loadedConversations] = await Promise.all([
+      const [loadedFriends, loadedConversations, loadedGroups] = await Promise.all([
         loadFriendsData(data.token),
         loadMessagesData(data.token),
+        loadGroupsData(data.token),
       ])
-      restoreSavedView({ username: data.user.username, friendsList: loadedFriends, conversations: loadedConversations, groups: groupChats, authToken: data.token })
+      restoreSavedView({ username: data.user.username, friendsList: loadedFriends, conversations: loadedConversations, groups: loadedGroups, authToken: data.token })
     } catch (err) {
       setAuthError(err.message)
     } finally { setAuthLoading(false) }
@@ -3341,6 +3531,17 @@ export default function App() {
         clearChannelUnread(serverId, channelId)
         socketRef.current?.emit('channel:read', { serverId, channelId })
       }
+      const open = homeChatRef.current
+      if (serverId === 'home' && open?.type === 'group') {
+        setGroupUnread((prev) => {
+          if (!(open.id in prev)) return prev
+          const next = { ...prev }
+          delete next[open.id]
+          return next
+        })
+        const t = localStorage.getItem('lanparty_token')
+        if (t) fetch(`${SERVER_URL}/groups/${encodeURIComponent(open.id)}/read`, { method: 'POST', headers: { Authorization: `Bearer ${t}` } }).catch(() => {})
+      }
     }
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
@@ -3445,11 +3646,14 @@ export default function App() {
     try {
       const title = kind === 'dm'
         ? `💬 ${info.author}`
-        : `${mentioned ? '🔔' : '#'} ${info.channelName || 'channel'} · ${info.serverName || 'LAN Party'}`
+        : kind === 'group'
+          ? `👥 ${info.groupName || 'Group chat'}`
+          : `${mentioned ? '🔔' : '#'} ${info.channelName || 'channel'} · ${info.serverName || 'LAN Party'}`
       const body = kind === 'dm'
         ? (info.preview || 'New direct message')
         : `${info.author}: ${info.preview || 'New message'}`
-      const n = new Notification(title, { body, tag: `lanparty-${kind}-${info.serverId || 'dm'}-${info.channelId || info.author}`, silent: false })
+      const tag = kind === 'group' ? `lanparty-group-${info.groupId}` : `lanparty-${kind}-${info.serverId || 'dm'}-${info.channelId || info.author}`
+      const n = new Notification(title, { body, tag, silent: false })
       n.onclick = () => { window.focus(); n.close() }
     } catch (e) { /* some browsers throw for backgrounded pages — badge still updates */ }
   }
@@ -4454,12 +4658,14 @@ export default function App() {
       const participantId = String(participant?.id ?? participant?.name ?? `group-member-${index}`)
       const participantName = participant?.name || participant?.peerUsername
       if (!participantName || map.has(participantId)) return
+      const username = participant?.peerUsername || participantName
       map.set(participantId, {
         id: participantId,
         name: participantName,
-        // Carried so a group member can be privately messaged. Group chats are client-side only, so
-        // peerUsername is the one reliable handle here; the display name is the fallback.
-        username: participant?.peerUsername || participantName,
+        // Carried so a group member can be privately messaged or removed.
+        username,
+        role: username === activeGroupChat.ownerUsername ? 'owner' : 'member',
+        online: (participant?.status || 'offline') !== 'offline',
         isYou: participantName === name || participant?.peerUsername === name,
       })
     })
@@ -4501,6 +4707,7 @@ export default function App() {
     setShowNewChatModal(false)
     setNewChatSelectedIds([])
     setNewChatGroupName('')
+    setAddToGroupId(null)
   }
 
   const toggleNewChatUser = (id) => {
@@ -4529,33 +4736,107 @@ export default function App() {
     return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name))
   })()
 
-  const createNewChat = () => {
-    const selectedUsers = newChatSelectedIds
-      .map((id) => newChatUsers.find((user) => String(user.id) === String(id)))
-      .filter(Boolean)
-    if (selectedUsers.length === 0) return
-    setSelectedServerId('home')
-    setLeftNav('messages')
-    clearPendingAttachment()
+  const pickedNewChatUsers = () => newChatSelectedIds
+    .map((id) => newChatUsers.find((user) => String(user.id) === String(id)))
+    .filter(Boolean)
+
+  // One person opens a DM; two or more create a group chat on the server, which tells everyone in it.
+  const createNewChat = async () => {
+    if (addToGroupId) { addPeopleToGroup(); return }
+    const selectedUsers = pickedNewChatUsers()
+    if (selectedUsers.length === 0 || groupBusy) return
     if (selectedUsers.length === 1) {
+      setSelectedServerId('home')
+      setLeftNav('messages')
+      clearPendingAttachment()
       openPeerChat('dm', selectedUsers[0])
       closeNewChatModal()
       return
     }
-    const group = {
-      id: `group-${Date.now()}`,
-      name: newChatGroupName.trim(),
-      avatar: '#5865f2',
-      preview: `${selectedUsers.length} members`,
-      participants: selectedUsers,
+    setGroupBusy(true)
+    try {
+      const { group } = await groupRequest('POST', '/groups', {
+        name: newChatGroupName.trim(),
+        members: selectedUsers.map((u) => u.peerUsername || u.name),
+      })
+      const chat = upsertGroupChat(group)
+      setSelectedServerId('home')
+      setLeftNav('messages')
+      closeNewChatModal()
+      handleSelectGroup(chat)
+    } catch (err) {
+      setToast(err.message || "Couldn't create the group")
+    } finally {
+      setGroupBusy(false)
     }
-    setGroupChats((prev) => [group, ...prev])
-    setSelectedGroupId(group.id)
-    setSelectedFriendId(null)
-    setSelectedDmId(null)
-    setHomeChat({ type: 'group', id: group.id, name: group.name, participants: selectedUsers })
-    setHomeMessages((prev) => ({ ...prev, [group.id]: prev[group.id] || [] }))
-    closeNewChatModal()
+  }
+
+  // ---- Group chat management (members panel) ----
+  const openAddToGroup = (groupId) => {
+    setNewChatSelectedIds([])
+    setNewChatGroupName('')
+    setAddToGroupId(groupId)
+    setShowMembersPanel(false)
+    setShowNewChatModal(true)
+  }
+
+  const addPeopleToGroup = async () => {
+    const usernames = pickedNewChatUsers().map((u) => u.peerUsername || u.name)
+    if (!addToGroupId || usernames.length === 0 || groupBusy) return
+    setGroupBusy(true)
+    try {
+      const { group } = await groupRequest('POST', `/groups/${encodeURIComponent(addToGroupId)}/members`, { usernames })
+      upsertGroupChat(group)
+      closeNewChatModal()
+      setToast(`Added ${usernames.join(', ')}`)
+    } catch (err) {
+      setToast(err.message || "Couldn't add them")
+    } finally {
+      setGroupBusy(false)
+    }
+  }
+
+  const renameGroup = async (group) => {
+    if (!group) return
+    const next = await askPrompt({
+      title: 'Rename group',
+      label: 'Group name',
+      placeholder: 'Leave empty to use everyone’s names',
+      initial: group.rawName || '',
+      submitLabel: 'Save',
+    })
+    if (next === null || next === undefined) return
+    try {
+      const { group: updated } = await groupRequest('PATCH', `/groups/${encodeURIComponent(group.id)}`, { name: next })
+      upsertGroupChat(updated)
+    } catch (err) {
+      setToast(err.message || "Couldn't rename the group")
+    }
+  }
+
+  const leaveGroup = async (group) => {
+    if (!group) return
+    if (!window.confirm(`Leave ${group.name}? You won't see its messages any more unless someone adds you back.`)) return
+    const me = localStorage.getItem('lanparty_user') || name
+    leavingGroupsRef.current.add(String(group.id))
+    try {
+      await groupRequest('DELETE', `/groups/${encodeURIComponent(group.id)}/members/${encodeURIComponent(me)}`)
+      dropGroupChat(group.id)
+      setToast(`You left ${group.name}`)
+    } catch (err) {
+      leavingGroupsRef.current.delete(String(group.id))
+      setToast(err.message || "Couldn't leave the group")
+    }
+  }
+
+  const removeFromGroup = async (groupId, username) => {
+    if (!groupId || !username) return
+    if (!window.confirm(`Remove ${username} from this group?`)) return
+    try {
+      await groupRequest('DELETE', `/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(username)}`)
+    } catch (err) {
+      setToast(err.message || `Couldn't remove ${username}`)
+    }
   }
 
   const acceptPendingFile = (file) => {
@@ -4631,7 +4912,7 @@ export default function App() {
   const reactToHomeMessage = (messageId, emoji) => {
     if (!homeChat || !messageId) return
     const chatKey = chatStorageKey(homeChat.id)
-    // Optimistic update; DMs persist server-side (reaction:updated reconciles), groups stay local.
+    // Optimistic update; the server stores it and reaction:updated reconciles everyone's copy.
     setHomeMessages((prev) => ({
       ...prev,
       [chatKey]: (prev[chatKey] || []).map((message) =>
@@ -4640,6 +4921,8 @@ export default function App() {
     }))
     if ((homeChat.type === 'friend' || homeChat.type === 'dm') && socket) {
       socket.emit('reaction:toggle', { scope: 'dm', messageId, emoji })
+    } else if (homeChat.type === 'group' && socket) {
+      socket.emit('reaction:toggle', { scope: 'group', messageId, emoji })
     }
   }
 
@@ -4736,16 +5019,20 @@ export default function App() {
       ),
     }))
     showText(newText, true)
-    if (homeChat.type !== 'friend' && homeChat.type !== 'dm') return
+    const isGroup = homeChat.type === 'group'
+    if (!isGroup && homeChat.type !== 'friend' && homeChat.type !== 'dm') return
     try {
       const t = token || localStorage.getItem('lanparty_token')
-      const res = await fetch(`${SERVER_URL}/messages/${encodeURIComponent(messageId)}`, {
+      const url = isGroup
+        ? `${SERVER_URL}/groups/${encodeURIComponent(homeChat.id)}/messages/${encodeURIComponent(messageId)}`
+        : `${SERVER_URL}/messages/${encodeURIComponent(messageId)}`
+      const res = await fetch(url, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
         body: JSON.stringify({ text: newText }),
       })
       if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || "Couldn't save your edit") }
-      loadMessagesData() // the edited message may be the one the conversation list previews
+      if (!isGroup) loadMessagesData() // the edited message may be the one the conversation list previews
     } catch (err) {
       if (prior) showText(prior.text, !!prior.edited)
       setToast(err.message || "Couldn't save your edit")
@@ -4860,8 +5147,13 @@ export default function App() {
       }
       return
     }
-    // Group messages are local-only.
-    setHomeMessages((prev) => ({ ...prev, [chatKey]: (prev[chatKey] || []).filter((m) => String(m.id) !== String(messageId)) }))
+    if (homeChat.type !== 'group') return
+    try {
+      await groupRequest('DELETE', `/groups/${encodeURIComponent(homeChat.id)}/messages/${encodeURIComponent(messageId)}`)
+      setHomeMessages((prev) => ({ ...prev, [chatKey]: (prev[chatKey] || []).filter((m) => String(m.id) !== String(messageId)) }))
+    } catch (err) {
+      setToast(err.message || "Couldn't delete that message")
+    }
   }
 
   const openPeerChat = (type, item) => {
@@ -4905,11 +5197,13 @@ export default function App() {
   const handleSelectGroup = (group) => {
     pendingUnreadScrollRef.current = groupUnread[group.id] || 0
     setShowMembersPanel(false)
+    setMobileNavOpen(false) // reveal the conversation on phones, as DMs do
     clearPendingAttachment()
     setSelectedGroupId(group.id)
     setSelectedFriendId(null)
     setSelectedDmId(null)
     setHomeChat({ type: 'group', id: group.id, name: group.name })
+    loadGroupHistory(group.id)
     setGroupUnread((prev) => {
       if (!prev[group.id]) return prev
       const next = { ...prev }
@@ -4962,16 +5256,25 @@ export default function App() {
       }
       return
     }
-    const chatKey = homeChat.id
-    const msg = { id: `${chatKey}-${Date.now()}`, author: name || 'You', text: body, attachment, ts: Date.now(), quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined }
-    setHomeMessages((prev) => ({
-      ...prev,
-      [chatKey]: oldestMessagesFirst([...(prev[chatKey] || []), msg]),
-    }))
-    updateGroupConversationPreview(chatKey, msg)
-    setPendingQuotes([])
-    clearPendingAttachment()
-    setUploadingFile(false)
+    if (homeChat.type !== 'group') { setUploadingFile(false); return }
+    try {
+      const data = await groupRequest('POST', `/groups/${encodeURIComponent(homeChat.id)}/messages`, {
+        text: body,
+        attachment,
+        quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined,
+      })
+      // group:message brings the same message to this tab too; appendHomeMessage de-dupes by id.
+      appendHomeMessage(homeChat.id, data.message)
+      updateGroupConversationPreview(homeChat.id, data.message)
+      setPendingQuotes([])
+      clearPendingAttachment()
+    } catch (err) {
+      console.warn('sendHomeMessage (group)', err)
+      setUploadError(err.message)
+      setText(body)
+    } finally {
+      setUploadingFile(false)
+    }
   }
 
   const homeChatMessages = homeChat ? homeMessages[chatStorageKey(homeChat.id)] || [] : []
@@ -5751,6 +6054,7 @@ export default function App() {
         onFriendVoiceChat={(friend) => startCall(friend?.peerUsername || friend?.name, false)}
         onViewProfile={(person) => openMemberProfile(person?.peerUsername || person?.name)}
         onRemoveFriend={removeFriend}
+        onLeaveGroup={leaveGroup}
         askPrompt={askPrompt}
         savedHomeLayout={userSettings ? (userSettings.homeLayout ?? null) : undefined}
         onHomeLayoutChange={saveHomeLayout}
@@ -6575,9 +6879,14 @@ export default function App() {
       <div className={`auth-overlay ${showNewChatModal ? 'open' : ''}`} onClick={closeNewChatModal} />
       <NewChatModal
         open={showNewChatModal}
-        users={newChatUsers}
+        users={addToGroupId
+          ? newChatUsers.filter((u) => !(groupChats.find((g) => String(g.id) === String(addToGroupId))?.members || [])
+            .some((m) => m.name === (u.peerUsername || u.name)))
+          : newChatUsers}
         selectedIds={newChatSelectedIds}
         groupName={newChatGroupName}
+        addToGroupName={addToGroupId ? (groupChats.find((g) => String(g.id) === String(addToGroupId))?.name || 'this group') : null}
+        busy={groupBusy}
         onToggleUser={toggleNewChatUser}
         onGroupNameChange={setNewChatGroupName}
         onClose={closeNewChatModal}
@@ -6587,10 +6896,16 @@ export default function App() {
       <div className={`overlay ${showMembersPanel || showInstallPanel || showSignOutConfirm || showStatusMenu || showAddFriendModal ? 'open' : ''}`} onClick={() => { setShowMembersPanel(false); setShowInstallPanel(false); setShowSignOutConfirm(false); setShowStatusMenu(false); closeAddFriendModal() }} />
       <div className={`members-panel ${showMembersPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showMembersPanel}>
         <div className="members-panel-header">
-          <div>{isHomeView ? `${homeChat?.name || 'Group'} Members` : 'Server Members'} — {membersPanelUsers.length}</div>
+          <div>{isHomeView ? 'Members' : 'Server Members'} — {membersPanelUsers.length}</div>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             {!isHomeView && (serverState?.myRole === 'owner' || serverState?.myRole === 'admin') && currentServerId() !== 'demo' && (
               <button className="members-invite-btn" title="Invite people" onClick={() => openServerInvite(currentServerId(), serverState?.server?.name)}>+ Invite</button>
+            )}
+            {activeGroupChat && (
+              <>
+                <button className="members-invite-btn" title="Add people to this group" onClick={() => openAddToGroup(activeGroupChat.id)}>+ Add</button>
+                <button className="members-invite-btn" title="Rename this group" onClick={() => renameGroup(activeGroupChat)}>Rename</button>
+              </>
             )}
             <button className="members-close" onClick={() => setShowMembersPanel(false)}>✕</button>
           </div>
@@ -6617,7 +6932,7 @@ export default function App() {
                       {...(hasMenu ? longPressProps((e) => openMemberMenu(e, member, role, canManage)) : {})}
                       title={member.username ? `View ${member.name}'s profile${hasMenu ? ' — right-click for more' : ''}` : undefined}
                     >
-                      {!isHomeView && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
+                      {(!isHomeView || activeGroupChat) && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
                       <span className="members-panel-name">{member.name}{member.isYou ? ' (you)' : ''}</span>
                       {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
                       {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
@@ -6628,6 +6943,9 @@ export default function App() {
             </ul>
           ) : (
             <div style={{ color: '#9fb0bf', fontSize: 14 }}>No members found for this chat.</div>
+          )}
+          {activeGroupChat && (
+            <button type="button" className="members-leave-btn" onClick={() => leaveGroup(activeGroupChat)}>Leave group</button>
           )}
         </div>
       </div>
@@ -6648,6 +6966,9 @@ export default function App() {
             )}
             {memberMenu.canManage && (
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setMemberMenu(null); kickMember(memberMenu.username) }}>🚫 Remove from server</button>
+            )}
+            {activeGroupChat && activeGroupChat.ownerUsername === name && memberMenu.username !== name && (
+              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { const groupId = activeGroupChat.id; setMemberMenu(null); removeFromGroup(groupId, memberMenu.username) }}>🚫 Remove from group</button>
             )}
           </div>
         </>,

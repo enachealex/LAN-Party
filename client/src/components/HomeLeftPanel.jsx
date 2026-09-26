@@ -107,6 +107,7 @@ export default function HomeLeftPanel({
   onFriendVoiceChat,
   onViewProfile,
   onRemoveFriend,
+  onLeaveGroup,
   askPrompt,
   // Saved layout from the account: undefined until settings have loaded, null if nothing is saved.
   savedHomeLayout,
@@ -905,7 +906,17 @@ export default function HomeLeftPanel({
               Remove Friend
             </button>
           )}
-          {dmMenu.kind !== 'group' && <div className="dc-context-menu-sep" />}
+          {dmMenu.kind === 'group' && onLeaveGroup && (
+            <button
+              type="button"
+              role="menuitem"
+              className="dc-context-menu-danger"
+              onClick={() => { onLeaveGroup(dmMenu.item); setDmMenu(null) }}
+            >
+              Leave Group
+            </button>
+          )}
+          {(dmMenu.kind !== 'group' || onLeaveGroup) && <div className="dc-context-menu-sep" />}
           <div className="dc-context-menu-label">Move to section</div>
           {dmSections.map((section) => (
             <button

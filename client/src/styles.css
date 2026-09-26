@@ -906,6 +906,9 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .members-panel-list li{padding:0;border:none}
 .members-invite-btn{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text);font-size:12.5px;font-weight:700;padding:4px 10px;border-radius:7px;cursor:pointer}
 .members-invite-btn:hover{background:rgba(255,255,255,.08)}
+/* Group chats: leave sits under the member list, away from the everyday buttons in the header. */
+.members-leave-btn{display:block;width:100%;margin-top:14px;padding:8px 10px;background:transparent;border:1px solid rgba(242,63,67,.45);border-radius:8px;color:#f87171;font-size:13px;font-weight:700;cursor:pointer}
+.members-leave-btn:hover{background:rgba(242,63,67,.16);color:#ffb4b4}
 .members-panel-row{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:transparent;border:none;color:inherit;font:inherit;padding:8px 10px;border-radius:8px;cursor:pointer}
 .members-panel-row:hover{background:rgba(255,255,255,.06)}
 .members-panel-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}

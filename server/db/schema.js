@@ -210,6 +210,41 @@ const MIGRATIONS = [
       await addColumn(db, 'direct_messages', 'edited_at', 'INTEGER');
     },
   },
+  {
+    // Group chats: a named conversation between 3+ people, stored on the server like DMs (they used
+    // to exist only in the creator's browser tab). Ids are 'grp-…' strings so they can never collide
+    // with a DM's key (the peer's numeric user id) in the client's per-conversation maps.
+    // last_read_at is per member: unread = messages from others newer than it.
+    name: '0006_group_chats',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS group_chats (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        owner_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      )`);
+      await db.exec(`CREATE TABLE IF NOT EXISTS group_members (
+        group_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        joined_at INTEGER NOT NULL,
+        last_read_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (group_id, user_id)
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members (user_id)');
+      await db.exec(`CREATE TABLE IF NOT EXISTS group_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT NOT NULL,
+        sender_id INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attachment_json TEXT,
+        reactions_json TEXT,
+        quotes_json TEXT,
+        edited_at INTEGER
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages (group_id, created_at)');
+    },
+  },
 ];
 
 /**
