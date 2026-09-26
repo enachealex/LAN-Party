@@ -197,7 +197,7 @@ async function main() {
     fileFilter: (_req, file, cb) => cb(null, Object.hasOwn(TILE_ICON_TYPES, file.mimetype || '')),
   });
 
-  // Profile pictures. Larger cap than a tile because these aren't cropped client-side yet, but still
+  // Profile pictures. Larger cap than a tile: the client crops stills to 256px, but GIFs (kept animated) aren't cropped, and still
   // far below the general upload limit — an avatar renders at ~40px.
   const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
   const avatarUpload = multer({
@@ -1194,7 +1194,7 @@ async function main() {
       const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
       const messagesByChannel = {};
       for (const ch of channels) {
-        const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
+        const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
         messagesByChannel[ch.id] = msgs.map((m) => mapMessageRow(m, req.user.username));
       }
       result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
@@ -1258,7 +1258,7 @@ async function main() {
       if (firstText) {
         socket.join(`channel:${serverId}:${firstText.id}`);
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
         socket.emit('messages:init', { serverId, channelId: firstText.id, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
         await markChannelRead(socketUser, serverId, firstText.id); // history was just shown
       } else {
@@ -1278,7 +1278,7 @@ async function main() {
       socket.join(`channel:${serverId}:${channelId}`);
       socket.emit('channel:joined', { serverId, channelId });
       if (ch.type === 'text') {
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
+        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
         socket.emit('messages:init', { serverId, channelId, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
         socket.emit('pins:updated', { serverId, channelId, pins: await channelPins(serverId, channelId, socketUser) });
       }
@@ -1310,7 +1310,7 @@ async function main() {
       const cleanQuotes = sanitizeQuotes(quotes);
       const ts = Date.now();
       await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null, cleanQuotes ? JSON.stringify(cleanQuotes) : null);
-      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json FROM messages WHERE rowid = last_insert_rowid()');
+      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE rowid = last_insert_rowid()');
       // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
       io.to(`channel:${serverId}:${channelId}`).emit('message', { ...mapMessageRow(msgRow), serverId, channelId });
       await emitUnreadBump(serverId, channelId, ch.privacy, author, body);
@@ -1325,6 +1325,32 @@ async function main() {
       if (!row || row.author !== info.name) return; // not found or not the author
       await db.run('DELETE FROM messages WHERE id = ?', id);
       io.to(`channel:${row.server_id}:${row.channel_id}`).emit('message:deleted', { id });
+    });
+
+    // Edit a channel message — the author only, and only a text message (the client offers Edit on
+    // nothing else). Saved with edited_at so "(edited)" survives a reload, and broadcast so everyone
+    // in the channel sees the new text. `ack` tells the editor whether it stuck: their client shows
+    // the edit immediately and puts the old text back if the server refused it.
+    socket.on('message:edit', async ({ id, text } = {}, ack) => {
+      const reply = typeof ack === 'function' ? ack : () => {};
+      const body = typeof text === 'string' ? text.trim() : '';
+      const info = clients[socket.id];
+      if (!id || !info) return reply({ ok: false, error: 'bad-request' });
+      if (!body) return reply({ ok: false, error: 'empty' });
+      const row = await db.get('SELECT author, server_id, channel_id, attachment_json, pinned_at FROM messages WHERE id = ?', id);
+      if (!row) return reply({ ok: false, error: 'not-found' });
+      if (row.author !== info.name) return reply({ ok: false, error: 'not-author' });
+      if (row.attachment_json) return reply({ ok: false, error: 'has-attachment' });
+      const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", row.channel_id, row.server_id);
+      const myRole = await roleOf(row.server_id, socketUser);
+      if (!ch || !(await canAccessChannel(row.server_id, row.channel_id, socketUser, ch.privacy, myRole))) return reply({ ok: false, error: 'no-access' });
+      const editedAt = Date.now();
+      await db.run('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?', body, editedAt, id);
+      const room = `channel:${row.server_id}:${row.channel_id}`;
+      io.to(room).emit('message:edited', { id, text: body, editedAt, serverId: row.server_id, channelId: row.channel_id });
+      // A pinned message shows its text in the pin bar and the View Pins list, so refresh those too.
+      if (row.pinned_at) io.to(room).emit('pins:updated', { serverId: row.server_id, channelId: row.channel_id, pins: await channelPins(row.server_id, row.channel_id, socketUser) });
+      reply({ ok: true, editedAt });
     });
 
     // Pin / unpin a channel message. Any member who can see the channel may pin (party app). The

@@ -222,6 +222,8 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 .dc-context-menu{position:fixed;z-index:5001;min-width:140px;padding:6px;background:#111214;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.45);border:1px solid #1e1f22}
 .dc-context-menu button{display:block;width:100%;padding:8px 12px;border:none;border-radius:4px;background:transparent;color:#dbdee1;font-size:14px;text-align:left;cursor:pointer}
 .dc-context-menu button:hover{background:#404249;color:#fff}
+.dc-context-menu button.dc-context-menu-danger{color:#f87171}
+.dc-context-menu button.dc-context-menu-danger:hover{background:rgba(242,63,67,.2);color:#ffb4b4}
 .dc-context-menu-label{padding:4px 12px 6px;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#949ba4}
 .dc-context-menu-sep{height:1px;margin:4px 6px;background:#1e1f22}
 .dc-context-menu .dc-context-menu-accent{color:#2bc3ff}
@@ -712,6 +714,12 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 .members-panel{position:fixed;right:16px;top:72px;width:300px;bottom:16px;background:var(--sidebar-bg);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.6);transform:translateY(-8px);opacity:0;pointer-events:none;transition:all 160ms}
 .members-panel.open{transform:translateY(0);opacity:1;pointer-events:auto}
 .members-panel.install-panel{right:50%;transform:translate(50%, -8px);width:420px}
+.install-panel-body{display:flex;flex-direction:column;gap:8px;padding:12px}
+.install-option{display:flex;flex-direction:column;gap:3px;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);color:var(--text);text-decoration:none}
+.install-option:hover{border-color:var(--accent-end);background:rgba(255,255,255,.07)}
+.install-option-title{font-weight:700;font-size:14px}
+.install-option-desc{font-size:12px;color:var(--muted)}
+.install-panel-note{margin:4px 2px 0;font-size:12px;color:var(--muted)}
 .auth-modal.profile-settings-modal{width:520px;max-height:min(88vh,720px);padding:0;overflow:hidden;display:flex;flex-direction:column;z-index:9150}
 .profile-settings-header .members-close{font-size:28px;line-height:1;width:40px;height:40px;display:flex;align-items:center;justify-content:center;border-radius:8px}
 .profile-settings-header .members-close:hover{background:rgba(255,255,255,.08);color:var(--text)}
@@ -2228,7 +2236,9 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
    Square crop picker for rail tile images.
    ------------------------------------------------------------------------- */
 /* Two-class selector so it outranks the bare .auth-modal sizing regardless of rule order. */
-.auth-modal.crop-modal{width:min(92vw,380px);padding:0}
+.auth-modal.crop-modal{width:min(92vw,380px);padding:0;z-index:9300}
+/* Above the settings modal (9150): the profile-picture cropper opens from inside Settings. */
+.auth-overlay.crop-overlay{z-index:9250}
 .crop-modal-inner{padding:16px;display:flex;flex-direction:column;gap:12px}
 .crop-modal-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .crop-modal-title{font-weight:800;font-size:16px}

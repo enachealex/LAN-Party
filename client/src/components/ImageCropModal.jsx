@@ -34,7 +34,8 @@ function canvasToBlob(canvas) {
   })
 }
 
-export default function ImageCropModal({ open, file, title = 'Crop image', onCancel, onConfirm }) {
+// outputPx: side of the square that's produced (tiles default to 192; avatars ask for more).
+export default function ImageCropModal({ open, file, title = 'Crop image', hint = 'The square is what appears on the tile.', onCancel, onConfirm, outputPx = OUTPUT_PX }) {
   const [img, setImg] = useState(null)          // the loaded HTMLImageElement
   const [scale, setScale] = useState(1)
   const [offset, setOffset] = useState({ x: 0, y: 0 }) // crop-box-relative, in CSS px
@@ -112,18 +113,18 @@ export default function ImageCropModal({ open, file, title = 'Crop image', onCan
     setError(null)
     try {
       const canvas = document.createElement('canvas')
-      canvas.width = OUTPUT_PX
-      canvas.height = OUTPUT_PX
+      canvas.width = outputPx
+      canvas.height = outputPx
       const ctx = canvas.getContext('2d')
       if (!ctx) throw new Error('Canvas is unavailable')
       ctx.imageSmoothingQuality = 'high'
       // Screen -> output scale factor. The drawn image is centred in the frame, then shifted by the
       // pan offset; multiplying every on-screen length by this ratio reproduces exactly what's framed.
-      const k = OUTPUT_PX / frameSize
+      const k = outputPx / frameSize
       const drawW = cover.w * scale * k
       const drawH = cover.h * scale * k
-      const drawX = (OUTPUT_PX - drawW) / 2 + offset.x * k
-      const drawY = (OUTPUT_PX - drawH) / 2 + offset.y * k
+      const drawX = (outputPx - drawW) / 2 + offset.x * k
+      const drawY = (outputPx - drawH) / 2 + offset.y * k
       ctx.drawImage(img, drawX, drawY, drawW, drawH)
       const blob = await canvasToBlob(canvas)
       const ext = blob.type === 'image/webp' ? 'webp' : 'png'
@@ -139,7 +140,7 @@ export default function ImageCropModal({ open, file, title = 'Crop image', onCan
 
   return (
     <>
-      <div className="auth-overlay open" onClick={onCancel} />
+      <div className="auth-overlay open crop-overlay" onClick={onCancel} />
       <div className="auth-modal crop-modal open" role="dialog" aria-modal="true" aria-label={title}>
         <div className="crop-modal-inner">
           <div className="crop-modal-head">
@@ -187,7 +188,7 @@ export default function ImageCropModal({ open, file, title = 'Crop image', onCan
             />
           </label>
 
-          <div className="crop-modal-hint">Drag to reposition. The square is what appears on the tile.</div>
+          <div className="crop-modal-hint">Drag to reposition. {hint}</div>
           {error && <div className="crop-modal-error">{error}</div>}
 
           <div className="crop-modal-actions">

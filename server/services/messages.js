@@ -88,6 +88,8 @@ function createMessages({ db }) {
       attachment: parseAttachment(row.attachment_json),
       reactions: formatReactions(parseReactions(row.reactions_json), forUsername),
       quotes: parseQuotes(row.quotes_json),
+      edited: !!row.edited_at,
+      editedAt: row.edited_at || null,
       pinnedAt: row.pinned_at || null,
       pinnedBy: row.pinned_by || null,
     };
@@ -96,7 +98,7 @@ function createMessages({ db }) {
   // Pinned messages of a channel, newest pin first (so pins[0] is what the pinned bar shows).
   async function channelPins(serverId, channelId, forUsername) {
     const rows = await db.all(
-      'SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
+      'SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
       serverId, channelId
     );
     return (rows || []).map((m) => mapMessageRow(m, forUsername));

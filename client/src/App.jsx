@@ -41,8 +41,8 @@ import { SfuSession } from './sfu'
 // same origin (the server serves the client), so it "just works" behind one domain. Override with
 // VITE_SERVER_URL at build time to point at a separate API host.
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? (import.meta.env.DEV ? 'http://localhost:3000' : '')
-// Reported in feedback/bug diagnostics. Override at build time with VITE_APP_VERSION.
-const APP_VERSION = import.meta.env.VITE_APP_VERSION || '1.2.0'
+// Reported in feedback/bug diagnostics: the git commit + build date, stamped by vite.config.js.
+const APP_VERSION = import.meta.env.VITE_APP_VERSION || 'unknown'
 const VOICE_TILES_PER_PAGE = 8 // max participant tiles per gallery page before paging kicks in
 const MAX_FILE_SIZE = 100 * 1024 * 1024
 const MESSAGE_REACTIONS = ['👍', '❤️', '😂', '😮', '🙏']
@@ -1026,6 +1026,8 @@ export default function App() {
   // Custom rail tile image being chosen: { target, file }. `target` is { kind: 'home' } or
   // { kind: 'server', id, name }; `file` is the picked original, cropped in the modal before upload.
   const [tileCrop, setTileCrop] = useState(null)
+  // A picked profile picture waiting in the square cropper (null = cropper closed).
+  const [avatarCrop, setAvatarCrop] = useState(null)
   const tileFileInputRef = useRef(null)
   const tileTargetRef = useRef(null) // survives the trip out to the OS file dialog and back
   const [memberMenu, setMemberMenu] = useState(null) // right-click manage menu: { x, y, username, name, role }
@@ -2206,6 +2208,16 @@ export default function App() {
     }
   }
 
+  // A picked picture goes through the square cropper first, so it's framed the way the user wants
+  // instead of being centre-cropped by CSS. Two exceptions go straight to the upload: a GIF (a canvas
+  // crop would freeze an animated avatar into one frame) and anything that isn't an image (the upload
+  // path already explains why it's refused).
+  const pickProfileAvatar = (file) => {
+    if (!file) return
+    if (!file.type.startsWith('image/') || file.type === 'image/gif') { uploadProfileAvatar(file); return }
+    setAvatarCrop(file)
+  }
+
   // ---- Private messages from a member list ----
 
   const openPrivateMessage = (target) => {
@@ -2717,6 +2729,26 @@ export default function App() {
 
     // A channel message was deleted by its author — remove it for everyone.
     s.on('message:deleted', ({ id }) => setMessages((prev) => prev.filter((m) => String(m.id) !== String(id))))
+    // A channel message was edited (by its author, perhaps in another window) — show the new text.
+    s.on('message:edited', ({ id, text }) => setMessages((prev) =>
+      prev.map((m) => (String(m.id) === String(id) ? { ...m, text, edited: true } : m))
+    ))
+    // A DM was edited — update it in whichever conversation holds it, and refresh the previews.
+    s.on('dm:message-edited', ({ id, text }) => {
+      setHomeMessages((prev) => {
+        let changed = false
+        const next = {}
+        for (const key of Object.keys(prev)) {
+          next[key] = prev[key].map((m) => {
+            if (String(m.id) !== String(id)) return m
+            changed = true
+            return { ...m, text, edited: true }
+          })
+        }
+        return changed ? next : prev
+      })
+      loadMessagesData(authToken)
+    })
     // A DM was deleted — drop that message id from any conversation it appears in.
     s.on('dm:message-deleted', ({ id }) => setHomeMessages((prev) => {
       let changed = false
@@ -3719,6 +3751,28 @@ export default function App() {
     }
   }
 
+  // The Friends/Messages layout (sections, what's in them, manual order) is saved to the account so it
+  // survives reloads and follows you between devices. HomeLeftPanel debounces the calls.
+  const saveHomeLayout = (homeLayout) => {
+    setUserSettings((prev) => ({ ...(prev || {}), homeLayout }))
+    patchUserSettings({ homeLayout })
+  }
+
+  // Remove a friend (both sides). The server then sends friend:list-updated to both of you, which
+  // refreshes the friend and conversation lists. Message history is kept on the server.
+  const removeFriend = async (friend) => {
+    const username = friend?.peerUsername || friend?.name
+    if (!username) return
+    if (!window.confirm(`Remove ${username} from your friends? You can send them a new request later.`)) return
+    try {
+      const res = await authedFetch(`/friends/${encodeURIComponent(username)}`, { method: 'DELETE' })
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || 'Could not remove friend') }
+      setToast(`Removed ${username} from your friends`)
+    } catch (err) {
+      setToast(err.message || 'Could not remove friend')
+    }
+  }
+
   // Watch/Discover: open the panel (and refresh the list) / jump into a stream's voice channel.
   const openDiscover = () => { setShowDiscover(true); socketRef.current?.emit('discover:list') }
   const watchStream = (s) => { setShowDiscover(false); joinVoiceChannel((s && s.channelId) || 'voice1', s && s.serverId) }
@@ -4668,22 +4722,49 @@ export default function App() {
     }
   }
 
-  const editHomeMessage = (messageId, newText) => {
+  // Edits show straight away and are then saved on the server, which tells everyone else. If the
+  // server refuses (or never answers), the old text comes back and the user is told — an edit that
+  // silently exists only on your own screen is exactly what this used to be.
+  const editHomeMessage = async (messageId, newText) => {
     if (!homeChat || !messageId) return
     const chatKey = chatStorageKey(homeChat.id)
-    setHomeMessages((prev) => ({
+    const prior = (homeMessages[chatKey] || []).find((m) => String(m.id) === String(messageId))
+    const showText = (text, edited) => setHomeMessages((prev) => ({
       ...prev,
       [chatKey]: (prev[chatKey] || []).map((m) =>
-        String(m.id) === String(messageId) ? { ...m, text: newText, edited: true } : m
+        String(m.id) === String(messageId) ? { ...m, text, edited } : m
       ),
     }))
+    showText(newText, true)
+    if (homeChat.type !== 'friend' && homeChat.type !== 'dm') return
+    try {
+      const t = token || localStorage.getItem('lanparty_token')
+      const res = await fetch(`${SERVER_URL}/messages/${encodeURIComponent(messageId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+        body: JSON.stringify({ text: newText }),
+      })
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || "Couldn't save your edit") }
+      loadMessagesData() // the edited message may be the one the conversation list previews
+    } catch (err) {
+      if (prior) showText(prior.text, !!prior.edited)
+      setToast(err.message || "Couldn't save your edit")
+    }
   }
 
   const editChannelMessage = (messageId, newText) => {
-    if (!messageId) return
-    setMessages((prev) =>
-      prev.map((m) => (String(m.id) === String(messageId) ? { ...m, text: newText, edited: true } : m))
+    if (!messageId || !socket) return
+    const prior = messages.find((m) => String(m.id) === String(messageId))
+    if (!prior) return
+    const showText = (text, edited) => setMessages((prev) =>
+      prev.map((m) => (String(m.id) === String(messageId) ? { ...m, text, edited } : m))
     )
+    showText(newText, true)
+    socket.timeout(8000).emit('message:edit', { id: messageId, text: newText }, (err, res) => {
+      if (!err && res && res.ok) return
+      showText(prior.text, !!prior.edited)
+      setToast("Couldn't save your edit")
+    })
   }
 
   // Delete a channel message (server verifies ownership, then broadcasts message:deleted).
@@ -4901,11 +4982,15 @@ export default function App() {
     for (const c of customEmojis) map[c.name] = c.url // personal takes precedence
     return map
   })()
+  // On Home with no conversation open there is no channel to name — the last server channel is
+  // still in state, but its server isn't loaded, so it would show as a raw channel id.
   const topbarChannelLabel = showHomeChat
     ? homeChat.type === 'group'
       ? homeChat.name
       : `@ ${homeChat.name}`
-    : `# ${activeChannelName}`
+    : isHomeView
+      ? 'Home'
+      : `# ${activeChannelName}`
   const topbarServerLabel = showHomeChat
     ? homeChat.type === 'group'
       ? 'Group Message'
@@ -5614,6 +5699,16 @@ export default function App() {
         onConfirm={uploadTileImage}
       />
 
+      <ImageCropModal
+        open={!!avatarCrop}
+        file={avatarCrop}
+        title="Crop your profile picture"
+        hint="Everyone sees this square, shown as a circle."
+        outputPx={256}
+        onCancel={() => setAvatarCrop(null)}
+        onConfirm={async (cropped) => { await uploadProfileAvatar(cropped); setAvatarCrop(null) }}
+      />
+
       {showInstallGate && (
         <MobileInstallGate
           deferredPrompt={deferredPrompt}
@@ -5655,6 +5750,10 @@ export default function App() {
         onCreateMessage={openNewChatModal}
         onFriendVoiceChat={(friend) => startCall(friend?.peerUsername || friend?.name, false)}
         onViewProfile={(person) => openMemberProfile(person?.peerUsername || person?.name)}
+        onRemoveFriend={removeFriend}
+        askPrompt={askPrompt}
+        savedHomeLayout={userSettings ? (userSettings.homeLayout ?? null) : undefined}
+        onHomeLayoutChange={saveHomeLayout}
         friends={friends}
         pendingFriendRequests={pendingFriendRequests}
         pendingFriendCount={pendingFriendCount}
@@ -5882,7 +5981,7 @@ export default function App() {
                   <>
                     <div className="video-stage-wrap">
                       {activity ? (
-                        <ActivityPanel activity={activity} me={name} onEvent={sendActivityEvent} onClose={closeActivity} />
+                        <ActivityPanel activity={activity} me={name} onEvent={sendActivityEvent} onClose={closeActivity} askPrompt={askPrompt} />
                       ) : (
                         <>
                           <div className="video-stage" ref={videoStageRef} style={{ gridTemplateColumns: `repeat(${voiceGrid.cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${voiceGrid.rows}, minmax(0, 1fr))` }}>
@@ -7021,13 +7120,16 @@ export default function App() {
           <div>Install LAN Party</div>
           <button className="members-close" onClick={() => setShowInstallPanel(false)}>✕</button>
         </div>
-        <div className="members-panel-body">
-          <p>If your browser supports Progressive Web Apps, you can install LAN Party from the browser install option. You can also use the native Windows desktop app when available.</p>
-          <p>Options:</p>
-          <ul>
-            <li>Install as PWA (use browser menu or the prompt)</li>
-            <li>Use the native desktop installer if you already have it</li>
-          </ul>
+        <div className="members-panel-body install-panel-body">
+          <a className="install-option" href={`${SERVER_URL}/downloads/LAN-Party-Setup.exe`} download>
+            <span className="install-option-title">⬇ Windows app</span>
+            <span className="install-option-desc">Windows 10 &amp; 11. Updates itself, keeps calls going from the tray.</span>
+          </a>
+          <a className="install-option" href={`${SERVER_URL}/downloads/LAN-Party.apk`} download>
+            <span className="install-option-title">⬇ Android app</span>
+            <span className="install-option-desc">Android 5+. Open the file once it downloads, and allow installs from your browser if asked.</span>
+          </a>
+          <p className="install-panel-note">Or install it from your browser: look for “Install app” in the address bar or the browser menu.</p>
         </div>
       </div>
 
@@ -7125,7 +7227,7 @@ export default function App() {
             <div className="profile-edit-row">
               <button type="button" className="connect-btn" onClick={() => profileAvatarInputRef.current?.click()}>Upload image / GIF</button>
               {editingProfile.avatarUrl && <button type="button" className="profile-link-btn" onClick={() => updateProfileDraft({ avatarUrl: '' })}>Remove</button>}
-              <input ref={profileAvatarInputRef} type="file" accept="image/*" className="file-input" onChange={(e) => { uploadProfileAvatar(e.target.files?.[0]); if (e.target) e.target.value = '' }} />
+              <input ref={profileAvatarInputRef} type="file" accept="image/*" className="file-input" onChange={(e) => { pickProfileAvatar(e.target.files?.[0]); if (e.target) e.target.value = '' }} />
             </div>
             <div className="profile-edit-row">
               <input

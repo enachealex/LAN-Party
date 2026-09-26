@@ -25,7 +25,7 @@ function ytId(input) {
   return m ? m[1] : null
 }
 
-export default function ActivityPanel({ activity, me, onEvent, onClose }) {
+export default function ActivityPanel({ activity, me, onEvent, onClose, askPrompt }) {
   if (!activity) return null
   const { type, state, by } = activity
   const meta = ACTIVITY_TYPES.find((a) => a.id === type)
@@ -36,7 +36,7 @@ export default function ActivityPanel({ activity, me, onEvent, onClose }) {
         <button type="button" className="activity-close" onClick={onClose} title={`End ${meta?.label || 'this'} for everyone`} aria-label="End for everyone">✕ End</button>
       </div>
       <div className="activity-body">
-        {type === 'music' && <MusicActivity state={state} me={me} onEvent={onEvent} />}
+        {type === 'music' && <MusicActivity state={state} me={me} onEvent={onEvent} askPrompt={askPrompt} />}
         {type === 'movie' && <MovieNight state={state} onEvent={onEvent} />}
         {type === 'watch' && <WatchTogether state={state} onEvent={onEvent} />}
         {type === 'whiteboard' && <Whiteboard state={state} onEvent={onEvent} />}
@@ -60,7 +60,7 @@ const fmtTime = (secs) => {
 const SPOTIFY_LS_KEY = 'lanparty_spotify'
 const readSpotifyToken = () => { try { return JSON.parse(localStorage.getItem(SPOTIFY_LS_KEY) || 'null') } catch { return null } }
 
-function MusicActivity({ state, me, onEvent }) {
+function MusicActivity({ state, me, onEvent, askPrompt }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState(null) // null = nothing searched yet
   const [searching, setSearching] = useState(false)
@@ -248,7 +248,8 @@ function MusicActivity({ state, me, onEvent }) {
   // ---- Playlists ----
   const saveQueueAsPlaylist = async () => {
     if (!state.queue.length) return
-    const name = (window.prompt('Playlist name:') || '').trim()
+    // askPrompt is App's in-app dialog — window.prompt does nothing in the desktop app.
+    const name = ((await askPrompt?.({ title: 'Save playlist', label: 'Playlist name', placeholder: 'e.g. Friday night', submitLabel: 'Save' })) || '').trim()
     if (!name) return
     try {
       const r = await fetch(`${SERVER_URL}/music/playlists`, {

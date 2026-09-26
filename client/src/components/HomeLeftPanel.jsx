@@ -65,6 +65,35 @@ function normalizeLayout(items) {
   return [...navs, ...sections]
 }
 
+// Turn a stored home layout (account settings, so possibly old, partial or hand-edited) back into
+// valid state. Anything malformed is dropped rather than trusted; the built-in nav items are always
+// present, and a conversation can only point at a section that still exists.
+function restoreHomeLayout(saved) {
+  const s = saved && typeof saved === 'object' ? saved : {}
+  const isStr = (v) => typeof v === 'string' && v.length > 0 && v.length < 200
+  const known = new Set(defaultLayout().map((i) => i.id))
+  let layout = Array.isArray(s.layout)
+    ? s.layout.filter((i) => i && (i.type === 'nav' ? known.has(i.id) : i.type === 'section' && isStr(i.id)))
+    : []
+  for (const nav of defaultLayout()) if (!layout.some((i) => i.type === 'nav' && i.id === nav.id)) layout.push(nav)
+  layout = normalizeLayout(layout)
+  const dmSections = Array.isArray(s.dmSections)
+    ? s.dmSections.filter((x) => x && isStr(x.id) && isStr(x.name)).map((x) => ({ id: x.id, name: x.name.slice(0, 60) }))
+    : []
+  const sectionIds = new Set(dmSections.map((x) => x.id))
+  const dmSectionMap = {}
+  if (s.dmSectionMap && typeof s.dmSectionMap === 'object') {
+    for (const [conv, sec] of Object.entries(s.dmSectionMap)) if (isStr(conv) && sectionIds.has(sec)) dmSectionMap[conv] = sec
+  }
+  const dmOrder = {}
+  if (s.dmOrder && typeof s.dmOrder === 'object') {
+    for (const [bucket, ids] of Object.entries(s.dmOrder)) {
+      if (isStr(bucket) && Array.isArray(ids)) dmOrder[bucket] = ids.filter(isStr)
+    }
+  }
+  return { layout, dmSections, dmSectionMap, dmOrder }
+}
+
 export default function HomeLeftPanel({
   activeNav = 'friends',
   onNavChange,
@@ -77,6 +106,11 @@ export default function HomeLeftPanel({
   onCreateMessage,
   onFriendVoiceChat,
   onViewProfile,
+  onRemoveFriend,
+  askPrompt,
+  // Saved layout from the account: undefined until settings have loaded, null if nothing is saved.
+  savedHomeLayout,
+  onHomeLayoutChange,
   friends = [],
   pendingFriendRequests = [],
   pendingFriendCount = 0,
@@ -115,6 +149,36 @@ export default function HomeLeftPanel({
   const [pendingOrder, setPendingOrder] = useState([])
   const [pendingDragIndex, setPendingDragIndex] = useState(null)
   const [pendingDragOverIndex, setPendingDragOverIndex] = useState(null)
+
+  // The layout (nav order, sections, which conversation sits in which, manual ordering) is saved to
+  // the account, so it survives a reload and follows you to other devices. Load it once, when
+  // settings arrive; save nothing before then, or these defaults would overwrite what's stored.
+  const hydratedRef = useRef(false)
+  const lastSavedRef = useRef(null)
+  const saveLayoutRef = useRef(onHomeLayoutChange)
+  saveLayoutRef.current = onHomeLayoutChange
+  useEffect(() => {
+    if (hydratedRef.current || savedHomeLayout === undefined) return
+    hydratedRef.current = true
+    const restored = restoreHomeLayout(savedHomeLayout)
+    setLayout(restored.layout)
+    setDmSections(restored.dmSections)
+    setDmSectionMap(restored.dmSectionMap)
+    setDmOrder(restored.dmOrder)
+    lastSavedRef.current = JSON.stringify(restored)
+  }, [savedHomeLayout])
+  useEffect(() => {
+    if (!hydratedRef.current) return
+    const snapshot = JSON.stringify({ layout, dmSections, dmSectionMap, dmOrder })
+    if (snapshot === lastSavedRef.current) return
+    // Debounced: a drag or a burst of moves becomes one save. The callback is read from a ref so an
+    // App re-render (which gives it a new identity) doesn't keep restarting the timer.
+    const timer = setTimeout(() => {
+      lastSavedRef.current = snapshot
+      saveLayoutRef.current?.(JSON.parse(snapshot))
+    }, 600)
+    return () => clearTimeout(timer)
+  }, [layout, dmSections, dmSectionMap, dmOrder])
 
   useEffect(() => {
     const ids = pendingFriendRequests.map((r) => r.id)
@@ -248,17 +312,21 @@ export default function HomeLeftPanel({
     },
   })
 
-  const createDmSectionAndMove = (conversationId) => {
-    const name = window.prompt('New section name', 'New Section')
-    if (!name?.trim()) { setDmMenu(null); return }
+  // askPrompt is App's in-app dialog — window.prompt does nothing in the desktop app.
+  const askSectionName = () => askPrompt?.({ title: 'New section', label: 'Section name', initial: 'New Section', submitLabel: 'Create' })
+
+  const createDmSectionAndMove = async (conversationId) => {
+    setDmMenu(null)
+    const name = await askSectionName()
+    if (!name?.trim()) return
     const id = `dmsec-${Date.now()}`
     setDmSections((prev) => [...prev, { id, name: name.trim() }])
     moveConversationToSection(conversationId, id)
   }
 
   // Create an empty conversation section (drag people/chats into it afterwards).
-  const createConversationSection = () => {
-    const name = window.prompt('New section name', 'New Section')
+  const createConversationSection = async () => {
+    const name = await askSectionName()
     if (!name?.trim()) return
     setDmSections((prev) => [...prev, { id: `dmsec-${Date.now()}`, name: name.trim() }])
   }
@@ -595,10 +663,21 @@ export default function HomeLeftPanel({
     )
   }
 
-  // Render any draggable entry (dm / group / friend) using the right row renderer.
+  const friendById = (id) => friends.find((f) => String(f.id) === String(id))
+  // The friend behind the open context menu: the row itself, or the peer of a DM row, so a DM with
+  // a friend still offers Voice Chat and Remove Friend.
+  const menuFriend = !dmMenu || dmMenu.kind === 'group' ? null : (dmMenu.kind === 'friend' ? dmMenu.item : friendById(dmMenu.id))
+
+  // Render any draggable entry (dm / group / friend) using the right row renderer. A friend you
+  // also have a DM with is one entry keyed by the same id, stored as the DM; in the Friends panel
+  // it should still look and act like a friend (status, tags, friend menu), not a conversation.
   const renderEntry = (entry) => {
     if (entry.kind === 'group') return renderMessageRow(entry.item, onSelectGroup, selectedGroupId === entry.item.id, 'group')
     if (entry.kind === 'friend') return renderFriendRow(entry.item)
+    if (activeNav === 'friends') {
+      const friend = friendById(entry.item.id)
+      if (friend) return renderFriendRow(friend)
+    }
     return renderMessageRow(entry.item, onSelectDm, String(selectedDmId) === String(entry.item.id), 'dm')
   }
 
@@ -789,22 +868,22 @@ export default function HomeLeftPanel({
           onMouseDown={(e) => e.stopPropagation()}
         >
           {dmMenu.kind === 'friend' && (
-            <>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { onSelectFriend?.(dmMenu.item); setDmMenu(null) }}
-              >
-                Send Message
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { onFriendVoiceChat?.(dmMenu.item); setDmMenu(null) }}
-              >
-                Voice Chat
-              </button>
-            </>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => { onSelectFriend?.(dmMenu.item); setDmMenu(null) }}
+            >
+              Send Message
+            </button>
+          )}
+          {menuFriend && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => { onFriendVoiceChat?.(menuFriend); setDmMenu(null) }}
+            >
+              Voice Chat
+            </button>
           )}
           {/* Profiles are per-person, so groups (no single peer) don't get this item. */}
           {(dmMenu.kind === 'friend' || dmMenu.kind === 'dm') && (
@@ -814,6 +893,16 @@ export default function HomeLeftPanel({
               onClick={() => { onViewProfile?.(dmMenu.item); setDmMenu(null) }}
             >
               View Profile
+            </button>
+          )}
+          {menuFriend && onRemoveFriend && (
+            <button
+              type="button"
+              role="menuitem"
+              className="dc-context-menu-danger"
+              onClick={() => { onRemoveFriend(menuFriend); setDmMenu(null) }}
+            >
+              Remove Friend
             </button>
           )}
           {dmMenu.kind !== 'group' && <div className="dc-context-menu-sep" />}

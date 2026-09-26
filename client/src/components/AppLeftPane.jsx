@@ -168,6 +168,10 @@ export default function AppLeftPane({
   onCreateMessage,
   onFriendVoiceChat,
   onViewProfile,
+  onRemoveFriend,
+  askPrompt,
+  savedHomeLayout,
+  onHomeLayoutChange,
   friends = [],
   pendingFriendRequests = [],
   pendingFriendCount = 0,
@@ -238,6 +242,15 @@ export default function AppLeftPane({
   const openCtxMenu = (e, item) => {
     e.preventDefault()
     setCtxMenu({ x: Math.min(e.clientX, window.innerWidth - 180), y: Math.min(e.clientY, window.innerHeight - 110), ...item })
+  }
+  // What the server menu needs to know about a server (its right-click menu and the header dropdown).
+  const serverMenuItem = (s) => ({ kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl })
+  // The server-name header opens the same menu as right-clicking the server's tile, just below itself.
+  const openServerHeaderMenu = (e) => {
+    const s = servers.find((sv) => sv.id === selectedServerId)
+    if (!s) return
+    const r = e.currentTarget.getBoundingClientRect()
+    openCtxMenu({ preventDefault() {}, clientX: r.left + 8, clientY: r.bottom + 4 }, serverMenuItem(s))
   }
   // Close the status dropdown (Available/Busy/…) on an outside click or Escape. The menu + its
   // trigger button live inside userPanelRef, so clicking the trigger just toggles (its own handler)
@@ -325,8 +338,8 @@ export default function AppLeftPane({
             voiceActive={inVoice && voiceRailTarget === s.id}
             badge={serverUnreadTotals[s.id] || 0}
             onClick={() => onSelectServer?.(s.id)}
-            onContextMenu={(e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl })}
-            longPress={longPressProps((e) => openCtxMenu(e, { kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl }))}
+            onContextMenu={(e) => openCtxMenu(e, serverMenuItem(s))}
+            longPress={longPressProps((e) => openCtxMenu(e, serverMenuItem(s)))}
             {...voiceTileProps}
           >
             {/* A server icon is shared by every member; without one the tile falls back to initials. */}
@@ -358,7 +371,7 @@ export default function AppLeftPane({
           {variant === 'server' ? (
             <>
               <div className="dc-server-header">
-                <button type="button" className="dc-server-header-btn" aria-haspopup="listbox">
+                <button type="button" className="dc-server-header-btn" aria-haspopup="menu" aria-expanded={ctxMenu?.kind === 'server' && ctxMenu.id === selectedServerId} onClick={openServerHeaderMenu}>
                   <span>{serverName}</span>
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                     <path d="M7 10l5 5 5-5H7z" />
@@ -504,6 +517,10 @@ export default function AppLeftPane({
               onCreateMessage={onCreateMessage}
               onFriendVoiceChat={onFriendVoiceChat}
               onViewProfile={onViewProfile}
+              onRemoveFriend={onRemoveFriend}
+              askPrompt={askPrompt}
+              savedHomeLayout={savedHomeLayout}
+              onHomeLayoutChange={onHomeLayoutChange}
               friends={friends}
               pendingFriendRequests={pendingFriendRequests}
               pendingFriendCount={pendingFriendCount}

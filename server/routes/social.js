@@ -171,8 +171,8 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     // Tell the ORIGINAL SENDER specifically that their request was accepted. friend:list-updated
     // can't serve this: it goes to BOTH parties (so the accepter would also get a "you have a new
     // friend" celebration on top of their own click) and it carries no payload, so there'd be no
-    // name for the toast. Keeping it separate also stays correct if a future unfriend/remove path
-    // starts emitting friend:list-updated too.
+    // name for the toast. Keeping it separate also keeps it correct now that removing a friend
+    // (DELETE /friends/:username) emits friend:list-updated too.
     io.to(`user:${fr.fromUsername}`).emit('friend:request-accepted', { by: me.username });
     return res.json({ success: true });
   });
@@ -187,6 +187,29 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     if (fr.status !== 'pending') return res.status(400).json({ error: 'Request is not pending' });
     await db.run('UPDATE friend_requests SET status = ? WHERE id = ?', 'declined', requestId);
     await emitPendingUpdate(me.username);
+    return res.json({ success: true });
+  });
+
+  // Remove a friend. The friendship goes both ways, and so do the old requests between you: an
+  // accepted request stays in friend_requests, which is UNIQUE per direction, so leaving it would
+  // make a fresh request from the same person fail later. Message history is kept — become friends
+  // again and it's all still there.
+  app.delete('/friends/:username', authMiddleware, async (req, res) => {
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const other = await getUserByUsername(String(req.params.username || '').trim());
+    if (!other) return res.status(404).json({ error: 'User not found' });
+    if (!(await areFriends(me.id, other.id))) return res.status(404).json({ error: 'You are not friends' });
+    await db.run(
+      'DELETE FROM friendships WHERE (user_id = ? AND friend_user_id = ?) OR (user_id = ? AND friend_user_id = ?)',
+      me.id, other.id, other.id, me.id
+    );
+    await db.run(
+      'DELETE FROM friend_requests WHERE (from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?)',
+      me.id, other.id, other.id, me.id
+    );
+    await emitFriendsListUpdate(me.username);
+    await emitFriendsListUpdate(other.username);
     return res.json({ success: true });
   });
 
@@ -253,7 +276,7 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
       await emitDmUnreadUpdate(me.username);
     }
     const rows = await db.all(
-      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, s.username AS author
+      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, dm.edited_at, s.username AS author
        FROM direct_messages dm
        JOIN users s ON s.id = dm.sender_id
        WHERE (dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)
@@ -314,7 +337,7 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
       cleanQuotes ? JSON.stringify(cleanQuotes) : null
     );
     const row = await db.get(
-      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, s.username AS author
+      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, dm.edited_at, s.username AS author
        FROM direct_messages dm
        JOIN users s ON s.id = dm.sender_id
        WHERE dm.id = ?`,
@@ -329,6 +352,28 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     await emitDmUnreadUpdate(peer.username);
     await emitDmUnreadUpdate(me.username);
     return res.json({ success: true, message: msg });
+  });
+
+  // Edit a direct message — the sender only, and only a text message. Both participants are told, so
+  // the conversation updates live on either side (and in the sender's other open windows).
+  app.patch('/messages/:id', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid message id' });
+    const body = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (!body) return res.status(400).json({ error: 'A message needs some text' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const dm = await db.get('SELECT sender_id, recipient_id, attachment_json FROM direct_messages WHERE id = ?', id);
+    if (!dm) return res.status(404).json({ error: 'Message not found' });
+    if (dm.sender_id !== me.id) return res.status(403).json({ error: 'You can only edit your own messages' });
+    if (dm.attachment_json) return res.status(400).json({ error: "Messages with an attachment can't be edited" });
+    const editedAt = Date.now();
+    await db.run('UPDATE direct_messages SET body = ?, edited_at = ? WHERE id = ?', body, editedAt, id);
+    const recipient = await db.get('SELECT username FROM users WHERE id = ?', dm.recipient_id);
+    const payload = { id, text: body, editedAt };
+    io.to(`user:${me.username}`).emit('dm:message-edited', payload);
+    if (recipient) io.to(`user:${recipient.username}`).emit('dm:message-edited', payload);
+    return res.json({ success: true, ...payload });
   });
 
   // Delete a direct message — only the sender may delete it. Notify both participants.

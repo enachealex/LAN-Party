@@ -201,6 +201,15 @@ const MIGRATIONS = [
       await addColumn(db, 'servers', 'icon_url', 'TEXT');
     },
   },
+  {
+    // When a message was last edited (ms), NULL if never. Lets "(edited)" survive a reload and tells
+    // other clients the text they have is stale.
+    name: '0005_message_edits',
+    up: async (db) => {
+      await addColumn(db, 'messages', 'edited_at', 'INTEGER');
+      await addColumn(db, 'direct_messages', 'edited_at', 'INTEGER');
+    },
+  },
 ];
 
 /**
