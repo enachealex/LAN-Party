@@ -62,6 +62,20 @@ function startedHidden() {
 const APP_URL = process.env.LANPARTY_URL || 'https://lanparty.thejumpvault.com/app/'
 const APP_ORIGIN = new URL(APP_URL).origin
 
+// True for a URL (or origin string) on LAN Party itself.
+function isAppUrl(value) {
+  try { return new URL(value).origin === APP_ORIGIN } catch (_) { return false }
+}
+
+// Links handed to the user's real browser. Only web and mail links: a message containing a file:,
+// ms-settings: or custom-protocol link must not be able to launch something on this machine.
+function openInBrowser(url) {
+  try {
+    const { protocol } = new URL(url)
+    if (protocol === 'https:' || protocol === 'http:' || protocol === 'mailto:') shell.openExternal(url).catch(() => {})
+  } catch (_) { /* not a URL: ignore */ }
+}
+
 let mainWindow
 let tray = null
 let isQuitting = false
@@ -253,21 +267,39 @@ function createWindow() {
       const u = new URL(url)
       if (u.origin === APP_ORIGIN || AUTH_HOSTS.includes(u.hostname)) return { action: 'allow' }
     } catch (_) { /* fall through to external */ }
-    shell.openExternal(url)
+    openInBrowser(url)
     return { action: 'deny' }
+  })
+
+  // The main window only ever shows LAN Party. A link that would navigate it to another site (one
+  // without target=_blank, say) opens in the browser instead, so no other site ever runs inside the
+  // app window with its desktop bridge. Sign-in pop-ups are separate windows and aren't affected.
+  mainWindow.webContents.on('will-navigate', (event) => {
+    if (isAppUrl(event.url)) return
+    event.preventDefault()
+    openInBrowser(event.url)
   })
 }
 
+// What LAN Party itself uses: calls (camera, mic, screen share), notifications, "Fullscreen" on a
+// video, choosing the speaker (setSinkId) and "Copy" on a message.
+const APP_PERMISSIONS = new Set([
+  'media', 'display-capture', 'notifications', 'fullscreen', 'speaker-selection', 'clipboard-sanitized-write',
+])
+
 // Grant camera / microphone / screen-capture to this first-party app, and provide a source for
-// getDisplayMedia so screen sharing works in the desktop build.
+// getDisplayMedia so screen sharing works in the desktop build. Everything is granted to LAN Party's
+// own origin only: the same session also hosts sign-in pop-ups (Spotify, Google), and those — or any
+// other page — get nothing.
 function configureMedia() {
   const ses = session.defaultSession
-  ses.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(['media', 'audioCapture', 'videoCapture', 'display-capture', 'notifications'].includes(permission))
+  ses.setPermissionRequestHandler((_wc, permission, callback, details) => {
+    callback(APP_PERMISSIONS.has(permission) && isAppUrl(details && details.requestingUrl))
   })
-  ses.setPermissionCheckHandler(() => true)
+  ses.setPermissionCheckHandler((_wc, _permission, requestingOrigin) => isAppUrl(requestingOrigin))
   if (typeof ses.setDisplayMediaRequestHandler === 'function') {
     ses.setDisplayMediaRequestHandler((request, callback) => {
+      if (!isAppUrl(request.securityOrigin)) return callback({})
       desktopCapturer.getSources({ types: ['screen', 'window'] })
         .then((sources) => callback(sources.length ? { video: sources[0] } : {}))
         .catch(() => callback({}))

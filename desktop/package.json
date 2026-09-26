@@ -1,6 +1,6 @@
 {
   "name": "lan-party-desktop",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "description": "Electron desktop wrapper for the LAN Party communication app",
   "author": "Jump Vault LLC",
@@ -24,9 +24,7 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "build/icon.png",
-      "publisherName": "Jump Vault LLC",
-      "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": true,
@@ -53,8 +51,8 @@
   },
   "devDependencies": {
     "cross-env": "^7.0.3",
-    "electron": "^31.7.7",
-    "electron-builder": "^24.13.3"
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3"
   },
   "dependencies": {
     "electron-updater": "^6.8.9"

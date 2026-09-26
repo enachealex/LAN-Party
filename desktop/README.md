@@ -1,62 +1,72 @@
 # LAN Party — Desktop (Electron)
 
-Wraps the web client (`../client`) in a native window. Chromium under the hood, so **all
-existing web features work unchanged** — including the Giphy library (`@giphy/react-components`
-web SDK via the server proxy), WebRTC voice/video, and screen sharing.
+A thin native shell around the **live hosted app** (`https://lanparty.thejumpvault.com/app/`).
+It loads the same origin as the browser and the Android app, so conversations are always in sync
+and nothing is stored on the device — an update never risks losing messages.
 
-## Prerequisites
-- Install deps once: `cd desktop && npm install`
-- The backend must be reachable at `http://localhost:3000` (run `cd server && npm run start`).
+What the shell adds on top of the web app (`main.js`):
 
-## Run (development)
-1. Terminal 1 — server: `cd server && npm run start`
-2. Terminal 2 — client dev server: `cd client && npm run dev`  (serves http://localhost:5173)
-3. Terminal 3 — desktop: `cd desktop && npm run dev`  (opens Electron pointed at the dev server)
+- **Tray**: closing the window hides it to the tray so calls and chat stay connected. Right-click
+  the tray icon for *Run in background* and *Start with Windows* (per-machine, in `userData`).
+- **Call overlay**: while hidden to the tray, a small transparent always-on-top window keeps
+  showing the call video (`overlay-preload.js`, loads `/app/?overlay=1`).
+- **Media**: camera, microphone, screen share (`desktopCapturer`), notifications, fullscreen and
+  speaker selection — granted to LAN Party's own origin only; sign-in pop-ups and any other
+  page get nothing. External links open in the user's browser (web and mail links only).
+- **Auto-update** via `electron-updater` from `https://lanparty.thejumpvault.com/downloads/`.
 
-## Run (production-style, against the built client)
-1. Build the client: `cd client && npm run build`  (outputs `client/dist`)
-2. `cd desktop && npm start`  (loads `../client/dist/index.html` over file://)
+## Run it
 
-## Package installers
-`cd desktop && npm run build` (electron-builder) — produces installers per-OS. The built
-client from `client/dist` is bundled as an extra resource (`client-dist`).
+```bash
+npm install
+npm start      # the live app
+npm run dev    # against a local client dev server (http://localhost:5173) — start the server
+               # (cd ../server && npm start) and the client (cd ../client && npm run dev) first
+```
 
-## Media permissions
-`main.js` grants camera / mic / screen-capture and provides a source to `getDisplayMedia`
-via `desktopCapturer` (uses the OS picker where supported) so screen sharing works in the app.
+Since Electron 42 the Electron binary downloads on the first `npm start`, not during `npm install`.
 
-## Code signing (Publisher = Jump Vault LLC)
+## Releasing a new version
 
-The SmartScreen "Publisher" line comes **only** from the app's Authenticode signature — an unsigned
-build always shows "Unknown publisher" no matter what `publisherName` says. To show
-**Jump Vault LLC**, the `.exe` must be signed with a certificate whose subject is `Jump Vault LLC`.
+1. Bump `version` in `package.json`. The updater compares this against what's installed.
+2. `npm run build` — writes `dist/LAN-Party-Setup.exe`, `dist/LAN-Party-Setup.exe.blockmap` and
+   `dist/latest.yml`. The file name never changes, so the landing page's download link stays valid.
+3. Upload all three to the server's downloads folder, installer first and `latest.yml` **last**
+   (installed apps treat a new `latest.yml` as "an update is ready"):
 
-**Trusted CA cert (the real fix — shows the publisher for everyone, drops the warning):** buy an OV
-or EV code-signing certificate issued to Jump Vault LLC from a trusted CA (DigiCert, Sectigo,
-SSL.com…). Then sign as below with that `.pfx` (or the CA's cloud-signing token).
-
-**Self-signed (interim — your own machine only):**
-1. Generate the certificate (creates `certs/jumpvaultllc.pfx` + `.cer`, gitignored):
-   ```powershell
-   ./scripts/create-cert.ps1
+   ```bash
+   scp dist/LAN-Party-Setup.exe dist/LAN-Party-Setup.exe.blockmap huckleberry@192.168.1.33:/mnt/data/lan-party/data/downloads/
+   scp dist/latest.yml huckleberry@192.168.1.33:/mnt/data/lan-party/data/downloads/
    ```
-2. Build a **signed** installer (electron-builder reads these env vars):
-   ```powershell
-   $env:CSC_LINK = "certs/jumpvaultllc.pfx"
-   $env:CSC_KEY_PASSWORD = "<the password you chose>"
-   npm run build
-   ```
-   The build config sets `publisherName: "Jump Vault LLC"` and RFC-3161 timestamping. Without the
-   env vars, builds are unsigned.
-3. To trust the signature on a test machine (as Administrator), import the public `.cer` into
-   `TrustedPublisher` and `Root` (commands are printed by the script).
+4. Check the public copy is the new one: the sha512 in
+   `https://lanparty.thejumpvault.com/downloads/latest.yml` must match `dist/latest.yml`.
 
-A self-signed cert is **not** trusted by Windows on other machines — they still see "Unknown
-publisher." Only a trusted-CA cert removes the warning for everyone.
+Installed apps check at startup and every 6 hours, download in the background, and offer
+"Restart now"; otherwise the update installs when the app quits.
 
-## Notes / next steps
-- Giphy: uses the **Web JS/React SDK** (not React Native). Key stays server-side via the proxy.
-- The app currently expects the server at `localhost:3000`. Bundling/auto-starting the Node
-  server inside the packaged app (spawn from `main.js`) is a future step.
-- For production hardening, add a Content-Security-Policy that allowlists the server origin
-  and `*.giphy.com` (avoid a CSP so strict it blocks Giphy media).
+## Auto-update and code signing
+
+Builds are **unsigned**, so Windows SmartScreen warns on a first manual install ("More info →
+Run anyway"). Updates after that install quietly.
+
+**Do not set `publisherName` on an unsigned build.** When it is set, electron-updater checks each
+downloaded installer's Authenticode signature against that name and rejects anything unsigned —
+the update is downloaded, refused and deleted, with the error visible only in a console no one
+sees. Every release from 0.1.0 to 1.3.0 shipped that way, so **none of them ever updated**: anyone
+on one has to install 1.4.0 manually once (download it from the landing page). From 1.4.0 on,
+updates work.
+
+**If you get a real code-signing certificate** (OV or EV, issued to Jump Vault LLC by a trusted CA
+such as DigiCert, Sectigo or SSL.com), signing removes the SmartScreen warning for everyone:
+
+1. Point electron-builder at it: `CSC_LINK` (path to the `.pfx`, or the CA's cloud-signing setup)
+   and `CSC_KEY_PASSWORD`.
+2. Only then add `"signtoolOptions": { "publisherName": "Jump Vault LLC" }` under `build.win`,
+   spelled **exactly** like the certificate's subject CN. Updates are then verified against it.
+   (Bonus: installs from 1.0.0 onward mostly pin "Jump Vault LLC", so a validly signed update
+   would reach them automatically. The earliest 1.0.0 build and 0.1.0 pin "The Jump Vault" and
+   need the manual reinstall regardless.)
+
+`scripts/create-cert.ps1` makes a **self-signed** certificate. That's useful for testing signing on
+your own machine only: other machines don't trust it, so never combine it with `publisherName` in a
+release — every other install would reject the update.
