@@ -2347,3 +2347,19 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .voice-effects-status{font-size:12px;line-height:1.4;margin:2px 0 8px;padding:6px 8px;border-radius:8px}
 .voice-effects-status.loading{color:var(--muted);background:rgba(255,255,255,.05)}
 .voice-effects-status.error{color:#ffb4b4;background:rgba(224,87,77,.12)}
+
+
+/* ---- Voice controls: toggles in the audio menu, push-to-talk state, per-person volume ---- */
+.voice-toggle-opt{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.voice-toggle-state{font-size:11px;font-weight:800;letter-spacing:.03em;color:var(--muted)}
+.voice-toggle-opt.active .voice-toggle-state{color:var(--accent-start)}
+/* Push to talk: dim while the key is up so "nobody can hear me" is visible at a glance, ringed while held. */
+.voice-ctrl-mic.ptt-idle{opacity:.55}
+.voice-ctrl-mic.ptt-live{box-shadow:0 0 0 2px #34d399}
+/* Per-person volume, tucked into the tile's bottom-right; revealed on hover like the expand button. */
+.video-tile-volume{position:absolute;right:8px;bottom:8px;display:flex;align-items:center;gap:6px;padding:3px;border-radius:9px;background:rgba(0,0,0,.6);opacity:0;transition:opacity .12s ease}
+.video-tile:hover .video-tile-volume,.video-tile-volume.open,.video-tile-volume:focus-within{opacity:1}
+.video-tile-volume-btn{width:26px;height:26px;border:none;border-radius:7px;background:transparent;color:#fff;font-size:14px;line-height:1;cursor:pointer}
+.video-tile-volume-btn:hover{background:rgba(255,255,255,.14)}
+.video-tile-volume-slider{width:96px;accent-color:var(--accent-end)}
+@media (hover:none){.video-tile-volume{opacity:1}}

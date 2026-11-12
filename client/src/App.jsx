@@ -897,9 +897,13 @@ function RemoteAudio({ stream }) {
 
 // A single participant tile: shows their camera video when a live video track is present,
 // otherwise an avatar initial. The <video> element also plays the stream's audio.
-function VideoTile({ stream, label, muted, isScreen, onExpand, sinkId }) {
+function VideoTile({ stream, label, muted, isScreen, onExpand, sinkId, volume = 1, onVolume }) {
   const ref = useRef()
   const [hasVideo, setHasVideo] = useState(false)
+  const [showVolume, setShowVolume] = useState(false)
+  // Per-person volume. Set imperatively for the same reason as `muted` below, and re-applied when
+  // the stream changes because a fresh srcObject can reset the element.
+  useEffect(() => { if (ref.current) ref.current.volume = Math.max(0, Math.min(1, volume)) }, [volume, stream])
   // React doesn't reliably update the <video> `muted` DOM property on re-render, so set it imperatively.
   useEffect(() => { if (ref.current) ref.current.muted = !!muted }, [muted])
   // Route this tile's audio to the user's chosen output device (speaker selection).
@@ -929,6 +933,31 @@ function VideoTile({ stream, label, muted, isScreen, onExpand, sinkId }) {
       <video ref={ref} autoPlay playsInline muted={muted} />
       {!hasVideo && <div className="video-tile-avatar">{(label || '?').trim().slice(0, 1).toUpperCase()}</div>}
       <div className="video-tile-label">{label}</div>
+      {/* Only on other people's tiles (onVolume is not passed for your own). One loud mic should not
+          force you to turn the whole call down. */}
+      {onVolume && (
+        <div className={`video-tile-volume${showVolume ? ' open' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <button
+            type="button"
+            className="video-tile-volume-btn"
+            onClick={() => setShowVolume((v) => !v)}
+            title={`Volume for ${label}: ${Math.round(volume * 100)}%`}
+            aria-label={`Adjust volume for ${label}`}
+            aria-expanded={showVolume}
+          >
+            {volume === 0 ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}
+          </button>
+          {showVolume && (
+            <input
+              type="range" min="0" max="100" step="1"
+              className="video-tile-volume-slider"
+              value={Math.round(volume * 100)}
+              onChange={(e) => onVolume(Number(e.target.value) / 100)}
+              aria-label={`Volume for ${label}`}
+            />
+          )}
+        </div>
+      )}
       {isScreen && hasVideo && onExpand && (
         <button type="button" className="video-tile-expand" title="View full screen" aria-label="View full screen" onClick={(e) => { e.stopPropagation(); onExpand(stream, label) }}>⛶</button>
       )}
@@ -1166,6 +1195,26 @@ export default function App() {
   const [showStatusMenu, setShowStatusMenu] = useState(false)
   const [micMuted, setMicMuted] = useState(false)
   const [deafened, setDeafened] = useState(false)
+  // ---- Voice preferences: per DEVICE (localStorage), like the mic and speaker choice. A headset on
+  // one machine and laptop speakers on another want different answers. ----
+  const readPref = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : v } catch (_) { return fallback } }
+  const writePref = (key, value) => { try { localStorage.setItem(key, value) } catch (_) { /* private mode: lasts for the session */ } }
+  // Browser noise suppression. On by default, which is also what the browser did before this was a setting.
+  const [noiseSuppression, setNoiseSuppression] = useState(() => readPref('lanparty_noise_suppression', '1') === '1')
+  // Push-to-talk: the mic only transmits while the key is held. `pttKey` is a KeyboardEvent.code, so
+  // it names the physical key and does not move with the keyboard layout.
+  const [pttEnabled, setPttEnabled] = useState(() => readPref('lanparty_ptt', '0') === '1')
+  const [pttKey, setPttKey] = useState(() => readPref('lanparty_ptt_key', 'Backquote'))
+  const [pttHeld, setPttHeld] = useState(false)
+  const [pttRebinding, setPttRebinding] = useState(false)
+  // Per-person volume, 0..1, keyed by display name so it survives them reconnecting (a socket id does not).
+  const [peerVolumes, setPeerVolumes] = useState(() => { try { return JSON.parse(readPref('lanparty_peer_volumes', '{}')) || {} } catch (_) { return {} } })
+  const setPeerVolume = (who, value) => setPeerVolumes((prev) => {
+    const next = { ...prev, [who]: value }
+    if (value >= 1) delete next[who] // full volume is the default; don't store it
+    writePref('lanparty_peer_volumes', JSON.stringify(next))
+    return next
+  })
   // Synthesized UI feedback sounds (Web Audio; see uiSounds.js). Persisted per-user in settings.
   const [uiSoundsEnabled, setUiSoundsEnabled] = useState(true)
   const [uiSoundVolume, setUiSoundVolume] = useState(0.5)
@@ -3444,7 +3493,7 @@ export default function App() {
   const startCall = async (peerUsername, withVideo = false) => {
     if (!peerUsername || callRef.current) return
     let stream
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: withVideo }) }
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: withVideo }) }
     catch (e) { alert('Microphone access is required to call.'); return }
     callLocalStreamRef.current = stream
     setCall({ status: 'outgoing', peer: peerUsername, peerSocket: null, video: withVideo })
@@ -3455,7 +3504,7 @@ export default function App() {
     const c = callRef.current
     if (!c || c.status !== 'incoming') return
     let stream
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: c.video }) }
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: c.video }) }
     catch (e) { declineCall(); return }
     callLocalStreamRef.current = stream
     setCall({ ...c, status: 'connecting' })
@@ -3894,13 +3943,23 @@ export default function App() {
     }
   }
 
+  // Constraints for every microphone capture. Passing `audio: true` left noise suppression to the
+  // browser's default with no way to turn it off, which matters for anyone playing music or using a
+  // mic that already cleans its own signal. Echo cancellation and gain control stay on.
+  const micConstraints = (deviceId) => ({
+    ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    noiseSuppression,
+    echoCancellation: true,
+    autoGainControl: true,
+  })
+
   const startVoice = async (channelId = 'voice1', opts = {}) => {
     if (typeof channelId !== 'string') channelId = 'voice1' // guard against being passed a click event
     if (!socket) return
     const muted = opts.muted != null ? opts.muted : micMuted
     if (!localStreamRef.current) {
       try {
-        const s = await navigator.mediaDevices.getUserMedia({ audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true })
+        const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(selectedMicId) })
         localStreamRef.current = s
         setLocalStream(s)
       } catch (err) {
@@ -3908,7 +3967,7 @@ export default function App() {
         return
       }
     }
-    localStreamRef.current.getAudioTracks().forEach((t) => { t.enabled = !muted }) // honor mute/join-muted
+    localStreamRef.current.getAudioTracks().forEach((t) => { t.enabled = !muted && !pttEnabled }) // honor mute/join-muted; in push-to-talk the mic starts closed
     setMicMuted(muted)
     // Promote the pre-join camera preview (if the user turned it on) into the call — the preview
     // pipeline (rawCam + processor + output track) simply carries over, so there's no flicker.
@@ -3992,7 +4051,7 @@ export default function App() {
 
   const startPreJoinMic = async () => {
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: selectedMicId ? { deviceId: { exact: selectedMicId } } : true })
+      const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(selectedMicId) })
       if (preJoinMicStreamRef.current) preJoinMicStreamRef.current.getTracks().forEach((t) => t.stop())
       preJoinMicStreamRef.current = s
       const actual = s.getAudioTracks()[0]?.getSettings?.().deviceId
@@ -4005,7 +4064,7 @@ export default function App() {
   const preJoinSelectMic = async (deviceId) => {
     setSelectedMicId(deviceId)
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } })
+      const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(deviceId) })
       if (preJoinMicStreamRef.current) preJoinMicStreamRef.current.getTracks().forEach((t) => t.stop())
       preJoinMicStreamRef.current = s
       startMicMeter(s)
@@ -4607,8 +4666,10 @@ export default function App() {
   // track's enabled flag when in a call; the state persists as the user's preference otherwise.
   const toggleMute = () => {
     const track = localStreamRef.current?.getAudioTracks()[0]
-    const next = track ? track.enabled : !micMuted // if enabled, we're muting → next=true
-    if (track) track.enabled = !next
+    // From the mute SETTING, not from track.enabled: in push-to-talk the track is closed whenever the
+    // key is up, so reading it would see "already muted" and the button would do nothing.
+    const next = !micMuted
+    if (track) track.enabled = !next && (!pttEnabled || pttHeld) // unmuting in push-to-talk still needs the key
     setMicMuted(next)
     playUiSound(next ? 'mute' : 'unmute')
     if (!next && deafened) setDeafened(false) // unmuting while deafened undeafens (Discord-like)
@@ -4627,11 +4688,89 @@ export default function App() {
         setMicMuted(true)
       } else {
         const restore = prevMicMutedRef.current
-        if (track) track.enabled = !restore
+        if (track) track.enabled = !restore && (!pttEnabled || pttHeld)
         setMicMuted(restore)
       }
       return next
     })
+  }
+
+  // Flip noise suppression. Tried on the live track first, so nobody hears a gap; browsers that
+  // refuse to change it mid-capture get the mic re-opened with the new setting instead.
+  const reopenMicRef = useRef(null)
+  const toggleNoiseSuppression = async () => {
+    const next = !noiseSuppression
+    setNoiseSuppression(next)
+    writePref('lanparty_noise_suppression', next ? '1' : '0')
+    const track = localStreamRef.current?.getAudioTracks()[0]
+    if (!track) return
+    try {
+      await track.applyConstraints({ noiseSuppression: next })
+      if (track.getSettings?.().noiseSuppression !== next) throw new Error('not applied')
+    } catch (_) {
+      const deviceId = track.getSettings?.().deviceId || selectedMicId
+      if (deviceId) reopenMicRef.current?.(deviceId, next)
+    }
+  }
+
+  const togglePtt = () => {
+    const next = !pttEnabled
+    setPttEnabled(next)
+    setPttHeld(false)
+    writePref('lanparty_ptt', next ? '1' : '0')
+  }
+
+  // The ONE place the mic track is switched on or off. Mute, deafen and device changes each set
+  // track.enabled themselves; with push-to-talk as a second reason to silence the mic, the last
+  // writer would win, and a muted mic could come back on when the talk key was pressed.
+  useEffect(() => {
+    const track = localStream?.getAudioTracks?.()[0]
+    if (!track) return
+    track.enabled = !micMuted && (!pttEnabled || pttHeld)
+  }, [localStream, micMuted, pttEnabled, pttHeld])
+
+  // Push-to-talk key handling. Web pages only receive keys while focused, so this works when the
+  // app is the active window, not while you are tabbed into a game. Losing focus releases the key,
+  // otherwise alt-tabbing mid-sentence would leave the mic open with no way to notice.
+  useEffect(() => {
+    if (pttRebinding) {
+      const capture = (e) => {
+        e.preventDefault(); e.stopPropagation()
+        if (e.code !== 'Escape') { setPttKey(e.code); writePref('lanparty_ptt_key', e.code) }
+        setPttRebinding(false)
+      }
+      window.addEventListener('keydown', capture, true)
+      return () => window.removeEventListener('keydown', capture, true)
+    }
+    if (!pttEnabled || !inVoice) { setPttHeld(false); return undefined }
+    const typing = (el) => !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)
+    const down = (e) => {
+      if (e.code !== pttKey || e.repeat) return
+      // A key that types a character must not transmit while you are writing a message. Keys that
+      // type nothing (F-keys, modifiers) are safe to honour anywhere.
+      if (typing(e.target) && e.key.length === 1) return
+      e.preventDefault()
+      setPttHeld(true)
+    }
+    const up = (e) => { if (e.code === pttKey) setPttHeld(false) }
+    const release = () => setPttHeld(false)
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    window.addEventListener('blur', release)
+    document.addEventListener('visibilitychange', release)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+      window.removeEventListener('blur', release)
+      document.removeEventListener('visibilitychange', release)
+    }
+  }, [pttEnabled, pttKey, pttRebinding, inVoice])
+
+  // A readable name for a KeyboardEvent.code: "Backquote" -> "`", "KeyV" -> "V", "F8" -> "F8".
+  const keyLabel = (code) => {
+    const named = { Backquote: '`', Space: 'Space', CapsLock: 'Caps Lock', ControlLeft: 'Left Ctrl', ControlRight: 'Right Ctrl', AltLeft: 'Left Alt', AltRight: 'Right Alt', ShiftLeft: 'Left Shift', ShiftRight: 'Right Shift' }
+    if (named[code]) return named[code]
+    return String(code || '').replace(/^Key/, '').replace(/^Digit/, '').replace(/^Numpad/, 'Num ')
   }
 
   // Speaker (output) selection is only supported where HTMLMediaElement.setSinkId exists (Chromium).
@@ -4651,14 +4790,17 @@ export default function App() {
 
   // Switch the microphone: grab the new device and replaceTrack on every peer (no renegotiation),
   // preserving the current mute state.
-  const changeMic = async (deviceId) => {
+  const changeMic = async (deviceId, noiseOverride) => {
     setSelectedMicId(deviceId)
     if (!localStreamRef.current) return
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } })
+      // The toggle calls this in the same tick it flips the setting, before state has caught up.
+      const constraints = micConstraints(deviceId)
+      if (typeof noiseOverride === 'boolean') constraints.noiseSuppression = noiseOverride
+      const s = await navigator.mediaDevices.getUserMedia({ audio: constraints })
       const nt = s.getAudioTracks()[0]
       if (!nt) return
-      nt.enabled = !micMuted // honor the current mute state
+      nt.enabled = !micMuted && (!pttEnabled || pttHeld) // honor mute and push-to-talk
       Object.values(peersRef.current).forEach(({ pc }) => {
         const sender = pc.getSenders().find((x) => x.track && x.track.kind === 'audio')
         if (sender) sender.replaceTrack(nt).catch(() => {})
@@ -4672,6 +4814,8 @@ export default function App() {
       setEffectsError('Could not switch microphone')
     }
   }
+
+  reopenMicRef.current = changeMic
 
   // Switch the speaker/output — applied to every remote tile's <video> via the sinkId prop.
   const changeSpeaker = (deviceId) => setSelectedSpeakerId(deviceId)
@@ -6417,7 +6561,7 @@ export default function App() {
                 const participantIds = Array.from(new Set([...Object.keys(peerNames), ...Object.keys(remoteStreams)]))
                 const tiles = [
                   { key: 'self', stream: localStream, label: `${name || 'You'} (you)`, muted: true, isScreen: screenSharing },
-                  ...participantIds.map((id) => ({ key: id, stream: remoteStreams[id] || null, label: peerNames[id] || 'Guest', muted: deafened, sinkId: selectedSpeakerId, isScreen: !!screenSharingPeers[id] })),
+                  ...participantIds.map((id) => ({ key: id, stream: remoteStreams[id] || null, label: peerNames[id] || 'Guest', muted: deafened, sinkId: selectedSpeakerId, isScreen: !!screenSharingPeers[id], volume: peerVolumes[peerNames[id]] ?? 1, onVolume: peerNames[id] ? (v) => setPeerVolume(peerNames[id], v) : undefined })),
                 ]
                 const start = voicePageClamped * VOICE_TILES_PER_PAGE
                 const pageTiles = tiles.slice(start, start + VOICE_TILES_PER_PAGE)
@@ -6430,7 +6574,7 @@ export default function App() {
                         <>
                           <div className="video-stage" ref={videoStageRef} style={{ gridTemplateColumns: `repeat(${voiceGrid.cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${voiceGrid.rows}, minmax(0, 1fr))` }}>
                             {pageTiles.map((t) => (
-                              <VideoTile key={t.key} stream={t.stream} label={t.label} muted={t.muted} sinkId={t.sinkId} isScreen={t.isScreen} onExpand={(s, l) => setFullscreenStream({ stream: s, label: l })} />
+                              <VideoTile key={t.key} stream={t.stream} label={t.label} muted={t.muted} sinkId={t.sinkId} isScreen={t.isScreen} volume={t.volume} onVolume={t.onVolume} onExpand={(s, l) => setFullscreenStream({ stream: s, label: l })} />
                             ))}
                           </div>
                           {voicePageCount > 1 && (
@@ -6599,10 +6743,25 @@ export default function App() {
                             ) : (
                               <div className="voice-effects-hint">Output device selection isn't supported in this browser.</div>
                             )}
+                            <div className="voice-effects-section">🎚️ Voice</div>
+                            <button type="button" role="menuitemcheckbox" aria-checked={noiseSuppression} className={`voice-quality-opt voice-toggle-opt${noiseSuppression ? ' active' : ''}`} onClick={toggleNoiseSuppression}>
+                              <span>Noise suppression</span><span className="voice-toggle-state">{noiseSuppression ? 'On' : 'Off'}</span>
+                            </button>
+                            <button type="button" role="menuitemcheckbox" aria-checked={pttEnabled} className={`voice-quality-opt voice-toggle-opt${pttEnabled ? ' active' : ''}`} onClick={togglePtt}>
+                              <span>Push to talk</span><span className="voice-toggle-state">{pttEnabled ? 'On' : 'Off'}</span>
+                            </button>
+                            {pttEnabled && (
+                              <>
+                                <button type="button" className="voice-quality-opt voice-toggle-opt" onClick={() => setPttRebinding(true)}>
+                                  <span>Talk key</span><span className="voice-toggle-state">{pttRebinding ? 'Press a key…' : keyLabel(pttKey)}</span>
+                                </button>
+                                <div className="voice-effects-hint">Hold the key to talk. Works while this window is focused; a browser can't see keys pressed in another app.</div>
+                              </>
+                            )}
                             <div className="voice-effects-hint">🔒 Your mic &amp; speakers are only accessed while you're in a call.</div>
                           </div>
                         )}
-                        <button ref={micBtnRef} className={`voice-ctrl voice-ctrl-mic${micMuted ? ' toggled' : ''}`} onClick={toggleMute} title={micMuted ? 'Unmute' : 'Mute'} aria-label="Toggle microphone" aria-pressed={micMuted}>
+                        <button ref={micBtnRef} className={`voice-ctrl voice-ctrl-mic${micMuted ? ' toggled' : ''}${pttEnabled && !micMuted ? (pttHeld ? ' ptt-live' : ' ptt-idle') : ''}`} onClick={toggleMute} title={micMuted ? 'Unmute' : pttEnabled ? `Push to talk: hold ${keyLabel(pttKey)}` : 'Mute'} aria-label="Toggle microphone" aria-pressed={micMuted}>
                           {micMuted ? <MicOffIcon /> : <MicOnIcon />}
                         </button>
                         <button className="voice-ctrl-caret" onClick={() => setShowAudioMenu((v) => { if (!v) loadAudioDevices(); return !v })} title="Audio settings — choose microphone &amp; speaker" aria-label="Audio device settings" aria-haspopup="menu" aria-expanded={showAudioMenu}>▾</button>
