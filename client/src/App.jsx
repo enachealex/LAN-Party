@@ -26,6 +26,7 @@ import ProfileAvatar from './components/ProfileAvatar'
 import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
 import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
+import { findNewerBuild, alreadyReloadedFor, reloadForBuild } from './appUpdate'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
 import MicTest from './components/MicTest'
@@ -1264,6 +1265,10 @@ export default function App() {
   // Public profile card shown when you click a member.
   const [profileCard, setProfileCard] = useState(null) // { loading?, username, profile, gamingProfile, status }
   const [toast, setToast] = useState(null) // brief bottom notice (invites, role changes)
+  // A newer build has been deployed than the one on screen (its signature), or null. See appUpdate.ts.
+  const [newBuild, setNewBuild] = useState(null)
+  const busyForReloadRef = useRef(false)
+  const checkForUpdateRef = useRef(() => {})
   // External streaming (Twitch/YouTube/Kik): my announcement + the announce form + in-app viewer.
   const [myExternalStream, setMyExternalStream] = useState(null) // { platform, channel, title, game }
   // Streams this viewer has dismissed from Live now. Purely local — hiding someone's card never
@@ -3252,6 +3257,8 @@ export default function App() {
       const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
       s.emit('join', { serverId: sid, name: nick })
       setConnected(true)
+      // The usual reason for a reconnect is the server restarting for a deploy.
+      checkForUpdateRef.current(false)
       markBoot('connect', 'done')
       markBoot('sync', 'active')
       // allSettled, not all: one failing fetch must not strand the splash. The individual loaders
@@ -5546,6 +5553,45 @@ export default function App() {
   const serverMentionTotals = Object.fromEntries(
     Object.entries(channelMentions).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
   )
+  // ---- Picking up a new deploy without being relaunched ----
+  // Reloading is only done on the user's behalf when it costs them nothing: no call or activity to
+  // drop, nothing half-typed or half-uploaded, no dialog mid-edit. Anything else gets the bar instead.
+  busyForReloadRef.current = Boolean(
+    inVoice || call || activity || uploadingFile || promptModal || editingProfile || editingSettings ||
+    text.trim() || composerStack.length
+  )
+  useEffect(() => {
+    let lastCheck = 0
+    let stopped = false
+    // `arriving`: the user is just coming back to the window (or is not looking at it at all), which
+    // is the moment a reload goes unnoticed. A periodic check while they are actively using the app
+    // never reloads under them; it only raises the bar.
+    const check = async (arriving) => {
+      const now = Date.now()
+      if (now - lastCheck < 60 * 1000) return
+      lastCheck = now
+      const build = await findNewerBuild()
+      if (stopped || !build) return
+      const unseen = arriving || document.hidden || !document.hasFocus()
+      if (unseen && !busyForReloadRef.current && !alreadyReloadedFor(build)) { reloadForBuild(build); return }
+      setNewBuild(build)
+    }
+    checkForUpdateRef.current = check
+    const onFocus = () => check(true)
+    const onVisible = () => { if (!document.hidden) check(true) }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisible)
+    // The desktop app keeps its page "visible" while hidden in the tray, so nothing above fires
+    // there until it is opened. This catches it beforehand, while nobody is looking.
+    const timer = setInterval(() => check(false), 15 * 60 * 1000)
+    return () => {
+      stopped = true
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisible)
+      clearInterval(timer)
+    }
+  }, [])
+
   const activeChannelObj = serverChannels.find((c) => c.id === activeChannel)
   const activeChannelType = activeChannelObj ? activeChannelObj.type : 'text'
   const activeChannelName = activeChannelObj?.name || activeChannel
@@ -7707,6 +7753,13 @@ export default function App() {
         </div>
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
+      {/* Only shown when the update could not simply be applied: mid-call, mid-sentence, and so on. */}
+      {newBuild && (
+        <div className="update-bar" role="status">
+          <span>A new version of LAN Party is ready.</span>
+          <button type="button" onClick={() => reloadForBuild(newBuild)}>Reload</button>
+        </div>
+      )}
 
       {/* Message search. Kept mounted so the last query and its results are still there on reopening. */}
       <SearchPanel

@@ -2450,3 +2450,8 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .topbar-icon-btn{width:40px;height:40px;border-color:transparent}
   .history-present-bar{margin-top:6px}
 }
+
+/* ---- "A new version is ready" bar: only when the update could not be applied silently ---- */
+.update-bar{position:fixed;left:50%;top:14px;transform:translateX(-50%);display:flex;align-items:center;gap:12px;max-width:calc(100vw - 24px);padding:9px 10px 9px 16px;border-radius:12px;background:#111a24;color:#e6edf5;border:1px solid rgba(255,255,255,.14);box-shadow:0 12px 34px rgba(0,0,0,.5);font-size:14px;z-index:650}
+.update-bar button{flex-shrink:0;padding:7px 14px;border:none;border-radius:8px;background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#fff;font:inherit;font-weight:700;cursor:pointer}
+@media (max-width: 820px){.update-bar{top:calc(env(safe-area-inset-top,0px) + 8px);font-size:13px}.update-bar button{min-height:40px}}
