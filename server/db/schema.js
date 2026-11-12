@@ -304,6 +304,20 @@ const MIGRATIONS = [
       )`);
     },
   },
+  {
+    // History is read a page at a time now (services/history.js): "the 50 messages of this
+    // conversation just below id N". Without an index that leads with the conversation and ends in
+    // the id, every page is a scan of the whole table, which is the cost paging exists to avoid.
+    // Direct messages need both orders of the pair, since a conversation is the rows sent either way.
+    // group_messages already had (group_id, created_at), but pages walk by id, not by time.
+    name: '0010_history_paging_indexes',
+    up: async (db) => {
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages (server_id, channel_id, id)');
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_direct_messages_sent ON direct_messages (sender_id, recipient_id, id)');
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_direct_messages_received ON direct_messages (recipient_id, sender_id, id)');
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_group_messages_group_id ON group_messages (group_id, id)');
+    },
+  },
 ];
 
 /**

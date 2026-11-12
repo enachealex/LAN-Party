@@ -2387,3 +2387,66 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .dc-rail-badge.dc-rail-badge-mention{background:#f23f43;letter-spacing:0}
 @media (max-width: 820px){.mention-option{min-height:44px}.mention-popup{max-width:none}}
 .dc-channel-lock + .dc-channel-mention{margin-left:6px}
+
+/* ---- History paging: the rows at the edges of the message list ----
+   Fixed height on purpose. The top row is present for as long as older messages exist and only its
+   text changes, so starting or finishing a load never moves the messages under the reader. */
+.history-edge{flex:none;min-height:18px;line-height:18px;text-align:center;font-size:12px;color:var(--muted)}
+.history-edge.start{display:flex;align-items:center;gap:12px;opacity:.8}
+.history-edge.start::before,.history-edge.start::after{content:'';flex:1;height:1px;background:rgba(255,255,255,.08)}
+/* The way back from an older stretch of a conversation. Between the list and the composer rather
+   than floating over the list, so it never covers a message and is always within reach. */
+.history-present-bar{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;margin-top:8px;padding:9px 14px;border:1px solid rgba(255,255,255,.1);border-radius:10px;background:#141b24;color:var(--text);font:inherit;font-size:13px;text-align:left;cursor:pointer}
+.history-present-bar:hover{background:#1a2330;border-color:var(--accent-start)}
+.history-present-note{min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-present-go{flex-shrink:0;font-weight:800;color:var(--accent-start)}
+
+/* ---- Message search ---- */
+.topbar-icon-btn{width:34px;height:34px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;padding:0;border:1px solid rgba(255,255,255,.06);border-radius:8px;background:transparent;color:var(--text);cursor:pointer}
+.topbar-icon-btn:hover{background:rgba(255,255,255,.12)}
+/* Top-aligned, so the field stays put while the list under it grows and shrinks with the results. */
+.search-overlay{position:fixed;inset:0;z-index:470;display:flex;align-items:flex-start;justify-content:center;padding:9vh 20px 20px;background:rgba(4,8,12,.72)}
+.search-panel{width:min(600px,100%);max-height:78vh;display:flex;flex-direction:column;overflow:hidden;background:#0f1620;border:1px solid rgba(255,255,255,.12);border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6)}
+.search-head{flex:none;display:flex;align-items:center;gap:10px;padding:12px 12px 12px 16px;border-bottom:1px solid rgba(255,255,255,.08)}
+.search-head-icon{flex-shrink:0;color:var(--muted)}
+/* 16px: anything smaller makes iOS zoom the page when the field takes focus. */
+.search-input{flex:1;min-width:0;padding:6px 0;border:none;outline:none;background:transparent;color:var(--text);font:inherit;font-size:16px}
+.search-input::placeholder{color:var(--muted)}
+.search-input::-webkit-search-cancel-button{display:none}
+.search-scopes{flex:none;display:flex;flex-wrap:wrap;gap:6px;padding:10px 12px 0}
+.search-scope{padding:6px 12px;border:1px solid rgba(255,255,255,.12);border-radius:999px;background:rgba(255,255,255,.04);color:var(--muted);font:inherit;font-size:12.5px;font-weight:700;cursor:pointer}
+.search-scope:hover:not(:disabled){color:var(--text);background:rgba(255,255,255,.08)}
+.search-scope.active{color:#fff;border-color:transparent;background:linear-gradient(135deg,var(--accent-start),var(--accent-end))}
+.search-scope:disabled{opacity:.45;cursor:default}
+.search-scope-hint{flex:none;padding:6px 16px 8px;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.search-results{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:4px 8px 10px}
+.search-empty{padding:26px 14px;text-align:center;font-size:14px;line-height:1.5;color:var(--muted)}
+.search-empty.error{color:#ff9d96}
+.search-result{flex:none;display:flex;flex-direction:column;gap:3px;width:100%;padding:9px 12px;border:1px solid rgba(255,255,255,.08);border-radius:9px;background:#0b1016;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.search-result:hover,.search-result:focus-visible{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.2);outline:none}
+/* Results of the previous query, still shown while the next one is on its way. */
+.search-result.stale{opacity:.5}
+.search-result-where{font-size:11px;font-weight:700;letter-spacing:.02em;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.search-result-head{display:flex;align-items:baseline;gap:8px;min-width:0}
+.search-result-author{font-weight:700;font-size:13px;color:#c9d4ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.search-result-time{flex-shrink:0;font-size:11px;color:var(--muted)}
+.search-result-text{font-size:13.5px;line-height:1.4;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.search-result-attach{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.search-hit{padding:0 1px;border-radius:3px;background:rgba(240,160,32,.32);color:inherit;font-weight:700}
+.search-more{flex:none;align-self:center;margin-top:4px;padding:8px 16px;border:1px solid rgba(255,255,255,.14);border-radius:8px;background:transparent;color:var(--text);font:inherit;font-size:13px;font-weight:700;cursor:pointer}
+.search-more:hover:not(:disabled){background:rgba(255,255,255,.08)}
+.search-more:disabled{opacity:.6;cursor:default}
+@media (max-width: 820px){
+  /* A full-screen sheet: a floating card would leave a few unusable pixels round it and put the
+     results under the keyboard. dvh follows the viewport as the browser chrome and keyboard move. */
+  .search-overlay{padding:0;align-items:stretch}
+  .search-panel{
+    width:100%;max-height:none;height:100vh;height:100dvh;border:none;border-radius:0;
+    padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);
+  }
+  .search-scope{min-height:36px}
+  .search-result{padding:11px 12px}
+  .search-more{min-height:44px}
+  .topbar-icon-btn{width:40px;height:40px;border-color:transparent}
+  .history-present-bar{margin-top:6px}
+}

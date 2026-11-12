@@ -2,6 +2,8 @@
 // decline / cancel / incoming / outgoing), and 1:1 DMs (conversations, thread,
 // read, send, delete). Leans on shared helpers (friend-graph, DM-unread, presence broadcasts) that
 // also serve the socket layer, so they are injected rather than moved.
+const { parsePageQuery, fetchPage } = require('../services/history');
+
 /** @param {Record<string, any>} deps */
 function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push }) {
   app.post('/user/presence', authMiddleware, async (req, res) => {
@@ -260,6 +262,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     if (!(await canDirectMessage(me.id, me.username, peer.id, peer.username))) {
       return res.status(403).json({ error: 'You can only message friends or people you share a server with' });
     }
+    // Before markRead, so a request that is going to be refused changes nothing.
+    const page = parsePageQuery(req.query);
+    if ('error' in page) return res.status(400).json({ error: page.error });
     const markRead = req.query.markRead === '1' || req.query.markRead === 'true';
     if (markRead) {
       const now = Date.now();
@@ -271,20 +276,18 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
       );
       await emitDmUnreadUpdate(me.username);
     }
-    const rows = await db.all(
-      `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, dm.edited_at, s.username AS author
-       FROM direct_messages dm
-       JOIN users s ON s.id = dm.sender_id
-       WHERE (dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)
-       ORDER BY dm.created_at ASC`,
-      me.id,
-      peer.id,
-      peer.id,
-      me.id
-    );
+    const { rows, hasMore, hasMoreAfter } = await fetchPage(db, {
+      columns: 'dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, dm.edited_at, s.username AS author',
+      from: 'direct_messages dm JOIN users s ON s.id = dm.sender_id',
+      where: '(dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)',
+      params: [me.id, peer.id, peer.id, me.id],
+      idCol: 'dm.id',
+    }, page);
     const summary = await getDmUnreadSummary(me.id);
     return res.json({
       messages: rows.map((r) => mapMessageRow(r, me.username)),
+      hasMore,
+      hasMoreAfter,
       totalUnread: summary.totalUnread,
     });
   });

@@ -34,6 +34,7 @@ import ImageCropModal from './components/ImageCropModal'
 import PrivateMessageModal from './components/PrivateMessageModal'
 import InviteLinkSection from './components/InviteLinkSection'
 import InviteJoinDialog, { InviteJoinNotice, useInviteJoin } from './components/InviteJoin'
+import SearchPanel from './components/SearchPanel'
 import { syncPush, stopPush, pushSupported, pushCovers, windowFocused, useNotificationTarget } from './push'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
@@ -98,6 +99,39 @@ function messageTimeValue(message) {
 
 function oldestMessagesFirst(messages = []) {
   return [...messages].sort((a, b) => messageTimeValue(a) - messageTimeValue(b))
+}
+
+// ---- History paging helpers ----
+// Conversations are loaded a page at a time (see "History paging" in App). The channel on screen
+// keeps its paging state under this key; DMs and groups use their own chat storage key.
+const CHANNEL_HISTORY_KEY = '#channel'
+
+// Join two runs of messages into one list, oldest first, keeping the first copy of any id. Pages
+// overlap whenever a live message and a fetched page both carry the same row.
+function mergeHistory(...runs) {
+  const seen = new Set()
+  const merged = []
+  for (const run of runs) {
+    for (const m of run || []) {
+      const id = String(m?.id)
+      if (seen.has(id)) continue
+      seen.add(id)
+      merged.push(m)
+    }
+  }
+  return oldestMessagesFirst(merged)
+}
+
+// The lowest (Math.min) or highest (Math.max) server row id in a list: the paging cursor. Ids made
+// up on the client (a fallback key, a local-only message) are not row ids and are skipped.
+function edgeMessageId(list, pick) {
+  let edge = null
+  for (const m of list || []) {
+    const id = typeof m?.id === 'number' ? m.id : /^\d+$/.test(String(m?.id ?? '')) ? Number(m.id) : NaN
+    if (!Number.isSafeInteger(id) || id < 1) continue
+    edge = edge == null ? id : pick(edge, id)
+  }
+  return edge
 }
 
 // A group with no name is called after its other members: "ann, ben, cat +2".
@@ -1437,6 +1471,45 @@ export default function App() {
   // Whether the view is pinned to the newest message (true = follow new content / late-loading media).
   const stickToBottomRef = useRef(true)
 
+  // ---- History paging ----
+  // A conversation is no longer held whole: it is a window of pages that grows as the reader
+  // scrolls. Per conversation (CHANNEL_HISTORY_KEY for the channel on screen, otherwise the home
+  // chat's storage key):
+  //   hasMore   older messages exist beyond the window (undefined until the server has said so)
+  //   detached  newer ones exist beyond it too: the window sits somewhere back in history (a jump
+  //             to a search result or a pin). Live messages are NOT appended to a detached window,
+  //             since that would put today's message directly under last month's with nothing to
+  //             show the gap.
+  //   missed    how many live messages arrived while detached
+  //   loadingOlder / loadingNewer   a page is on its way (one request at a time per direction)
+  // The ref is the copy socket handlers and scroll listeners read; both are written together.
+  const [historyMeta, setHistoryMeta] = useState({})
+  const historyMetaRef = useRef({})
+  // What is loaded, for code that runs outside a render (scroll listeners, socket handlers).
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  const homeMessagesRef = useRef(homeMessages)
+  homeMessagesRef.current = homeMessages
+  // Which channel the `messages` list belongs to, as the server tagged it. Paging asks for more of
+  // THIS channel; activeChannel can be a beat ahead of the list while a switch is in flight.
+  const messagesChannelRef = useRef(null)
+  // A scroll position owed to the next render: { fromBottom } after older messages were prepended
+  // (so the view does not jump), or { toBottom } after returning to the present.
+  const pendingScrollRef = useRef(null)
+  // Set when a page of NEWER history is appended, so the follow-new-messages logic leaves it alone.
+  const skipFollowRef = useRef(false)
+  // A channel jump waiting for the socket to move us there: { serverId, channelId, messageId, timer }.
+  const pendingJumpRef = useRef(null)
+  // Live messages that arrived while a window was being fetched, and how many fetches are running.
+  const liveBufferRef = useRef({})
+  const windowFetchRef = useRef({})
+  const olderRetryAtRef = useRef(0)
+  // The message a jump should scroll to and flash once it has rendered: { key, id, n }.
+  const [jumpHighlight, setJumpHighlight] = useState(null)
+  // The paging functions, refreshed every render, for effects and listeners declared above them.
+  const historyFnsRef = useRef({})
+  const [showSearch, setShowSearch] = useState(false)
+
   // Keep an object URL for previewing the pending file in the composer; revoke on change/unmount.
   useEffect(() => {
     if (!pendingFile || !(pendingFile instanceof File)) {
@@ -1517,8 +1590,11 @@ export default function App() {
   }, [])
 
   // Identity of the currently-open chat (channel or home chat).
-  const activeChatKey = homeChat ? `home:${homeChat.id}` : `channel:${selectedServerId}:${activeChannel}`
-  const activeMessageCount = homeChat ? activeHomeMessageCount : messages.length
+  // A home chat stays selected while a server is on screen, so "is one open" is not enough: keyed on
+  // homeChat alone, the channel list would be scrolled (and listened to) as if it were that chat.
+  const viewingHomeChat = Boolean(homeChat) && selectedServerId === 'home'
+  const activeChatKey = viewingHomeChat ? `home:${homeChat.id}` : `channel:${selectedServerId}:${activeChannel}`
+  const activeMessageCount = viewingHomeChat ? activeHomeMessageCount : messages.length
 
   useEffect(() => {
     const list = messagesListRef.current
@@ -1546,6 +1622,14 @@ export default function App() {
       return
     }
 
+    // A page of newer history appended to a detached window is not "a message arrived". Following
+    // it would land on its last message, which asks for the next page, and so on to the present.
+    if (skipFollowRef.current) {
+      skipFollowRef.current = false
+      stickToBottomRef.current = false
+      return
+    }
+
     // Same chat, a message arrived: keep pinned to the bottom only if already near it.
     const distanceFromBottom = list.scrollHeight - list.scrollTop - list.clientHeight
     if (distanceFromBottom < 120) { list.scrollTop = list.scrollHeight; stickToBottomRef.current = true }
@@ -1559,7 +1643,12 @@ export default function App() {
     const list = messagesListRef.current
     if (!list) return
     const nearBottom = () => list.scrollHeight - list.scrollTop - list.clientHeight < 120
-    const onScroll = () => { stickToBottomRef.current = nearBottom() }
+    // The bottom of a detached window is not the newest message, so there is nothing to stay pinned
+    // to there. Every scroll also checks whether an edge is close enough to fetch the next page.
+    const onScroll = () => {
+      stickToBottomRef.current = nearBottom() && !historyFnsRef.current.isDetached?.()
+      historyFnsRef.current.checkEdges?.()
+    }
     const onMediaLoad = () => { if (stickToBottomRef.current) list.scrollTop = list.scrollHeight }
     list.addEventListener('scroll', onScroll, { passive: true })
     list.addEventListener('load', onMediaLoad, true) // `load` doesn't bubble, but fires in capture
@@ -1576,6 +1665,58 @@ export default function App() {
   useEffect(() => {
     selectedServerIdRef.current = selectedServerId
   }, [selectedServerId])
+
+  // ---- History paging: scroll upkeep (the paging itself is further down, by appendHomeMessage) ----
+  // These sit below the effects that refresh homeChatRef / selectedServerIdRef on purpose: effects
+  // run in declaration order, and the paging functions read the conversation on screen from those refs.
+
+  // Settle a scroll position owed from just before this render. Prepending a page makes the list
+  // taller at the top; keeping the distance from the BOTTOM fixed is what leaves the messages the
+  // reader was looking at exactly where they were. Layout effect, so it lands before the paint.
+  useLayoutEffect(() => {
+    const owed = pendingScrollRef.current
+    if (!owed) return
+    pendingScrollRef.current = null
+    const list = messagesListRef.current
+    if (!list) return
+    if (owed.toBottom) {
+      list.scrollTop = list.scrollHeight
+      stickToBottomRef.current = true
+    } else {
+      list.scrollTop = list.scrollHeight - owed.fromBottom
+    }
+  })
+
+  // Leaving a conversation whose window was detached throws that window away, so coming back
+  // always starts from the newest messages with live updates on.
+  useEffect(() => {
+    const homeKey = viewingHomeChat ? chatStorageKey(homeChat.id) : null
+    const serverId = selectedServerId
+    const channelId = activeChannel
+    return () => historyFnsRef.current.leaveConversation?.(homeKey, serverId, channelId)
+  }, [activeChatKey])
+
+  // A home chat stays selected while a server is on screen, and may have had its window thrown away
+  // by the effect above in the meantime. Coming back to it by the Home tile opens nothing, so
+  // without this it would sit there empty ("No messages yet") in front of a full history.
+  useEffect(() => {
+    historyFnsRef.current.loadHomeChatIfMissing?.()
+  }, [activeChatKey])
+
+  // A jump's target has rendered: bring it into view and flash it. Runs after the scroll-to-bottom
+  // effect above (declaration order), so a freshly opened chat ends on the target, not the bottom.
+  useEffect(() => {
+    if (!jumpHighlight) return
+    if (historyFnsRef.current.currentKey?.() !== jumpHighlight.key) return
+    historyFnsRef.current.flashMessage?.(jumpHighlight.id, false)
+  }, [jumpHighlight])
+
+  // After anything that changes the list or its paging state, see whether an edge is already in
+  // reach. Without this a first page too short to scroll could never ask for the one before it,
+  // because no scroll event would ever fire.
+  useEffect(() => {
+    historyFnsRef.current.checkEdges?.()
+  }, [activeChatKey, activeMessageCount, historyMeta])
 
   useEffect(() => {
     if (!isAuthenticated || !viewPersistenceReadyRef.current) return
@@ -2575,9 +2716,350 @@ export default function App() {
     }
   }
 
+  // ---- History paging: the plumbing ----
+  // Everything here reads the conversation on screen through refs, never through render state:
+  // these functions are called from socket handlers (bound once, in connect) and scroll listeners.
+  const patchHistoryMeta = (key, patch) => {
+    const next = { ...historyMetaRef.current, [key]: { ...(historyMetaRef.current[key] || {}), ...patch } }
+    historyMetaRef.current = next
+    setHistoryMeta(next)
+  }
+  const dropHistoryMeta = (key) => {
+    if (!(key in historyMetaRef.current)) return
+    const next = { ...historyMetaRef.current }
+    delete next[key]
+    historyMetaRef.current = next
+    setHistoryMeta(next)
+  }
+  // Every time a conversation's window is REPLACED (opened, jumped, returned to the present) its
+  // sequence number moves on. A page request remembers the number it started under and throws its
+  // answer away if the number has moved: that page belonged next to a window that is gone.
+  const historySeq = (key) => chatHistoryLoadSeqRef.current[key] || 0
+  const bumpHistorySeq = (key) => {
+    chatHistoryLoadSeqRef.current[key] = historySeq(key) + 1
+    return chatHistoryLoadSeqRef.current[key]
+  }
+  // While a window is being fetched, live messages are also kept aside: one that lands after the
+  // server read the page but before the page is shown would otherwise be lost with the old window.
+  const beginWindowFetch = (key) => {
+    if (!windowFetchRef.current[key]) liveBufferRef.current[key] = []
+    windowFetchRef.current[key] = (windowFetchRef.current[key] || 0) + 1
+  }
+  const endWindowFetch = (key) => {
+    windowFetchRef.current[key] = Math.max(0, (windowFetchRef.current[key] || 0) - 1)
+    if (!windowFetchRef.current[key]) delete liveBufferRef.current[key]
+  }
+  const takeLiveBuffer = (key) => {
+    const held = liveBufferRef.current[key] || []
+    if (windowFetchRef.current[key]) liveBufferRef.current[key] = []
+    return held
+  }
+  // A live message for conversation `key` has arrived. True means "do not add it to the list":
+  // the window on screen is detached, and the message will be there when the reader comes back.
+  const holdLiveMessage = (key, message) => {
+    if (windowFetchRef.current[key]) (liveBufferRef.current[key] = liveBufferRef.current[key] || []).push(message)
+    const meta = historyMetaRef.current[key]
+    if (!meta?.detached) return false
+    patchHistoryMeta(key, { missed: (meta.missed || 0) + 1 })
+    return true
+  }
+
+  // The conversation on screen, as what paging needs to ask the server for more of it.
+  const currentHistoryTarget = () => {
+    if (selectedServerIdRef.current === 'home') {
+      const chat = homeChatRef.current
+      if (!chat) return null
+      const key = chatStorageKey(chat.id)
+      if (chat.type === 'group') return { kind: 'group', key, groupId: chat.id }
+      if (chat.type !== 'friend' && chat.type !== 'dm') return null
+      return { kind: 'dm', key, peer: chat.peerUsername || chat.name }
+    }
+    const held = messagesChannelRef.current
+    if (!held || held.serverId !== selectedServerIdRef.current) return null
+    return { kind: 'channel', key: CHANNEL_HISTORY_KEY, serverId: held.serverId, channelId: held.channelId }
+  }
+  const historyList = (target) =>
+    (target.kind === 'channel' ? messagesRef.current : homeMessagesRef.current[target.key]) || []
+  const setHistoryList = (target, update) => {
+    if (target.kind === 'channel') setMessages((prev) => update(prev))
+    else setHomeMessages((prev) => ({ ...prev, [target.key]: update(prev[target.key] || []) }))
+  }
+
+  const fetchHistoryPage = async (target, params = {}) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    const path = target.kind === 'channel'
+      ? `/servers/${encodeURIComponent(target.serverId)}/channels/${encodeURIComponent(target.channelId)}/messages`
+      : target.kind === 'group'
+        ? `/groups/${encodeURIComponent(target.groupId)}/messages`
+        : `/messages/with/${encodeURIComponent(target.peer)}`
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)])
+    ).toString()
+    const res = await fetch(`${SERVER_URL}${path}${qs ? `?${qs}` : ''}`, { headers: { Authorization: `Bearer ${t}` } })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || "Couldn't load messages")
+    return { messages: data.messages || [], hasMore: !!data.hasMore, hasMoreAfter: !!data.hasMoreAfter }
+  }
+
+  // A page request failed. Nothing asks again for a few seconds (the edge check runs the moment the
+  // row stops saying "loading", so a server that is down would otherwise be asked in a tight loop),
+  // and then the edges are looked at once more: a reader parked at the very top makes no further
+  // scroll events, so without that second look the page would simply never be asked for again.
+  const pauseHistoryPaging = () => {
+    olderRetryAtRef.current = Date.now() + 4000
+    setTimeout(() => historyFnsRef.current.checkEdges?.(), 4100)
+  }
+
+  // Replacing a window moves the sequence number on before the new page is fetched, which makes any
+  // older/newer page still in flight give up without touching its "loading" flag. That is right
+  // when the new window arrives (it resets the flags). When it does not, the old window is still on
+  // screen, and it would say "Loading…" and refuse to page for good.
+  const clearHistoryLoading = (key) => {
+    const meta = historyMetaRef.current[key]
+    if (meta && (meta.loadingOlder || meta.loadingNewer)) patchHistoryMeta(key, { loadingOlder: false, loadingNewer: false })
+  }
+
+  // The reader is at the newest messages of a conversation: move the server's read marker there and
+  // clear the badge. Never called for a detached window. Its newest messages have not been shown,
+  // and marking them read would lose their unread badge for good.
+  const markHistoryRead = (target) => {
+    if (target.kind === 'channel') {
+      socketRef.current?.emit('channel:read', { serverId: target.serverId, channelId: target.channelId })
+      clearChannelUnread(target.serverId, target.channelId)
+    } else if (target.kind === 'dm') {
+      markConversationRead(target.peer, token || localStorage.getItem('lanparty_token'))
+    } else {
+      const t = token || localStorage.getItem('lanparty_token')
+      fetch(`${SERVER_URL}/groups/${encodeURIComponent(target.groupId)}/read`, {
+        method: 'POST', headers: { Authorization: `Bearer ${t}` },
+      }).catch(() => {})
+      setGroupUnread((prev) => {
+        if (!(target.groupId in prev)) return prev
+        const next = { ...prev }
+        delete next[target.groupId]
+        return next
+      })
+    }
+  }
+
+  // Replace a conversation's window with one page. Callers bump the sequence number first.
+  const showHistoryWindow = (target, page, detached) => {
+    // Reaching the present means live messages apply again, including any that arrived mid-fetch.
+    const late = detached ? [] : takeLiveBuffer(target.key)
+    setHistoryList(target, () => mergeHistory(page.messages, late))
+    patchHistoryMeta(target.key, { hasMore: page.hasMore, detached, missed: 0, loadingOlder: false, loadingNewer: false })
+  }
+
+  // The reader is near the top and older messages exist: fetch the page before the oldest loaded.
+  const loadOlderMessages = async () => {
+    const target = currentHistoryTarget()
+    if (!target || windowFetchRef.current[target.key]) return
+    const meta = historyMetaRef.current[target.key]
+    if (!meta?.hasMore || meta.loadingOlder || Date.now() < olderRetryAtRef.current) return
+    const before = edgeMessageId(historyList(target), Math.min)
+    if (before == null) return
+    const seq = historySeq(target.key)
+    patchHistoryMeta(target.key, { loadingOlder: true })
+    try {
+      const page = await fetchHistoryPage(target, { before })
+      if (historySeq(target.key) !== seq) return
+      const list = messagesListRef.current
+      if (list && currentHistoryTarget()?.key === target.key) {
+        pendingScrollRef.current = { fromBottom: list.scrollHeight - list.scrollTop }
+      }
+      setHistoryList(target, (prev) => mergeHistory(page.messages, prev))
+      // An empty page ends it whatever the flag says; otherwise the edge check would ask again forever.
+      patchHistoryMeta(target.key, { hasMore: page.hasMore && page.messages.length > 0, loadingOlder: false })
+    } catch (err) {
+      console.warn('loadOlderMessages failed', err)
+      pauseHistoryPaging()
+      if (historySeq(target.key) === seq) patchHistoryMeta(target.key, { loadingOlder: false })
+    }
+  }
+
+  // The reader reached the bottom of a detached window: fetch the page after the newest loaded.
+  // The last such page reattaches the window to the present.
+  const loadNewerMessages = async () => {
+    const target = currentHistoryTarget()
+    if (!target || windowFetchRef.current[target.key]) return
+    const meta = historyMetaRef.current[target.key]
+    if (!meta?.detached || meta.loadingNewer || Date.now() < olderRetryAtRef.current) return
+    const after = edgeMessageId(historyList(target), Math.max)
+    if (after == null) return
+    const seq = historySeq(target.key)
+    patchHistoryMeta(target.key, { loadingNewer: true })
+    beginWindowFetch(target.key)
+    try {
+      const page = await fetchHistoryPage(target, { after })
+      if (historySeq(target.key) !== seq) return
+      const detached = page.hasMoreAfter && page.messages.length > 0
+      const incoming = detached ? page.messages : [...page.messages, ...takeLiveBuffer(target.key)]
+      const known = new Set(historyList(target).map((m) => String(m.id)))
+      if (incoming.some((m) => !known.has(String(m.id)))) skipFollowRef.current = true
+      setHistoryList(target, (prev) => mergeHistory(prev, incoming))
+      patchHistoryMeta(target.key, { detached, loadingNewer: false, ...(detached ? {} : { missed: 0 }) })
+      // Read markers stood still while the window was detached; this page is where they catch up.
+      if (!detached && currentHistoryTarget()?.key === target.key) markHistoryRead(target)
+    } catch (err) {
+      console.warn('loadNewerMessages failed', err)
+      pauseHistoryPaging()
+      if (historySeq(target.key) === seq) patchHistoryMeta(target.key, { loadingNewer: false })
+    } finally {
+      endWindowFetch(target.key)
+    }
+  }
+
+  // Called on every scroll and after every change to the list: is either edge close enough to
+  // want its next page? Both loaders refuse to run twice at once, so calling this often is cheap.
+  const checkHistoryEdges = () => {
+    const list = messagesListRef.current
+    if (!list) return
+    const target = currentHistoryTarget()
+    const meta = target && historyMetaRef.current[target.key]
+    if (!meta) return
+    if (meta.hasMore && list.scrollTop < 240) loadOlderMessages()
+    if (meta.detached && list.scrollHeight - list.scrollTop - list.clientHeight < 240) loadNewerMessages()
+  }
+
+  // Scroll a loaded message into view and flash it. False when it is not in the loaded window.
+  const flashMessage = (messageId, smooth) => {
+    const list = messagesListRef.current
+    if (!list) return false
+    const el = list.querySelector(`[data-mid="${CSS.escape(String(messageId))}"]`)
+    if (!el) return false
+    stickToBottomRef.current = false // jumping away from the bottom on purpose
+    el.scrollIntoView({ block: 'center', behavior: smooth ? 'smooth' : 'auto' })
+    el.classList.remove('msg-jump-flash')
+    void el.offsetWidth // restart the animation when the same message is jumped to twice
+    el.classList.add('msg-jump-flash')
+    setTimeout(() => el.classList.remove('msg-jump-flash'), 1600)
+    return true
+  }
+
+  // Show the page of history around one message (a search result, or a pin that is not loaded)
+  // and flash it. `onFail` is for a conversation opened just for this: it still needs something.
+  const loadHistoryAround = async (target, messageId, { markRead = false, onFail } = {}) => {
+    const seq = bumpHistorySeq(target.key)
+    beginWindowFetch(target.key)
+    try {
+      // The server is never asked to mark read here: it would mark the whole conversation, and
+      // this page may stop short of its newest messages.
+      const page = await fetchHistoryPage(target, { around: messageId })
+      if (historySeq(target.key) !== seq) return
+      // A home chat left while this was on its way. Showing the page now would store a detached
+      // window for a conversation nobody is looking at: its live messages would be held back, and
+      // the next visit would open on last month. Dropped instead; coming back loads the newest page.
+      if (target.kind !== 'channel' && currentHistoryTarget()?.key !== target.key) {
+        clearHistoryLoading(target.key)
+        return
+      }
+      bumpHistorySeq(target.key) // pages requested for the window this replaces are now stale
+      showHistoryWindow(target, page, page.hasMoreAfter)
+      if (page.messages.some((m) => String(m.id) === String(messageId))) {
+        setJumpHighlight({ key: target.key, id: messageId, n: Date.now() })
+      } else {
+        setToast('That message is no longer there')
+      }
+      if (markRead && !page.hasMoreAfter) markHistoryRead(target)
+    } catch (err) {
+      console.warn('loadHistoryAround failed', err)
+      if (historySeq(target.key) !== seq) return
+      clearHistoryLoading(target.key)
+      setToast("Couldn't load that message")
+      if (onFail) onFail()
+    } finally {
+      endWindowFetch(target.key)
+    }
+  }
+
+  // Back to the newest page and to normal live behaviour. Resolves once that is done (or failed).
+  const jumpToPresent = async () => {
+    const target = currentHistoryTarget()
+    if (!target) return
+    const seq = bumpHistorySeq(target.key)
+    beginWindowFetch(target.key)
+    try {
+      const page = await fetchHistoryPage(target)
+      if (historySeq(target.key) !== seq) return
+      bumpHistorySeq(target.key)
+      if (currentHistoryTarget()?.key === target.key) pendingScrollRef.current = { toBottom: true }
+      showHistoryWindow(target, page, false)
+      markHistoryRead(target)
+    } catch (err) {
+      console.warn('jumpToPresent failed', err)
+      if (historySeq(target.key) !== seq) return
+      clearHistoryLoading(target.key)
+      setToast("Couldn't load the latest messages")
+    } finally {
+      endWindowFetch(target.key)
+    }
+  }
+  // Sending from a detached window: return to the present first, so the new message appears where
+  // it actually is rather than being held back with the other live ones.
+  const ensureLiveHistory = async () => {
+    const target = currentHistoryTarget()
+    if (target && historyMetaRef.current[target.key]?.detached) await jumpToPresent()
+  }
+
+  // See the effect that calls this: a detached window does not outlive the visit that made it.
+  const leaveConversation = (homeKey, serverId, channelId) => {
+    if (homeKey) {
+      if (!historyMetaRef.current[homeKey]?.detached) return
+      bumpHistorySeq(homeKey)
+      setHomeMessages((prev) => {
+        if (!(homeKey in prev)) return prev
+        const next = { ...prev }
+        delete next[homeKey]
+        return next
+      })
+      dropHistoryMeta(homeKey)
+      return
+    }
+    // Only if the list still IS the channel being left: by the time this runs the next channel's
+    // history may already have arrived, and that must not be cleared.
+    const held = messagesChannelRef.current
+    if (!historyMetaRef.current[CHANNEL_HISTORY_KEY]?.detached) return
+    if (!held || held.serverId !== serverId || held.channelId !== channelId) return
+    bumpHistorySeq(CHANNEL_HISTORY_KEY)
+    messagesChannelRef.current = null
+    setMessages([])
+    dropHistoryMeta(CHANNEL_HISTORY_KEY)
+  }
+
+  // The channel list is about to be emptied for a switch: forget its paging state with it, so
+  // nothing pages or holds back live messages against a list that is no longer there.
+  const resetChannelHistory = () => {
+    bumpHistorySeq(CHANNEL_HISTORY_KEY)
+    messagesChannelRef.current = null
+    dropHistoryMeta(CHANNEL_HISTORY_KEY)
+  }
+
+  // See the effect that calls this. "Nothing loaded" is the missing paging state, not an empty list:
+  // a conversation with no messages has been loaded too. One already being fetched is left alone.
+  const loadHomeChatIfMissing = () => {
+    const target = currentHistoryTarget()
+    if (!target || target.kind === 'channel') return
+    if (historyMetaRef.current[target.key] || windowFetchRef.current[target.key]) return
+    if (target.kind === 'group') loadGroupHistory(target.groupId)
+    else loadHomeChatHistory(target.peer, target.key)
+  }
+
+  historyFnsRef.current = {
+    checkEdges: checkHistoryEdges,
+    flashMessage,
+    leaveConversation,
+    loadHomeChatIfMissing,
+    currentKey: () => currentHistoryTarget()?.key,
+    isDetached: () => {
+      const target = currentHistoryTarget()
+      return Boolean(target && historyMetaRef.current[target.key]?.detached)
+    },
+  }
+
   const appendHomeMessage = (chatKey, message) => {
     const key = chatStorageKey(chatKey)
     if (!message?.id) return
+    if (holdLiveMessage(key, message)) return
     setHomeMessages((prev) => {
       const existing = prev[key] || []
       if (existing.some((m) => m.id === message.id)) return prev
@@ -2627,24 +3109,29 @@ export default function App() {
     const t = authToken || token
     if (!t || !peerUsername) return
     const key = chatStorageKey(chatKey)
-    const seq = (chatHistoryLoadSeqRef.current[key] || 0) + 1
-    chatHistoryLoadSeqRef.current[key] = seq
+    const seq = bumpHistorySeq(key)
+    beginWindowFetch(key)
     try {
+      // No cursor: the newest page. Older ones are fetched as the reader scrolls up.
       const res = await fetch(
         `${SERVER_URL}/messages/with/${encodeURIComponent(peerUsername)}?markRead=1`,
         { headers: { Authorization: `Bearer ${t}` } }
       )
-      if (!res.ok) return
-      if (chatHistoryLoadSeqRef.current[key] !== seq) return
+      if (!res.ok) { if (historySeq(key) === seq) clearHistoryLoading(key); return }
       const data = await res.json()
+      if (historySeq(key) !== seq) return
+      bumpHistorySeq(key) // a page requested for the list this replaces no longer fits
       const messages = (data.messages || []).map((m, i) => ({
         ...m,
         id: m.id ?? `${key}-${m.ts}-${i}`,
       }))
-      setHomeMessages((prev) => ({ ...prev, [key]: oldestMessagesFirst(messages) }))
+      showHistoryWindow({ kind: 'dm', key }, { messages, hasMore: !!data.hasMore }, false)
       await loadMessagesData(t)
     } catch (err) {
       console.warn('loadHomeChatHistory failed', err)
+      if (historySeq(key) === seq) clearHistoryLoading(key)
+    } finally {
+      endWindowFetch(key)
     }
   }
 
@@ -2654,17 +3141,22 @@ export default function App() {
     const t = authToken || token || localStorage.getItem('lanparty_token')
     if (!t || !groupId) return
     const key = chatStorageKey(groupId)
-    const seq = (chatHistoryLoadSeqRef.current[key] || 0) + 1
-    chatHistoryLoadSeqRef.current[key] = seq
+    const seq = bumpHistorySeq(key)
+    beginWindowFetch(key)
     try {
       const res = await fetch(`${SERVER_URL}/groups/${encodeURIComponent(groupId)}/messages?markRead=1`, {
         headers: { Authorization: `Bearer ${t}` },
       })
-      if (!res.ok || chatHistoryLoadSeqRef.current[key] !== seq) return
+      if (!res.ok) { if (historySeq(key) === seq) clearHistoryLoading(key); return }
       const data = await res.json()
-      setHomeMessages((prev) => ({ ...prev, [key]: oldestMessagesFirst(data.messages || []) }))
+      if (historySeq(key) !== seq) return
+      bumpHistorySeq(key)
+      showHistoryWindow({ kind: 'group', key }, { messages: data.messages || [], hasMore: !!data.hasMore }, false)
     } catch (err) {
       console.warn('loadGroupHistory failed', err)
+      if (historySeq(key) === seq) clearHistoryLoading(key)
+    } finally {
+      endWindowFetch(key)
     }
   }
 
@@ -2803,7 +3295,12 @@ export default function App() {
       const viewingThisDm = homeChatRef.current?.peerUsername === fromUsername &&
         selectedServerIdRef.current === 'home'
       if (fromUsername && fromUsername !== userName) playUiSound(viewingThisDm && !document.hidden ? 'receive' : 'notify')
-      if (viewingThisDm && !document.hidden) {
+      // Open, but on an older stretch: the message was held back, not shown, so it stays unread
+      // until the reader returns to the present.
+      const heldBack = viewingThisDm && !document.hidden && Boolean(historyMetaRef.current[chatKey]?.detached)
+      if (heldBack) {
+        loadMessagesData(authToken)
+      } else if (viewingThisDm && !document.hidden) {
         markConversationRead(fromUsername, authToken)
       } else {
         loadMessagesData(authToken)
@@ -2839,7 +3336,8 @@ export default function App() {
       if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
       loadServers()
     })
-    // messages:init is `{ serverId, channelId, messages }` (older array shape still accepted).
+    // messages:init is `{ serverId, channelId, messages, hasMore }`: the newest page of the channel
+    // just entered, and whether older ones exist (older array shape still accepted).
     s.on('messages:init', (payload) => {
       // Ignore history for a server we're no longer viewing (e.g. a stale join racing a
       // restored view) so it can't clobber the current channel's list.
@@ -2848,7 +3346,43 @@ export default function App() {
         if (payload.serverId !== viewServer) return
       }
       const msgs = Array.isArray(payload) ? payload : (payload && payload.messages) || []
+      const tagged = payload && !Array.isArray(payload) && payload.serverId && payload.channelId
+      const jump = pendingJumpRef.current
+      const jumpingHere = jump && tagged && jump.serverId === payload.serverId && jump.channelId === payload.channelId
+      // The channel already on screen, sent again: a reconnect (and the resync after a refused send)
+      // re-joins the server, and the answer is only the newest page. Replacing the list with it
+      // would throw away every older page the reader had scrolled through, and their place in them.
+      const held = messagesChannelRef.current
+      const meta = historyMetaRef.current[CHANNEL_HISTORY_KEY]
+      if (tagged && !jumpingHere && meta && held && held.serverId === payload.serverId && held.channelId === payload.channelId) {
+        // Reading an older stretch: it stays. The present is one "Jump to present" away.
+        if (meta.detached) return
+        // Otherwise keep what is loaded and add what was missed, provided the two join up. If they
+        // do not (more than a page arrived while away) there would be a hole, so start afresh below.
+        const loaded = new Set(messagesRef.current.map((m) => String(m.id)))
+        if (msgs.some((m) => loaded.has(String(m.id)))) {
+          setMessages((prev) => mergeHistory(msgs, prev))
+          return
+        }
+      }
+      messagesChannelRef.current = tagged ? { serverId: payload.serverId, channelId: payload.channelId } : null
+      // A fresh window: pages still on their way for the previous one must not be spliced into it.
+      bumpHistorySeq(CHANNEL_HISTORY_KEY)
       setMessages(oldestMessagesFirst(msgs))
+      patchHistoryMeta(CHANNEL_HISTORY_KEY, {
+        hasMore: tagged ? !!payload.hasMore : false, detached: false, missed: 0, loadingOlder: false, loadingNewer: false,
+      })
+      // Arrived here to show one message (a search result)? It is either on this page already, or
+      // further back, in which case the page around it replaces this one.
+      if (jumpingHere) {
+        pendingJumpRef.current = null
+        clearTimeout(jump.timer)
+        if (msgs.some((m) => String(m.id) === String(jump.messageId))) {
+          setJumpHighlight({ key: CHANNEL_HISTORY_KEY, id: jump.messageId, n: Date.now() })
+        } else {
+          loadHistoryAround({ kind: 'channel', key: CHANNEL_HISTORY_KEY, serverId: payload.serverId, channelId: payload.channelId }, jump.messageId)
+        }
+      }
     })
     s.on('channel:joined', ({ serverId, channelId } = {}) => {
       if (!channelId) return
@@ -2882,12 +3416,17 @@ export default function App() {
         const viewServer = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
         if (msg.serverId !== viewServer || msg.channelId !== activeChannelRef.current) return
         // We're looking at this channel right now — advance our read marker so a reload
-        // doesn't count what we just watched arrive.
-        if (selectedServerIdRef.current !== 'home') s.emit('channel:read', { serverId: msg.serverId, channelId: msg.channelId })
+        // doesn't count what we just watched arrive. Not while reading an older stretch of it: the
+        // message is held back below, and something never shown must not be marked read.
+        if (selectedServerIdRef.current !== 'home' && !historyMetaRef.current[CHANNEL_HISTORY_KEY]?.detached) {
+          s.emit('channel:read', { serverId: msg.serverId, channelId: msg.channelId })
+        }
       }
       if (msg && msg.author && msg.author !== userName) playUiSound('receive')
       // Their message has arrived, so they are no longer "typing" it.
       if (msg && msg.author) clearTyping(`channel:${msg.serverId}:${msg.channelId}`, msg.author)
+      // Looking at an older stretch of this channel: the message waits for "Jump to present".
+      if (holdLiveMessage(CHANNEL_HISTORY_KEY, msg)) return
       setMessages(prev => {
         if (prev.some((m) => m.id === msg.id)) return prev
         return oldestMessagesFirst([...prev, msg])
@@ -2899,7 +3438,9 @@ export default function App() {
       if (!serverId || !channelId) return
       if (author && author === userName) return // our own message
       const viewingIt = selectedServerIdRef.current === serverId && activeChannelRef.current === channelId
-      if (viewingIt && !document.hidden) { s.emit('channel:read', { serverId, channelId }); return }
+      // A detached window is not showing this message, so it counts as unread like any other.
+      const heldBack = Boolean(historyMetaRef.current[CHANNEL_HISTORY_KEY]?.detached)
+      if (viewingIt && !document.hidden && !heldBack) { s.emit('channel:read', { serverId, channelId }); return }
       setChannelUnreads((prev) => {
         const srv = { ...(prev[serverId] || {}) }
         srv[channelId] = (srv[channelId] || 0) + 1
@@ -3040,6 +3581,11 @@ export default function App() {
       if (message.author === me) return
       const reading = isOpenGroup(groupId) && !document.hidden
       playUiSound(reading ? 'receive' : 'notify')
+      // Open on an older stretch: held back and not shown, so it is unread until they come back.
+      if (reading && historyMetaRef.current[chatStorageKey(groupId)]?.detached) {
+        setGroupUnread((prev) => ({ ...prev, [groupId]: (prev[groupId] || 0) + 1 }))
+        return
+      }
       if (reading) {
         fetch(`${SERVER_URL}/groups/${encodeURIComponent(groupId)}/read`, {
           method: 'POST', headers: { Authorization: `Bearer ${authToken}` },
@@ -3331,6 +3877,7 @@ export default function App() {
   const handleSelectServer = (id) => {
     setSelectedServerId(id)
     if (id !== 'home' && socketRef.current) {
+      resetChannelHistory()
       setMessages([])
       socketRef.current.emit('join', { serverId: id, name })
     }
@@ -3619,6 +4166,7 @@ export default function App() {
     // the active one (in which case the state-change effect below wouldn't fire).
     setMobileNavOpen(false)
     setActiveChannel(channelId)
+    resetChannelHistory()
     setMessages([]) // drop the previous channel's messages so the scroll-to-bottom runs on fresh content
     const serverId = currentServerId()
     socket.emit('joinChannel', { serverId, channelId })
@@ -3927,6 +4475,7 @@ export default function App() {
     setShowGifPicker(false)
     setUploadError(null)
     setUploadingFile(true)
+    await ensureLiveHistory()
     try {
       const attachment = await uploadSelectedFile()
       socket.emit('message', { serverId: currentServerId(), channelId: activeChannel, text: body, attachment, quotes: pendingQuotes.length > 0 ? pendingQuotes : undefined })
@@ -4952,6 +5501,13 @@ export default function App() {
     setOutgoingFriendRequests([])
     setDmConversations([])
     setGroupChats([])
+    // Paging state describes lists that belong to the account signing out.
+    historyMetaRef.current = {}
+    setHistoryMeta({})
+    messagesChannelRef.current = null
+    clearTimeout(pendingJumpRef.current?.timer)
+    pendingJumpRef.current = null
+    setShowSearch(false)
     setTotalUnreadMessages(0)
     setUnreadByChatId({})
     setGroupUnread({})
@@ -5316,6 +5872,7 @@ export default function App() {
 
   // Send an image/media attachment to the current channel or DM/group (shared by collab-save).
   const sendMediaMessage = async (attachment) => {
+    await ensureLiveHistory()
     if (showHomeChat && homeChat) {
       if (homeChat.type === 'friend' || homeChat.type === 'dm') {
         const peerUsername = homeChat.peerUsername || homeChat.name
@@ -5414,18 +5971,79 @@ export default function App() {
   // ---- Pinning (channel messages) ----
   const pinMessage = (messageId) => { if (socket && messageId) socket.emit('message:pin', { id: messageId }) }
   const unpinMessage = (messageId) => { if (socket && messageId) socket.emit('message:unpin', { id: messageId }) }
-  // Scroll a message into view and flash it. Used from the pin bar and the View Pins list.
+  // Scroll a message of the conversation on screen into view and flash it. Used from the pin bar,
+  // the View Pins list and search results.
   const jumpToMessage = (messageId) => {
     setShowPinsModal(false)
     setPinBarMenu(null)
-    const list = messagesListRef.current
-    if (!list) return
-    const el = list.querySelector(`[data-mid="${CSS.escape(String(messageId))}"]`)
-    if (!el) return // not currently loaded (e.g. very old) — nothing to scroll to
-    stickToBottomRef.current = false // jumping away from the bottom on purpose
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    el.classList.add('msg-jump-flash')
-    setTimeout(() => el.classList.remove('msg-jump-flash'), 1600)
+    if (flashMessage(messageId, true)) return
+    // Not in the loaded window. History is paged, so that is the normal case for anything old:
+    // fetch the page around it instead of doing nothing.
+    const target = currentHistoryTarget()
+    if (target) loadHistoryAround(target, messageId)
+  }
+
+  // Open the conversation a search result came from and show that message in it.
+  const jumpToSearchResult = async (result) => {
+    const messageId = result?.message?.id
+    if (!messageId) return
+    setShowSearch(false)
+    setMobileNavOpen(false) // reveal the chat on phones
+    if (result.kind === 'channel') {
+      const s = socketRef.current
+      if (!s) return
+      const sameServer = selectedServerId === result.serverId
+      const held = messagesChannelRef.current
+      if (sameServer && activeChannel === result.channelId && held?.channelId === result.channelId) {
+        jumpToMessage(messageId)
+        return
+      }
+      // Somewhere else: ask the socket to take us there, and let messages:init finish the jump once
+      // that channel's history is in. If we are never let in (channel deleted, access removed) the
+      // request is dropped rather than left armed for the next time that channel is opened.
+      clearTimeout(pendingJumpRef.current?.timer)
+      const jump = { serverId: result.serverId, channelId: result.channelId, messageId, timer: null }
+      jump.timer = setTimeout(() => {
+        if (pendingJumpRef.current !== jump) return
+        pendingJumpRef.current = null
+        setToast("Couldn't open that message")
+      }, 8000)
+      pendingJumpRef.current = jump
+      if (sameServer) { joinChannel(result.channelId); return }
+      // Another server: entering it lands in its first channel, and only then can we move on to the
+      // one we want (the same two-step, for the same reason, as opening a notification).
+      const hop = () => s.emit('joinChannel', { serverId: result.serverId, channelId: result.channelId })
+      const onJoined = ({ serverId, channelId } = {}) => {
+        if (serverId !== result.serverId) return
+        s.off('channel:joined', onJoined)
+        clearTimeout(giveUp)
+        if (channelId !== result.channelId) hop()
+      }
+      const giveUp = setTimeout(() => s.off('channel:joined', onJoined), 8000)
+      s.on('channel:joined', onJoined)
+      handleSelectServer(result.serverId)
+      return
+    }
+    if (result.kind === 'dm') {
+      const matches = (item) => (item.peerUsername || item.name) === result.peer
+      if (showHomeChat && homeChat.type !== 'group' && matches(homeChat)) { jumpToMessage(messageId); return }
+      const known = dmConversations.find(matches) || friends.find(matches)
+      if (!known) { setToast("Couldn't open that conversation"); return }
+      setSelectedServerId('home')
+      setLeftNav('messages')
+      openPeerChat('dm', { ...known, peerUsername: known.peerUsername || known.name }, messageId)
+      return
+    }
+    if (result.kind === 'group') {
+      if (showHomeChat && homeChat.type === 'group' && String(homeChat.id) === String(result.groupId)) { jumpToMessage(messageId); return }
+      const find = (list) => (list || []).find((g) => String(g.id) === String(result.groupId))
+      // Not in the list we have: it may simply be newer than our last load.
+      const group = find(groupChats) || find(await loadGroupsData())
+      if (!group) { setToast("Couldn't open that conversation"); return }
+      setSelectedServerId('home')
+      setLeftNav('messages')
+      openGroupChat(group, messageId)
+    }
   }
 
   // ---- Quoted replies (Teams-style) ----
@@ -5507,7 +6125,23 @@ export default function App() {
     }
   }
 
-  const openPeerChat = (type, item) => {
+  // Open a home chat on the page around one message rather than on its newest page. What is cached
+  // for it is dropped first, so the chat opens straight onto that page instead of showing the newest
+  // messages for a moment and then leaping away from them. Opening counts as reading it only if the
+  // page reaches the newest messages (markRead, see loadHistoryAround).
+  const openHistoryAround = (target, messageId, loadNewest) => {
+    setHomeMessages((prev) => {
+      if (!(target.key in prev)) return prev
+      const next = { ...prev }
+      delete next[target.key]
+      return next
+    })
+    dropHistoryMeta(target.key)
+    loadHistoryAround(target, messageId, { markRead: true, onFail: loadNewest })
+  }
+
+  // `aroundMessageId` opens the chat at that message (a search result) instead of at the newest.
+  const openPeerChat = (type, item, aroundMessageId) => {
     const peerUsername = item.peerUsername || item.name
     const chatId = chatStorageKey(item.id)
     // Capture unread count before it's cleared so the scroll lands on the first unread message.
@@ -5525,7 +6159,11 @@ export default function App() {
     }
     setSelectedGroupId(null)
     if (type === 'friend' || type === 'dm') {
-      loadHomeChatHistory(peerUsername, chatId)
+      if (aroundMessageId) {
+        openHistoryAround({ kind: 'dm', key: chatId, peer: peerUsername }, aroundMessageId, () => loadHomeChatHistory(peerUsername, chatId))
+      } else {
+        loadHomeChatHistory(peerUsername, chatId)
+      }
     }
     if (type === 'group') {
       setGroupUnread((prev) => {
@@ -5545,7 +6183,10 @@ export default function App() {
     openPeerChat('dm', { ...dm, peerUsername: dm.peerUsername || dm.name })
   }
 
-  const handleSelectGroup = (group) => {
+  // Takes only the group: it is handed to the conversation list as a click handler.
+  const handleSelectGroup = (group) => openGroupChat(group)
+
+  const openGroupChat = (group, aroundMessageId) => {
     pendingUnreadScrollRef.current = groupUnread[group.id] || 0
     setShowMembersPanel(false)
     setMobileNavOpen(false) // reveal the conversation on phones, as DMs do
@@ -5554,8 +6195,13 @@ export default function App() {
     setSelectedFriendId(null)
     setSelectedDmId(null)
     setHomeChat({ type: 'group', id: group.id, name: group.name })
-    loadGroupHistory(group.id)
-    setGroupUnread((prev) => {
+    if (aroundMessageId) {
+      openHistoryAround({ kind: 'group', key: chatStorageKey(group.id), groupId: group.id }, aroundMessageId, () => loadGroupHistory(group.id))
+    } else {
+      loadGroupHistory(group.id)
+    }
+    // Opened at an old message, the unread ones may not be on the page: the badge stays until they are.
+    if (!aroundMessageId) setGroupUnread((prev) => {
       if (!prev[group.id]) return prev
       const next = { ...prev }
       delete next[group.id]
@@ -5571,6 +6217,7 @@ export default function App() {
     setShowGifPicker(false)
     setUploadError(null)
     setUploadingFile(true)
+    await ensureLiveHistory()
     let attachment = null
     try {
       attachment = await uploadSelectedFile()
@@ -5908,6 +6555,7 @@ export default function App() {
 
   // Route a GIF message to whatever is on screen: a DM, a local group chat, or a server channel.
   const deliverGifMessage = async (attachment, body) => {
+    await ensureLiveHistory()
     if (showHomeChat && homeChat) {
       if (homeChat.type === 'friend' || homeChat.type === 'dm') {
         const peerUsername = homeChat.peerUsername || homeChat.name
@@ -6148,6 +6796,54 @@ export default function App() {
   const serverEmojiGroups = serverState?.server
     ? [{ serverId: serverState.server.id, serverName: serverState.server.name || 'Server', emojis: serverEmojis[serverState.server.id] || [] }]
     : []
+
+  // ---- History paging: what the message list shows at its edges ----
+  const activeHistoryMeta = historyMeta[showHomeChat ? chatStorageKey(homeChat.id) : CHANNEL_HISTORY_KEY]
+  // Top of the list. While older messages exist the row is always there, at a fixed height, and
+  // only its text comes and goes: a row that appeared when loading began would itself shove the
+  // messages down under the reader's eyes.
+  const renderHistoryStart = () => {
+    if (!activeHistoryMeta) return null
+    if (activeHistoryMeta.hasMore) {
+      return (
+        <div className="history-edge" aria-live="polite">
+          {activeHistoryMeta.loadingOlder ? 'Loading earlier messages…' : '\u00a0'}
+        </div>
+      )
+    }
+    if (activeHistoryMeta.hasMore === false) return <div className="history-edge start">Beginning of the conversation</div>
+    return null
+  }
+  // Bottom of a detached window: more of the conversation follows, and loads on reaching it.
+  const renderHistoryEnd = () => (activeHistoryMeta?.detached
+    ? <div className="history-edge" aria-live="polite">{activeHistoryMeta.loadingNewer ? 'Loading newer messages…' : '\u00a0'}</div>
+    : null)
+  // The way back from a detached window. Outside the scrolling list so it is always in reach.
+  const renderPresentBar = () => {
+    if (!activeHistoryMeta?.detached) return null
+    const missed = activeHistoryMeta.missed || 0
+    return (
+      <button type="button" className="history-present-bar" onClick={jumpToPresent}>
+        <span className="history-present-note">
+          {missed ? `${missed} new message${missed === 1 ? '' : 's'} since you jumped back` : "You're viewing older messages"}
+        </span>
+        <span className="history-present-go">Jump to present ↓</span>
+      </button>
+    )
+  }
+
+  // What "This conversation" means to the search panel right now (null: nothing to search here,
+  // e.g. the Home landing or a voice channel, where only "Everywhere" makes sense).
+  const searchHere = showHomeChat
+    ? homeChat.type === 'group'
+      ? { key: `group:${homeChat.id}`, label: homeChat.name, params: { scope: 'group', groupId: String(homeChat.id) } }
+      : { key: `dm:${homeChat.peerUsername || homeChat.name}`, label: `@${homeChat.peerUsername || homeChat.name}`, params: { scope: 'dm', with: homeChat.peerUsername || homeChat.name } }
+    : !isHomeView && activeChannelType === 'text' && activeChannel
+      ? { key: `channel:${selectedServerId}:${activeChannel}`, label: `#${activeChannelName}`, params: { scope: 'channel', serverId: selectedServerId, channelId: activeChannel } }
+      : null
+  const searchServer = isHomeView ? null : { id: selectedServerId, name: serverName }
+  // An unnamed group comes back from search with an empty name; the list already knows what to call it.
+  const searchGroupLabel = (groupId) => groupChats.find((g) => String(g.id) === String(groupId))?.name || ''
 
   const renderComposer = (placeholder, onSend) => {
     const canSend = Boolean(text.trim() || pendingFile || composerStack.length) && !uploadingFile
@@ -6574,6 +7270,18 @@ export default function App() {
                   </div>
 
                   <div className="topbar-right" style={{display:'flex',gap:8,alignItems:'center'}}>
+                    <button
+                      type="button"
+                      className="topbar-icon-btn"
+                      onClick={() => setShowSearch(true)}
+                      title="Search messages"
+                      aria-label="Search messages"
+                    >
+                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true">
+                        <circle cx="10.5" cy="10.5" r="6.5" />
+                        <path d="M15.5 15.5 21 21" />
+                      </svg>
+                    </button>
                     {!isDesktopApp && (
                       <button className="create-app-btn" onClick={() => {
                         if (deferredPrompt) {
@@ -6610,8 +7318,9 @@ export default function App() {
                     <div className="empty-title">No messages yet</div>
                     <div className="empty-sub">Say hello to {homeChat.name}!</div>
                   </div>
-                ) : (
-                  homeChatMessages.map((m, i) => (
+                ) : (<>
+                  {renderHistoryStart()}
+                  {homeChatMessages.map((m, i) => (
                     <ChatMessage
                       key={m.id ?? `${m.ts}-${i}`}
                       message={m}
@@ -6630,10 +7339,12 @@ export default function App() {
                       onSaveEmoji={saveCustomEmojiFromChat}
                       onForward={openForward}
                     />
-                  ))
-                )}
+                  ))}
+                  {renderHistoryEnd()}
+                </>)}
               </div>
 
+              {renderPresentBar()}
               {renderComposer(`Message ${homeChat.name}`, sendHomeMessage)}
             </>
           )}
@@ -6674,8 +7385,9 @@ export default function App() {
                     <div className="empty-title">No messages yet</div>
                     <div className="empty-sub">Be the first to say something!</div>
                   </div>
-                ) : (
-                  messages.map((m, i) => (
+                ) : (<>
+                  {renderHistoryStart()}
+                  {messages.map((m, i) => (
                     <ChatMessage
                       key={m.id ?? `${m.ts}-${i}`}
                       message={m}
@@ -6697,10 +7409,12 @@ export default function App() {
                       onUnpin={unpinMessage}
                       isPinned={pinnedIdSet.has(m.id)}
                     />
-                  ))
-                )}
+                  ))}
+                  {renderHistoryEnd()}
+                </>)}
               </div>
 
+              {renderPresentBar()}
               {renderComposer(`Message #${activeChannelName}`, sendMessage)}
             </>
           )}
@@ -6993,6 +7707,18 @@ export default function App() {
         </div>
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
+
+      {/* Message search. Kept mounted so the last query and its results are still there on reopening. */}
+      <SearchPanel
+        open={showSearch}
+        onClose={() => setShowSearch(false)}
+        authedFetch={authedFetch}
+        here={searchHere}
+        server={searchServer}
+        onJump={jumpToSearchResult}
+        formatTime={formatMessageTime}
+        groupLabel={searchGroupLabel}
+      />
 
       {/* Right-click menu on the pin bar: View Pins / Unpin the latest */}
       {pinBarMenu && createPortal(

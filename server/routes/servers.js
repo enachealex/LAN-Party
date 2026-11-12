@@ -2,9 +2,10 @@
 // and channels, private-channel member lists, and membership (roster/invite/kick/role/leave).
 // Role checks and the state broadcasts are shared with the socket layer, so they are injected.
 const { mentionedUsernames } = require('../services/push');
+const { parsePageQuery, fetchPage, channelHistory } = require('../services/history');
 
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile }) {
   // The rail shows only the servers the user owns or has been invited to. New users start with an
   // empty rail (no server is auto-joined at registration) and land on the home view.
   app.get('/servers', authMiddleware, async (req, res) => {
@@ -104,6 +105,24 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     }
     await broadcastServerState(serverId);
     return res.json({ channel: { id: chId, name, type, privacy } });
+  });
+
+  // A page of a channel's history: what the client asks for when the reader scrolls back, or jumps
+  // to a search result. Held to the rule joinChannel applies (the channel belongs to the server and
+  // this user may open it), since it returns exactly what joining would. It deliberately does not
+  // mark the channel read: fetching older messages says nothing about having seen the newest ones.
+  app.get('/servers/:serverId/channels/:channelId/messages', authMiddleware, async (req, res) => {
+    const { serverId, channelId } = req.params;
+    const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+    if (!ch) return res.status(404).json({ error: 'Channel not found' });
+    const role = await roleOf(serverId, req.user.username);
+    if (!(await canAccessChannel(serverId, channelId, req.user.username, ch.privacy, role))) {
+      return res.status(403).json({ error: 'You do not have access to this channel' });
+    }
+    const page = parsePageQuery(req.query);
+    if ('error' in page) return res.status(400).json({ error: page.error });
+    const { rows, hasMore, hasMoreAfter } = await fetchPage(db, channelHistory(serverId, channelId), page);
+    return res.json({ messages: rows.map((m) => mapMessageRow(m, req.user.username)), hasMore, hasMoreAfter });
   });
 
   // Read / manage a private channel's access list (owner/admins only). Public channels have none.

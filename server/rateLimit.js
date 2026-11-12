@@ -35,13 +35,18 @@ function callerKey(req) {
 }
 
 /**
- * @param {{ id: string, windowMs: number, max: number, message?: string }} opts
+ * `keyOf` lets a route that already knows who is calling count by that instead of by address: an
+ * account name cannot be changed per request the way a forwarded header can. Returning nothing falls
+ * back to the address.
+ * @param {{ id: string, windowMs: number, max: number, message?: string, keyOf?: (req: any) => string | null | undefined }} opts
  * @returns {(req: any, res: any, next: Function) => void} express middleware
  */
-function rateLimit({ id, windowMs, max, message }) {
+function rateLimit({ id, windowMs, max, message, keyOf }) {
   return function limiter(req, res, next) {
     const now = Date.now();
-    const key = `${callerKey(req)}:${id}`;
+    const who = keyOf ? keyOf(req) : null;
+    // The prefix keeps an account called "10.0.0.5" out of that address's bucket.
+    const key = `${who ? `user:${who}` : callerKey(req)}:${id}`;
     let b = buckets.get(key);
     if (!b || b.resetAt <= now) {
       b = { count: 0, resetAt: now + windowMs };

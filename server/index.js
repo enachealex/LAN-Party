@@ -27,6 +27,8 @@ const { registerServerRoutes } = require('./routes/servers');
 const { registerInviteRoutes } = require('./routes/invites');
 const { registerLibraryRoutes } = require('./routes/library');
 const { registerPushRoutes } = require('./routes/push');
+const { registerSearchRoutes } = require('./routes/search');
+const { PAGE_DEFAULT, fetchPage, channelHistory } = require('./services/history');
 const { rateLimit } = require('./rateLimit');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
@@ -1123,7 +1125,7 @@ async function main() {
   }
 
   // Servers / channels / membership (routes/servers.js).
-  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile });
+  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile });
 
   // Shareable invite links (routes/invites.js).
   registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput });
@@ -1143,6 +1145,9 @@ async function main() {
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
   registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
+
+  // Message search across channels, DMs and groups (routes/search.js).
+  registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChannel, visibleChannelsFor, getUserByUsername, canDirectMessage, parseAttachment });
 
   app.post('/files/upload', authMiddleware, (req, res) => {
     upload.single('file')(req, res, (err) => {
@@ -1245,21 +1250,37 @@ async function main() {
     });
   });
 
-  // Sync endpoint: return servers, channels, and messages
+  // Sync endpoint: the servers, channels and newest messages the caller may open.
+  // It used to read every server, every channel and every message for anyone with a token, which
+  // made the access rules on the paged routes and on search beside the point. It now goes through
+  // the same checks they do (the commons plus real membership rows, then visibleChannelsFor) and
+  // sends only the newest page of each channel, like 'messages:init'.
   app.get('/user/sync', authMiddleware, async (req, res) => {
-    // for demo return full demo server
-    const rows = await db.all('SELECT * FROM servers');
-    const result = {};
-    for (const s of rows) {
-      const channels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
-      const messagesByChannel = {};
-      for (const ch of channels) {
-        const msgs = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', s.id, ch.id);
-        messagesByChannel[ch.id] = msgs.map((m) => mapMessageRow(m, req.user.username));
+    try {
+      const me = req.user.username;
+      const rows = await db.all(
+        `SELECT s.id, s.name, 'member' AS role FROM servers s WHERE s.id = ?
+         UNION ALL
+         SELECT s.id, s.name, m.role FROM server_members m JOIN servers s ON s.id = m.server_id
+          WHERE m.username = ? AND s.id != ?`,
+        DEMO_ID, me, DEMO_ID
+      );
+      const result = {};
+      for (const s of rows) {
+        const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
+        const channels = await visibleChannelsFor(s.id, allChannels, me, s.role);
+        const messagesByChannel = {};
+        for (const ch of channels) {
+          const page = await fetchPage(db, channelHistory(s.id, ch.id), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
+          messagesByChannel[ch.id] = page.rows.map((m) => mapMessageRow(m, me));
+        }
+        result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
       }
-      result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
+      return res.json({ servers: result });
+    } catch (e) {
+      console.error('[sync] error:', e);
+      return res.status(500).json({ error: 'Server error' });
     }
-    return res.json({ servers: result });
   });
 
   // SFU (mediasoup) for voice rooms — feature-detected by clients via sfu:caps; when disabled or
@@ -1329,11 +1350,12 @@ async function main() {
       if (firstText) {
         socket.join(`channel:${serverId}:${firstText.id}`);
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, firstText.id);
-        socket.emit('messages:init', { serverId, channelId: firstText.id, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
+        // Only the newest page: the rest is fetched as the reader scrolls back (GET .../messages?before=).
+        const page = await fetchPage(db, channelHistory(serverId, firstText.id), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
+        socket.emit('messages:init', { serverId, channelId: firstText.id, messages: page.rows.map((m) => mapMessageRow(m, socketUser)), hasMore: page.hasMore });
         await markChannelRead(socketUser, serverId, firstText.id); // history was just shown
       } else {
-        socket.emit('messages:init', { serverId, channelId: null, messages: [] });
+        socket.emit('messages:init', { serverId, channelId: null, messages: [], hasMore: false });
       }
     });
 
@@ -1349,8 +1371,8 @@ async function main() {
       socket.join(`channel:${serverId}:${channelId}`);
       socket.emit('channel:joined', { serverId, channelId });
       if (ch.type === 'text') {
-        const messages = await db.all('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? ORDER BY ts ASC', serverId, channelId);
-        socket.emit('messages:init', { serverId, channelId, messages: (messages || []).map((m) => mapMessageRow(m, socketUser)) });
+        const page = await fetchPage(db, channelHistory(serverId, channelId), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
+        socket.emit('messages:init', { serverId, channelId, messages: page.rows.map((m) => mapMessageRow(m, socketUser)), hasMore: page.hasMore });
         socket.emit('pins:updated', { serverId, channelId, pins: await channelPins(serverId, channelId, socketUser) });
       }
       await markChannelRead(socketUser, serverId, channelId);

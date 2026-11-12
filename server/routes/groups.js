@@ -10,6 +10,7 @@
 // - Non-members get a 404, never a 403, so a group's existence isn't revealed by guessing ids.
 // - Every change is pushed to each member's `user:<name>` room. Clients never have to poll.
 const crypto = require('crypto');
+const { parsePageQuery, fetchPage } = require('../services/history');
 
 const GROUP_MAX_MEMBERS = 25;
 const GROUP_NAME_MAX = 60;
@@ -161,8 +162,9 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     await broadcastGroup(groupId);
   }
 
-  const MESSAGE_SELECT = `SELECT gm.id, gm.body AS text, gm.created_at AS ts, gm.attachment_json, gm.reactions_json, gm.quotes_json, gm.edited_at, u.username AS author
-       FROM group_messages gm JOIN users u ON u.id = gm.sender_id`;
+  const MESSAGE_COLUMNS = 'gm.id, gm.body AS text, gm.created_at AS ts, gm.attachment_json, gm.reactions_json, gm.quotes_json, gm.edited_at, u.username AS author';
+  const MESSAGE_FROM = 'group_messages gm JOIN users u ON u.id = gm.sender_id';
+  const MESSAGE_SELECT = `SELECT ${MESSAGE_COLUMNS} FROM ${MESSAGE_FROM}`;
 
   app.get('/groups', authMiddleware, async (req, res) => {
     const me = await getUserByUsername(req.user.username);
@@ -251,9 +253,14 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
   app.get('/groups/:id/messages', authMiddleware, async (req, res) => {
     const ctx = await requireMember(req, res);
     if (!ctx) return;
+    // Before markRead, so a request that is going to be refused changes nothing.
+    const page = parsePageQuery(req.query);
+    if ('error' in page) return res.status(400).json({ error: page.error });
     if (req.query.markRead === '1' || req.query.markRead === 'true') await markRead(ctx.groupId, ctx.me);
-    const rows = await db.all(`${MESSAGE_SELECT} WHERE gm.group_id = ? ORDER BY gm.created_at ASC, gm.id ASC`, ctx.groupId);
-    return res.json({ messages: rows.map((r) => mapMessageRow(r, ctx.me.username)) });
+    const { rows, hasMore, hasMoreAfter } = await fetchPage(db, {
+      columns: MESSAGE_COLUMNS, from: MESSAGE_FROM, where: 'gm.group_id = ?', params: [ctx.groupId], idCol: 'gm.id',
+    }, page);
+    return res.json({ messages: rows.map((r) => mapMessageRow(r, ctx.me.username)), hasMore, hasMoreAfter });
   });
 
   app.post('/groups/:id/read', authMiddleware, async (req, res) => {
