@@ -67,6 +67,24 @@ describe('extractBundle', () => {
     assert.ok(fs.existsSync(path.join(dest, 'css', 'style.css')));
   });
 
+  // A zip of a folder. The app is served from the top of its directory, so an index.html left one
+  // level down would be offered to a whole voice room and open as a 404.
+  test('a zip whose index.html is inside a folder is re-rooted at that folder', () => {
+    const dest = freshDest();
+    const { entry } = extractBundle(zipFile({
+      'myapp/index.html': strToU8('<script src="js/app.js"></script>'),
+      'myapp/js/app.js': strToU8('console.log(1)'),
+      'README.txt': strToU8('outside the app folder'),
+      '__MACOSX/myapp/._index.html': strToU8('junk'),
+    }), dest);
+    assert.equal(entry, 'index.html');
+    assert.equal(fs.readFileSync(path.join(dest, 'index.html'), 'utf8'), '<script src="js/app.js"></script>');
+    assert.ok(fs.existsSync(path.join(dest, 'js', 'app.js')), 'relative paths inside the folder still resolve');
+    assert.equal(fs.existsSync(path.join(dest, 'myapp')), false);
+    assert.equal(fs.existsSync(path.join(dest, 'README.txt')), false, 'files outside the app folder are not kept');
+    assert.equal(fs.existsSync(path.join(dest, '__MACOSX')), false);
+  });
+
   test('rejects a zip with no index.html', () => {
     assert.throws(() => extractBundle(zipFile({ 'app.js': strToU8('x') }), freshDest()), /index\.html/);
   });

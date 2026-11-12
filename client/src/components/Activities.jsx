@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import AppActivity from './AppActivity'
 
 // Built-in, self-contained activities. Whatever's active is shared with everyone in the voice
 // channel and kept in sync by the server — no launch/invite dance. Add a new activity by adding an
@@ -25,9 +26,17 @@ function ytId(input) {
   return m ? m[1] : null
 }
 
-export default function ActivityPanel({ activity, me, onEvent, onClose, askPrompt }) {
+export default function ActivityPanel({ activity, me, onEvent, onClose, askPrompt, appHost }) {
   if (!activity) return null
   const { type, state, by } = activity
+  // An uploaded app is not one of the built-ins above: it has its own panel (a Join card first,
+  // then the sandboxed frame), in AppActivity. Keyed per run (the server names each one) so a
+  // different app, or the same one started again, begins at the card instead of inheriting the last
+  // one's "joined" — and whoever started it is auto-joined again, as the server already has them.
+  if (type === 'app') {
+    if (!appHost || !state) return null
+    return <AppActivity key={state.run || `${state.appId}:${by}`} activity={activity} me={me} onEvent={onEvent} onClose={onClose} {...appHost} autoJoin={appHost.startedAppId === state.appId && by === me} description={appHost.descriptionFor?.(state.appId) || ''} />
+  }
   const meta = ACTIVITY_TYPES.find((a) => a.id === type)
   return (
     <div className="activity-panel">

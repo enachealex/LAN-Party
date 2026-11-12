@@ -317,6 +317,22 @@ async function main() {
   // SPA catch-all (which would serve the client shell for a bundle path — misleading, and it would
   // mask a bundle's broken asset references).
   app.use('/app-bundles', (req, res) => res.status(404).type('txt').send('Not found'));
+  // The app bridge SDK that uploaded mini-apps load with <script src="/sdk/lanparty.js">. A bundle
+  // document runs in an opaque origin (see the sandbox CSP above), so to it this is a cross-origin
+  // fetch: the CORS header keeps it loadable however the app pulls it in (plain script, module,
+  // fetch). The file is public and identical for everyone — there is nothing here to protect.
+  // Short cache so a fixed shim reaches running apps within minutes, not whenever caches expire.
+  const SDK_FILE = path.join(__dirname, 'sdk', 'lanparty.js');
+  app.get('/sdk/lanparty.js', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.type('application/javascript').sendFile(SDK_FILE);
+  });
+  // Terminal for the same reason as the mounts above: a mistyped SDK path must 404, not hand a
+  // <script> tag the SPA shell with a 200.
+  app.use('/sdk', (req, res) => res.status(404).type('txt').send('Not found'));
   // Static images used by the landing page (app screenshots). Committed with the repo.
   app.use('/landing-assets', express.static(path.join(__dirname, 'landing-assets'), { redirect: false }));
   // Digital Asset Links for the Android app (a Trusted Web Activity). Chrome fetches this to verify
@@ -422,7 +438,19 @@ async function main() {
   // --- Activities: one shared activity per voice room, synced to everyone in it ---
   const activities = {}; // room -> { type, state, by }
   // Activity state machine + per-socket views (services/activities.js).
-  const { ACTIVITY_TYPES, activityInit, applyActivityEvent, activityViewFor, broadcastActivity } = createActivities({ io, clients });
+  const {
+    ACTIVITY_TYPES, activityInit, applyActivityEvent, activityViewFor, broadcastActivity,
+    APP_ACTIVITY, appActivityInit, applyAppEvent, appLeave, appJoinedSockets, appEventAllowed, forgetAppSocket,
+  } = createActivities({ io, clients });
+  // An app that is deleted while a room is running it: end it there. The bundle's files are about to
+  // go, and a room left pointing at them would offer everyone a "Join" that opens a 404.
+  function endAppActivities(appId) {
+    for (const [room, act] of Object.entries(activities)) {
+      if (act.type !== APP_ACTIVITY || act.state.appId !== appId) continue;
+      delete activities[room];
+      io.to(room).emit('activity:update', null);
+    }
+  }
 
   // Message parsing/serialisation + reaction & pin storage (services/messages.js).
   const {
@@ -1134,7 +1162,7 @@ async function main() {
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities });
 
   // Tenor / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });
@@ -1290,6 +1318,14 @@ async function main() {
   // Socket.IO handlers
   io.on('connection', (socket) => {
     console.log('socket connected', socket.id);
+    // Handlers below take their payload as `({ a, b } = {})`. That default covers a missing payload
+    // but not an explicit null, and destructuring null throws — inside an async handler that is an
+    // unhandled rejection, which ends the process. Any socket could do it, logged in or not, so a
+    // null payload is turned into a missing one here, once, before any handler sees it.
+    socket.use((packet, next) => {
+      if (packet[1] === null) packet[1] = undefined;
+      next();
+    });
     // The voice room this socket currently occupies (sockets join at most one voice room).
     const voiceRoomOf = (s) => { for (const r of s.rooms) if (r.startsWith('voice:')) return r; return null; };
     // try to read token from handshake. Read BEFORE anything is bound, so the membership guard below
@@ -1596,24 +1632,92 @@ async function main() {
     });
 
     // Activities: start one for the voice room (everyone in it gets it), relay events, or stop.
-    socket.on('activity:start', async ({ serverId = 'demo', channelId = 'voice1', type } = {}) => {
+    //
+    // An uploaded app as the activity (type 'app') is held to a tighter rule than the built-ins:
+    // the sender must be IN the voice room, not merely a member of the server. Its events come from
+    // untrusted uploaded code and are fanned out to the room, so only someone the room can see (and
+    // who can see the room) gets to start, drive or end one. While an app is the room's activity
+    // that also covers replacing it with a built-in, which would otherwise be a way to end it from
+    // outside. Built-in activities with no app involved keep the membership check they always had.
+    const appName = () => socketUser || clients[socket.id]?.name || 'Anon';
+    const outsideAppRoom = (room) => activities[room]?.type === APP_ACTIVITY && !socket.rooms.has(room);
+    // The joined list changed. Nobody is re-sent the app's shared state for that (up to 64 KB each,
+    // for a list of names): the room gets just the list. `self` — the socket whose own view changed,
+    // because it joined and now needs the state, or left and must drop it — gets its full view.
+    const sendAppJoined = (room, act, self) => {
+      const list = { run: act.state.run, joined: act.state.joined };
+      if (self) { self.to(room).emit('activity:app-joined', list); self.emit('activity:update', activityViewFor(act, self.id)); }
+      else io.to(room).emit('activity:app-joined', list);
+    };
+    socket.on('activity:start', async ({ serverId = 'demo', channelId = 'voice1', type, appId } = {}) => {
+      const room = `voice:${serverId}:${channelId}`;
+      if (type === APP_ACTIVITY) {
+        if (!Number.isSafeInteger(appId) || !socket.rooms.has(room)) return;
+        if (!appEventAllowed(socket.id)) return; // a start costs a query and a room-wide broadcast
+        // Name, url and icon come from this row. Whatever else the client sent is ignored, so a
+        // start can never point the room at a url of the sender's choosing.
+        const row = await db.get("SELECT id, name, icon_url, created_by, bundle_dir FROM apps WHERE id = ? AND kind = 'bundle' AND bundle_dir IS NOT NULL AND bundle_dir != ''", appId);
+        // Re-checked after the await: they may have left the room while the query ran.
+        if (!row || !socket.rooms.has(room)) return;
+        const act = { type: APP_ACTIVITY, state: appActivityInit(row), by: appName() };
+        activities[room] = act;
+        // Whoever starts it has already chosen to run it, so they are joined from the first update.
+        applyAppEvent(act, { kind: 'join' }, appName(), socket.id);
+        broadcastActivity(room, act);
+        return;
+      }
       if (!ACTIVITY_TYPES.includes(type)) return;
       if (!(await mayUseVoice(serverId))) return;
-      const room = `voice:${serverId}:${channelId}`;
+      if (outsideAppRoom(room)) return;
       activities[room] = { type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon' };
       broadcastActivity(room, activities[room]);
     });
-    socket.on('activity:event', async ({ serverId = 'demo', channelId = 'voice1', event } = {}) => {
-      if (!(await mayUseVoice(serverId))) return;
+    socket.on('activity:event', async ({ serverId = 'demo', channelId = 'voice1', event, app: appRun } = {}, ack) => {
       const room = `voice:${serverId}:${channelId}`;
+      // An app's events say which run of which app they are for (`app`, the run id from its state);
+      // a built-in's carry no such tag. The two never cross: without this, an event still on the
+      // wire when the room's activity was swapped landed on whatever replaced it — an app's "join"
+      // seating someone in a game of Tic-Tac-Toe, a Tic-Tac-Toe "join" adding someone to an app
+      // they never chose, one app's frame writing into the next app's state.
+      if (appRun !== undefined || activities[room]?.type === APP_ACTIVITY) {
+        // Entirely synchronous, and the bucket comes first: being in the room already proves
+        // membership (voice:join checked it), so a flooding app costs no database query at all.
+        // The ack tells the sender's SDK whether to keep or roll back its optimistic change; a
+        // dropped event is otherwise silent — nobody else in the room hears about it.
+        const reply = (r) => { if (typeof ack === 'function') ack(r); };
+        const act = activities[room];
+        if (!act || act.type !== APP_ACTIVITY) return reply({ ok: false, reason: 'ended' });
+        if (!socket.rooms.has(room)) return reply({ ok: false, reason: 'not-in-room' });
+        if (!appEventAllowed(socket.id)) return reply({ ok: false, reason: 'rate-limited' });
+        if (appRun !== act.state.run) return reply({ ok: false, reason: 'ended' });
+        const result = applyAppEvent(act, event, appName(), socket.id);
+        if (!result.ok) return reply({ ok: false, reason: result.reason });
+        if (result.relay) {
+          // Fixed event name, this room's joined sockets only: the app chooses the payload and
+          // nothing else about where it goes.
+          for (const id of appJoinedSockets(act)) if (id !== socket.id) io.to(id).emit('activity:app-message', result.relay);
+        } else if (result.audience === 'joined') {
+          // State goes out BEFORE the ack, so by the time the sender hears "ok" it already holds
+          // the state that includes its change.
+          broadcastActivity(room, act, { joinedOnly: true });
+        } else if (result.audience === 'room') {
+          sendAppJoined(room, act, socket);
+        }
+        return reply({ ok: true, rev: act.state.rev });
+      }
+      if (!(await mayUseVoice(serverId))) return;
       const act = activities[room];
       if (!act || !event || typeof event !== 'object') return;
+      // An app may have become the activity while the membership query ran; its events never go
+      // through the built-in reducer.
+      if (act.type === APP_ACTIVITY) return;
       applyActivityEvent(act, event, clients[socket.id]?.name || 'Anon', { room });
       broadcastActivity(room, act);
     });
     socket.on('activity:stop', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
       if (!(await mayUseVoice(serverId))) return;
       const room = `voice:${serverId}:${channelId}`;
+      if (outsideAppRoom(room)) return;
       delete activities[room];
       io.to(room).emit('activity:update', null);
     });
@@ -1675,6 +1779,8 @@ async function main() {
       sfu.removePeer(room, socket.id); // close their SFU transports + notify consumers
       if (liveStreams[socket.id]) { delete liveStreams[socket.id]; broadcastDiscover(); }
       if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size === 0) delete activities[room];
+      // Leaving voice leaves the app too: the people still playing must see them go.
+      else if (appLeave(activities[room], socket.id)) sendAppJoined(room, activities[room], null);
     });
 
     socket.on('voice:signal', ({ to, signal } = {}) => {
@@ -1722,6 +1828,8 @@ async function main() {
           sfu.removePeer(room, socket.id);
           // If this socket is the last one in the room, drop its activity.
           if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size <= 1) delete activities[room];
+          // Otherwise take them off the app's joined list, or a closed tab stays "playing" forever.
+          else if (appLeave(activities[room], socket.id)) socket.to(room).emit('activity:app-joined', { run: activities[room].state.run, joined: activities[room].state.joined });
         }
       }
       if (liveStreams[socket.id] || externalStreams[socket.id]) {
@@ -1733,6 +1841,7 @@ async function main() {
 
     socket.on('disconnect', () => {
       push.dropSocket(socket.id); // a closed window is not looking at anything
+      forgetAppSocket(socket.id);
       const info = clients[socket.id];
       delete clients[socket.id];
       if (info) {

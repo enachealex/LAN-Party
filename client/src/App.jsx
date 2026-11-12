@@ -1144,6 +1144,9 @@ export default function App() {
   // The embeddable app currently open in the in-app sandboxed viewer (null = closed).
   const [viewerApp, setViewerApp] = useState(null)
   const [publicApps, setPublicApps] = useState([])
+  // Whether that list has ever been fetched. An empty array alone cannot tell "there are no apps"
+  // from "not asked yet" or "the request failed", and the launcher must not claim the first.
+  const [publicAppsStatus, setPublicAppsStatus] = useState('idle') // 'idle' | 'loading' | 'ready' | 'error'
   const [showSettingsPanel, setShowSettingsPanel] = useState(false)
   const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
   // Feedback / bug-report modal (submissions forward to Vaultline via the server's /feedback route).
@@ -1281,6 +1284,22 @@ export default function App() {
   // Activities: the shared activity for the current voice room (null when none), + the launcher.
   const [activity, setActivity] = useState(null)
   const [showActivityMenu, setShowActivityMenu] = useState(false)
+  // Uploaded apps as activities. Whoever is hosting an app's frame (AppActivity) is handed what the
+  // socket says as it arrives, beside the React state above rather than through it: transient app
+  // messages are events, not state, and state updates have to reach the app one by one and in
+  // order, where React is free to fold two quick ones into a single render.
+  const appHostHandlersRef = useRef(new Set())
+  const subscribeAppHostRef = useRef((handler) => {
+    appHostHandlersRef.current.add(handler)
+    return () => { appHostHandlersRef.current.delete(handler) }
+  })
+  const notifyAppHostRef = useRef((event) => {
+    appHostHandlersRef.current.forEach((handler) => { try { handler(event) } catch (_) { /* one listener must not stop the rest */ } })
+  })
+  // The app this client itself just asked to start, so its panel opens without a second click.
+  const startedAppRef = useRef(null) // { appId, at }
+  const activityTypeRef = useRef(null)
+  activityTypeRef.current = activity?.type || null
   // Wraps for the call-bar popovers, so an outside click can close whichever is open.
   const audioMenuRef = useRef(null)
   const effectsMenuRef = useRef(null)
@@ -3257,6 +3276,9 @@ export default function App() {
       const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
       s.emit('join', { serverId: sid, name: nick })
       setConnected(true)
+      // A joined app frame belongs to the previous socket. (On the very first connect nothing is
+      // listening for this.)
+      notifyAppHostRef.current({ type: 'reconnected' })
       // The usual reason for a reconnect is the server restarting for a deploy.
       checkForUpdateRef.current(false)
       markBoot('connect', 'done')
@@ -3656,7 +3678,23 @@ export default function App() {
     s.on('discover:update', (list) => setDiscoverStreams(Array.isArray(list) ? list : []))
     s.emit('discover:list')
     // Activities: the server pushes the current shared activity for our voice room (or null).
-    s.on('activity:update', (a) => setActivity(a && typeof a === 'object' ? a : null))
+    s.on('activity:update', (a) => {
+      const next = a && typeof a === 'object' ? a : null
+      setActivity(next)
+      if (next && next.type === 'app') notifyAppHostRef.current({ type: 'activity', activity: next })
+    })
+    // Someone joined or left the running app. Sent on its own, without the app's shared state, so
+    // people coming and going do not cost everyone a copy of it.
+    s.on('activity:app-joined', (m) => {
+      if (!m || typeof m !== 'object' || !Array.isArray(m.joined)) return
+      setActivity((prev) => (prev && prev.type === 'app' && prev.state && prev.state.run === m.run ? { ...prev, state: { ...prev.state, joined: m.joined } } : prev))
+    })
+    // A transient message from an uploaded app someone else in the room is running. Passed on as
+    // data to the app's own frame and never rendered here.
+    s.on('activity:app-message', (m) => {
+      if (!m || typeof m !== 'object') return
+      notifyAppHostRef.current({ type: 'message', from: typeof m.from === 'string' ? m.from : '', data: m.data })
+    })
     // Fetch WebRTC ICE servers (STUN + any configured TURN) so calls connect across networks.
     fetch(`${SERVER_URL}/webrtc/ice`).then((r) => r.json()).then((d) => { if (d && Array.isArray(d.iceServers) && d.iceServers.length) iceConfigRef.current = d.iceServers }).catch(() => {})
 
@@ -4912,7 +4950,43 @@ export default function App() {
 
   // Activities: start one for the room, relay an event, or end it (all scoped to the voice channel).
   const startActivity = (type) => { setShowActivityMenu(false); socketRef.current?.emit('activity:start', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', type }) }
-  const sendActivityEvent = (event) => { socketRef.current?.emit('activity:event', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', event }) }
+  // `ack` is only used by uploaded apps (the server answers their events so the SDK can keep or
+  // roll back an optimistic change). Built-in activities pass none, and none is sent for them.
+  // `run` goes with it: it names the run of the app the event is for, and the server drops the
+  // event if that is not what the room is running by the time it arrives.
+  const sendActivityEvent = (event, ack, run) => {
+    const payload = { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', event }
+    if (typeof ack !== 'function') { socketRef.current?.emit('activity:event', payload); return }
+    payload.app = run
+    // An app's panel can outlive its activity by a moment (it says "leave" as it unmounts). Once
+    // the room has moved on, that must not land on whatever activity replaced it.
+    if (activityTypeRef.current !== 'app' || !socketRef.current) { ack({ ok: false, reason: 'ended' }); return }
+    socketRef.current.emit('activity:event', payload, ack)
+  }
+  // Start an uploaded app for the room. Only the id is sent: the server takes the name, url and
+  // icon from its own record of the app.
+  const startAppActivity = (app) => {
+    setShowActivityMenu(false)
+    startedAppRef.current = { appId: app.id, at: Date.now() }
+    socketRef.current?.emit('activity:start', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', type: 'app', appId: app.id })
+  }
+  // Public identity of someone in the room, for the app card and for the app itself: name and
+  // avatar, the same things every member can already see. Display name and username are the same
+  // thing in LAN Party today.
+  const describeAppPerson = (username) => {
+    const p = username === name ? profile : (serverState?.members || []).find((m) => m.username === username)?.profile
+    const avatar = typeof p?.avatarUrl === 'string' && !p.avatarUrl.startsWith('blob:') ? emojiSrc(p.avatarUrl) : ''
+    return { username, displayName: username, avatarUrl: avatar }
+  }
+  const startedApp = startedAppRef.current
+  const appHost = {
+    describePerson: describeAppPerson,
+    resolveSrc: emojiSrc,
+    subscribe: subscribeAppHostRef.current,
+    startedAppId: startedApp && Date.now() - startedApp.at < 15000 ? startedApp.appId : null,
+    descriptionFor: (appId) => publicApps.find((a) => a.id === appId)?.description || '',
+  }
+  const launchableApps = publicApps.filter((a) => a.embeddable)
   const closeActivity = () => { socketRef.current?.emit('activity:stop', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1' }) }
 
   // Keyboard shortcuts on the pre-join dialog: Esc cancels, Enter joins.
@@ -6778,15 +6852,27 @@ export default function App() {
   const loadPublicApps = async () => {
     const t = token || localStorage.getItem('lanparty_token')
     if (!t) return
+    // A refresh that fails keeps the list already on screen; only a first load can end in 'error'.
+    setPublicAppsStatus((s) => (s === 'ready' ? s : 'loading'))
     try {
       const res = await fetch(`${SERVER_URL}/apps`, { headers: { Authorization: `Bearer ${t}` } })
-      if (res.ok) { const data = await res.json(); setPublicApps(data.apps || []) }
+      if (res.ok) { const data = await res.json(); setPublicApps(data.apps || []); setPublicAppsStatus('ready') }
+      else setPublicAppsStatus((s) => (s === 'ready' ? s : 'error'))
     } catch (err) {
       console.warn('loadPublicApps failed', err)
+      setPublicAppsStatus((s) => (s === 'ready' ? s : 'error'))
     }
   }
 
   const openAppDirectory = () => { setShowAppDirectory(true); loadPublicApps() }
+
+  // An app somebody else started is one this client may never have listed. Fetch the directory once
+  // so its Join card can show the uploader's description (the activity state does not carry it).
+  const activeAppId = activity?.type === 'app' ? activity.state?.appId : null
+  useEffect(() => {
+    if (activeAppId != null && !publicApps.some((a) => a.id === activeAppId)) loadPublicApps()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAppId])
 
   // Upload an app to the public directory. `source` is 'link' (external URL) or 'bundle' (an uploaded
   // .html/.zip that LAN Party hosts + runs sandboxed). Both may carry an optional icon image.
@@ -7485,7 +7571,7 @@ export default function App() {
                   <>
                     <div className="video-stage-wrap">
                       {activity ? (
-                        <ActivityPanel activity={activity} me={name} onEvent={sendActivityEvent} onClose={closeActivity} askPrompt={askPrompt} />
+                        <ActivityPanel activity={activity} me={name} onEvent={sendActivityEvent} onClose={closeActivity} askPrompt={askPrompt} appHost={appHost} />
                       ) : (
                         <>
                           <div className="video-stage" ref={videoStageRef} style={{ gridTemplateColumns: `repeat(${voiceGrid.cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${voiceGrid.rows}, minmax(0, 1fr))` }}>
@@ -7624,19 +7710,50 @@ export default function App() {
                       <div className="voice-ctrl-wrap" ref={activityMenuRef}>
                         {showActivityMenu && (
                           <div className="voice-quality-menu activity-launcher" role="menu" aria-label="Things To Do">
-                            <div className="voice-quality-title">🎉 Things To Do</div>
-                            {ACTIVITY_TYPES.map((a) => (
-                              <button key={a.id} type="button" role="menuitem" className="activity-launch-opt" onClick={() => startActivity(a.id)}>
-                                <span className="activity-launch-icon">{a.icon}</span>
-                                <span className="activity-launch-text">
-                                  <span className="activity-launch-label">{a.label}</span>
-                                  <span className="activity-launch-hint">{a.hint}</span>
-                                </span>
-                              </button>
-                            ))}
+                            {/* The scroll lives on an inner box: the menu's tail arrow hangs outside
+                                the menu, and overflow on the menu itself would clip it. */}
+                            <div className="activity-launch-scroll">
+                              <div className="voice-quality-title">🎉 Things To Do</div>
+                              {ACTIVITY_TYPES.map((a) => (
+                                <button key={a.id} type="button" role="menuitem" className="activity-launch-opt" onClick={() => startActivity(a.id)}>
+                                  <span className="activity-launch-icon">{a.icon}</span>
+                                  <span className="activity-launch-text">
+                                    <span className="activity-launch-label">{a.label}</span>
+                                    <span className="activity-launch-hint">{a.hint}</span>
+                                  </span>
+                                </button>
+                              ))}
+                              <div className="voice-quality-title activity-launch-section">🧩 Community apps</div>
+                              {launchableApps.map((a) => (
+                                <button key={a.id} type="button" role="menuitem" className="activity-launch-opt" onClick={() => startAppActivity(a)}>
+                                  {a.iconUrl
+                                    ? <img className="activity-launch-icon activity-launch-appicon" src={emojiSrc(a.iconUrl)} alt="" />
+                                    : <span className="activity-launch-icon activity-launch-appicon activity-launch-appicon-fallback">{(a.name || '?').slice(0, 1).toUpperCase()}</span>}
+                                  <span className="activity-launch-text">
+                                    <span className="activity-launch-label">{a.name}</span>
+                                    <span className="activity-launch-hint">{a.description || `by ${a.createdBy || 'someone'}`}</span>
+                                  </span>
+                                </button>
+                              ))}
+                              {launchableApps.length === 0 && publicAppsStatus === 'ready' && (
+                                <div className="activity-launch-empty">
+                                  No apps yet. Upload a mini-app in the App Directory and it shows up here for the whole room.
+                                  <button type="button" className="activity-launch-link" onClick={() => { setShowActivityMenu(false); openAppDirectory() }}>Open App Directory</button>
+                                </div>
+                              )}
+                              {launchableApps.length === 0 && publicAppsStatus === 'error' && (
+                                <div className="activity-launch-empty" role="alert">
+                                  Could not load the apps.
+                                  <button type="button" className="activity-launch-link" onClick={() => loadPublicApps()}>Try again</button>
+                                </div>
+                              )}
+                              {launchableApps.length === 0 && publicAppsStatus !== 'ready' && publicAppsStatus !== 'error' && (
+                                <div className="activity-launch-empty">Loading apps…</div>
+                              )}
+                            </div>
                           </div>
                         )}
-                        <button className={`voice-ctrl${activity ? ' toggled' : ''}`} onClick={() => setShowActivityMenu((v) => !v)} title="Things To Do" aria-label="Things To Do" aria-pressed={!!activity} aria-haspopup="menu">
+                        <button className={`voice-ctrl${activity ? ' toggled' : ''}`} onClick={() => { if (!showActivityMenu) loadPublicApps(); setShowActivityMenu((v) => !v) }} title="Things To Do" aria-label="Things To Do" aria-pressed={!!activity} aria-haspopup="menu">
                           <ActivitiesIcon />
                         </button>
                       </div>
@@ -8682,7 +8799,7 @@ export default function App() {
       />
 
       {/* Sandboxed viewer for embedded (uploaded) mini-apps */}
-      <AppViewer app={viewerApp} resolveSrc={emojiSrc} onClose={() => setViewerApp(null)} />
+      <AppViewer app={viewerApp} resolveSrc={emojiSrc} me={describeAppPerson(name)} onClose={() => setViewerApp(null)} />
 
       {/* Install panel (fallback) */}
       <div className={`members-panel install-panel ${showInstallPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showInstallPanel}>

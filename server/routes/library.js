@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const { extractBundle } = require('../services/appBundles');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -123,6 +123,8 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
     if (!row) return res.status(404).json({ error: 'App not found' });
     if (row.created_by !== req.user.username) return res.status(403).json({ error: 'You can only remove apps you uploaded' });
     await db.run('DELETE FROM apps WHERE id = ?', id);
+    // Any voice room running this app as its activity is told it ended, before the files go.
+    if (typeof endAppActivities === 'function') endAppActivities(id);
     if (row.kind === 'bundle' && row.bundle_dir) {
       // Resolve + confirm the target stays strictly inside appBundlesDir before recursive delete.
       const target = path.resolve(appBundlesDir, row.bundle_dir);

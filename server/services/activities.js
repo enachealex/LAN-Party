@@ -5,6 +5,8 @@
 // A factory because the sketch/music rules need to know who is in the room (io) and which display
 // name a socket belongs to (clients).
 
+const crypto = require('crypto');
+
 /** @param {{ io: any, clients: Record<string, any> }} deps */
 function createActivities({ io, clients }) {
   const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music', 'movie'];
@@ -57,6 +59,187 @@ function createActivities({ io, clients }) {
     thumbnail: String(t.thumbnail || '').slice(0, 300),
     durationMs: Number.isFinite(Number(t.durationMs)) ? Number(t.durationMs) : undefined,
   });
+
+  // --- Uploaded apps as activities (the app bridge) ---
+  // Any bundle from the app directory can be the room's activity. The server knows nothing about
+  // what the app does: it keeps one JSON object per room (`shared`) that the app's SDK patches, and
+  // relays transient messages. Everything arriving here was written by uploaded, untrusted code, so
+  // every event is validated in full and rejected whole — a half-applied patch would leave the room
+  // in a state no client asked for.
+  //
+  // Deliberately NOT in ACTIVITY_TYPES: an app needs a row from the apps table to start, so the
+  // socket layer handles it on its own path rather than through activityInit(type).
+  const APP_ACTIVITY = 'app';
+  const APP_LIMITS = {
+    sharedBytes: 64 * 1024, // serialised `shared`
+    keys: 200,              // top-level keys in `shared`
+    keyLength: 64,
+    messageBytes: 8 * 1024, // one transient message
+    depth: 32,              // nesting; bounds the recursive walk below
+    burst: 30,              // token bucket: events allowed at once...
+    perSecond: 15,          // ...and the sustained rate it refills at
+    // A second bucket, per room and in bytes. Every accepted change re-sends the whole `shared`
+    // object to everyone who joined, so counting events alone lets a 64 KB state be pushed out
+    // fifteen times a second by each participant's copy of the app — megabytes a second on the
+    // socket that also carries chat and voice signalling. A change is charged the size of the state
+    // it sends out: a small state is never held back by this, a large one can only change slowly.
+    fanoutBurstBytes: 512 * 1024,
+    fanoutBytesPerSecond: 256 * 1024,
+  };
+  const APP_FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+  // Who has JOINED an app, per socket rather than per name: one person can be in the room on two
+  // devices, and closing one of them must not remove them from the list. Kept beside the activity
+  // instead of on it because the activity object is sent to clients as-is. state.joined is the
+  // de-duplicated list of names derived from this, in join order.
+  /** @type {WeakMap<object, Map<string, string>>} */
+  const appJoined = new WeakMap();
+  /** @type {Map<string, { tokens: number, ts: number }>} */
+  const appBuckets = new Map(); // socketId -> token bucket
+  // The room's byte budget, keyed by the activity so a new run starts with a full one.
+  /** @type {WeakMap<object, { bytes: number, ts: number }>} */
+  const appFanout = new WeakMap();
+
+  const isPlainObject = (v) => {
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+    const proto = Object.getPrototypeOf(v);
+    return proto === Object.prototype || proto === null;
+  };
+  // True only for values JSON can carry faithfully, with no prototype-pollution key at any depth.
+  // The depth cap is not about taste: socket.io accepts a megabyte, which is enough brackets to
+  // overflow the stack of any recursive walk (including JSON.stringify's).
+  function appJsonSafe(v, depth = 0) {
+    if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
+    if (typeof v === 'number') return Number.isFinite(v);
+    if (typeof v !== 'object' || depth >= APP_LIMITS.depth) return false;
+    if (Array.isArray(v)) return v.every((x) => appJsonSafe(x, depth + 1));
+    if (!isPlainObject(v)) return false; // Buffers (socket.io binary), Dates, class instances
+    for (const k of Object.keys(v)) {
+      if (APP_FORBIDDEN_KEYS.has(k)) return false;
+      if (!appJsonSafe(v[k], depth + 1)) return false;
+    }
+    return true;
+  }
+  const appClone = (v) => JSON.parse(JSON.stringify(v));
+  const appKeyOk = (k) => typeof k === 'string' && k.length >= 1 && k.length <= APP_LIMITS.keyLength && !APP_FORBIDDEN_KEYS.has(k);
+  // Measures a candidate `shared`: the reason it is over a limit, or the object and its serialised
+  // size when it fits.
+  function appSharedCheck(entries) {
+    if (entries.size > APP_LIMITS.keys) return { problem: 'too-many-keys' };
+    // Object.fromEntries defines own properties; it never goes through a setter, so even a key the
+    // checks above somehow missed could not reach Object.prototype.
+    const next = Object.fromEntries(entries);
+    const bytes = Buffer.byteLength(JSON.stringify(next), 'utf8');
+    if (bytes > APP_LIMITS.sharedBytes) return { problem: 'too-large' };
+    return { problem: null, next, bytes };
+  }
+  // Takes `bytes` from the room's fan-out budget, or says no and takes nothing.
+  function appFanoutAllowed(act, bytes, now) {
+    let b = appFanout.get(act);
+    if (!b) { b = { bytes: APP_LIMITS.fanoutBurstBytes, ts: now }; appFanout.set(act, b); }
+    b.bytes = Math.min(APP_LIMITS.fanoutBurstBytes, b.bytes + Math.max(0, now - b.ts) / 1000 * APP_LIMITS.fanoutBytesPerSecond);
+    b.ts = now;
+    if (b.bytes < bytes) return false;
+    b.bytes -= bytes;
+    return true;
+  }
+
+  function appActivityInit(row) {
+    return {
+      appId: row.id,
+      name: row.name,
+      url: `/app-bundles/${row.bundle_dir}/`,
+      iconUrl: row.icon_url || '',
+      createdBy: row.created_by,
+      // Names this run of the app. Its events carry it back, so one that was meant for an earlier
+      // activity in the room (still on the wire when that was replaced) can be told apart and dropped.
+      run: crypto.randomBytes(8).toString('hex'),
+      shared: {},
+      rev: 0,
+      lastBy: null,
+      joined: [],
+    };
+  }
+  function appJoinedMap(act) {
+    let m = appJoined.get(act);
+    if (!m) { m = new Map(); appJoined.set(act, m); }
+    return m;
+  }
+  const appSyncJoined = (act) => { act.state.joined = [...new Set(appJoinedMap(act).values())]; };
+  /** Socket ids that have joined this app (the only ones that receive its state and messages). */
+  const appJoinedSockets = (act) => [...appJoinedMap(act).keys()];
+  /** Remove a socket from an app's joined list (left voice, disconnected). True if it was there. */
+  function appLeave(act, socketId) {
+    if (!act || act.type !== APP_ACTIVITY) return false;
+    if (!appJoinedMap(act).delete(socketId)) return false;
+    appSyncJoined(act);
+    return true;
+  }
+  // One bucket per socket covers every app event, so no mix of set/replace/emit/join gets a second
+  // allowance. Checked before anything else touches the event: a flood must cost nothing but this.
+  function appEventAllowed(socketId, now = Date.now()) {
+    let b = appBuckets.get(socketId);
+    if (!b) { b = { tokens: APP_LIMITS.burst, ts: now }; appBuckets.set(socketId, b); }
+    b.tokens = Math.min(APP_LIMITS.burst, b.tokens + Math.max(0, now - b.ts) / 1000 * APP_LIMITS.perSecond);
+    b.ts = now;
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  }
+  const forgetAppSocket = (socketId) => { appBuckets.delete(socketId); };
+
+  // Reducer for an app activity. `user` is the sender's name as the SOCKET knows it — nothing in
+  // `ev` is ever used as an identity. Returns what the transport should do with the outcome:
+  //   { ok: false, reason }                      nothing changed
+  //   { ok: true, audience: 'joined' }           shared state changed; the joined sockets need it
+  //   { ok: true, audience: 'room' }             the joined LIST changed; the whole room needs that
+  //   { ok: true, relay: { from, data } }        transient message for the other joined sockets
+  //   { ok: true }                               accepted, nothing to send (already joined, etc.)
+  function applyAppEvent(act, ev, user, socketId, now = Date.now()) {
+    const s = act.state;
+    const joined = appJoinedMap(act);
+    if (!ev || typeof ev !== 'object') return { ok: false, reason: 'invalid' };
+    if (ev.kind === 'join') {
+      if (joined.has(socketId)) return { ok: true };
+      joined.set(socketId, user);
+      appSyncJoined(act);
+      return { ok: true, audience: 'room' };
+    }
+    if (ev.kind === 'leave') {
+      return appLeave(act, socketId) ? { ok: true, audience: 'room' } : { ok: true };
+    }
+    // Only people who chose to run the app may drive it: someone who has not joined has no iframe,
+    // so a set/emit from them is a hand-written socket event, not the app.
+    if (!joined.has(socketId)) return { ok: false, reason: 'not-joined' };
+    if (ev.kind === 'set' || ev.kind === 'replace') {
+      const source = ev.kind === 'set' ? ev.patch : ev.shared;
+      if (!isPlainObject(source)) return { ok: false, reason: 'invalid' };
+      const keys = Object.keys(source);
+      // Cheap bound before the deep walk: a patch can never legitimately name more keys than fit.
+      if (keys.length > APP_LIMITS.keys) return { ok: false, reason: 'too-many-keys' };
+      if (!keys.every(appKeyOk)) return { ok: false, reason: 'bad-key' };
+      if (!appJsonSafe(source)) return { ok: false, reason: 'invalid' };
+      const entries = new Map(ev.kind === 'set' ? Object.entries(s.shared) : []);
+      for (const k of keys) {
+        // null deletes on a merge; on a replace it would only store a pointless null, so drop it too.
+        if (source[k] === null) entries.delete(k);
+        else entries.set(k, appClone(source[k]));
+      }
+      const checked = appSharedCheck(entries);
+      if (checked.problem) return { ok: false, reason: checked.problem };
+      if (!appFanoutAllowed(act, checked.bytes, now)) return { ok: false, reason: 'rate-limited' };
+      s.shared = checked.next;
+      s.rev += 1;
+      s.lastBy = user;
+      return { ok: true, audience: 'joined' };
+    }
+    if (ev.kind === 'emit') {
+      if (ev.data === undefined || !appJsonSafe(ev.data)) return { ok: false, reason: 'invalid' };
+      if (Buffer.byteLength(JSON.stringify(ev.data), 'utf8') > APP_LIMITS.messageBytes) return { ok: false, reason: 'too-large' };
+      return { ok: true, relay: { from: user, data: appClone(ev.data) } };
+    }
+    return { ok: false, reason: 'invalid' };
+  }
+
   function applyActivityEvent(act, ev, user, ctx) {
     const s = act.state;
     if (act.type === 'watch') {
@@ -209,21 +392,39 @@ function createActivities({ io, clients }) {
 
   // What a given socket is allowed to see of an activity: in Sketch & Guess the secret word only
   // goes to the current drawer — everyone else gets a redacted copy (mask only).
+  //
+  // An app's shared state only goes to the people who joined it. Everyone else gets what the "Join"
+  // card needs (name, icon, who started it, who is in) with `shared` emptied: they are not running
+  // the app, so there is no reason for up to 64 KB of some uploader's data to land in their client.
   function activityViewFor(act, socketId) {
+    if (act && act.type === APP_ACTIVITY) {
+      if (appJoinedMap(act).has(socketId)) return act;
+      return { ...act, state: { ...act.state, shared: {} } };
+    }
     if (!act || act.type !== 'sketch') return act;
     const s = act.state;
     if (s.phase !== 'play' || !s.word) return act;
     if (clients[socketId]?.name === sketchDrawer(s)) return act;
     return { ...act, state: { ...s, word: null } };
   }
-  function broadcastActivity(room, act) {
+  // joinedOnly: an app's state change is of no interest to people who have not joined it (their
+  // view has no `shared`), so they are skipped rather than sent an update for every move of a game
+  // they are not playing.
+  function broadcastActivity(room, act, { joinedOnly = false } = {}) {
     if (!act) { io.to(room).emit('activity:update', null); return; }
     const ids = io.sockets.adapter.rooms.get(room) || new Set();
-    for (const id of ids) io.to(id).emit('activity:update', activityViewFor(act, id));
+    const only = joinedOnly && act.type === APP_ACTIVITY ? appJoinedMap(act) : null;
+    for (const id of ids) {
+      if (only && !only.has(id)) continue;
+      io.to(id).emit('activity:update', activityViewFor(act, id));
+    }
   }
 
   // Only these are used outside this module; the sketch/ttt helpers stay private.
-  return { ACTIVITY_TYPES, activityInit, applyActivityEvent, activityViewFor, broadcastActivity };
+  return {
+    ACTIVITY_TYPES, activityInit, applyActivityEvent, activityViewFor, broadcastActivity,
+    APP_ACTIVITY, APP_LIMITS, appActivityInit, applyAppEvent, appLeave, appJoinedSockets, appEventAllowed, forgetAppSocket,
+  };
 }
 
 module.exports = { createActivities };

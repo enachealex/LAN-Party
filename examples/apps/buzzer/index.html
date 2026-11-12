@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buzzer</title>
+<!--
+  Buzzer — a sample LAN Party app. One file, no build step, nothing loaded from anywhere except the
+  SDK. Upload it in the App Directory, then start it from Things To Do in a voice channel.
+
+  What it shows:
+    lp.me / lp.participants   who you are, and who else has joined
+    lp.setState               shared state everyone sees (round, buzzes, scores)
+    lp.emit / on('message')   moments that are not state (the flash and beep when someone buzzes)
+    lp.standalone             the same page still works opened on its own
+
+  The one idea worth copying: every player writes only to keys of their OWN ("b:<name>",
+  "s:<name>" for a score). setState is a shallow merge per key, so two people buzzing at the same
+  instant can never overwrite each other — both buzzes land, and the server's order decides who was
+  first. See docs/APP-INTEGRATION.md.
+-->
+<style>
+  :root{
+    color-scheme:dark; /* so the browser's own scrollbars and form controls are dark too */
+    --bg:#0d141d; --panel:#141d29; --line:rgba(255,255,255,.09); --text:#e8eef5; --muted:#9fb0bf;
+    --accent:#2bc3ff; --accent2:#7c6cff; --hot:#ff5a4d; --gold:#ffc94d; --ok:#3ddc84;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--text);font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+  button{font:inherit;color:inherit;cursor:pointer}
+  button:disabled{cursor:default}
+  .note{flex:none;padding:7px 14px;background:rgba(255,201,77,.12);border-bottom:1px solid rgba(255,201,77,.3);color:#ffe2a0;font-size:12.5px;text-align:center}
+  .wrap{flex:1;min-height:0;display:flex;gap:14px;padding:14px}
+  .stage{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;overflow:auto;transition:box-shadow .15s,border-color .15s}
+  .stage.flash{border-color:var(--hot);box-shadow:0 0 0 3px rgba(255,90,77,.35),0 0 60px rgba(255,90,77,.35) inset}
+  .round{align-self:stretch;display:flex;align-items:center;justify-content:space-between;gap:10px;color:var(--muted);font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase}
+  .pill{padding:3px 10px;border-radius:999px;border:1px solid var(--line);font-size:11px}
+  .pill.locked{color:var(--gold);border-color:rgba(255,201,77,.45);background:rgba(255,201,77,.1)}
+  .result{min-height:64px;text-align:center;display:flex;flex-direction:column;justify-content:center;gap:2px}
+  .result-first{font-size:24px;font-weight:900;overflow-wrap:anywhere}
+  .result-first b{color:var(--gold)}
+  .result-rest{font-size:13px;color:var(--muted);overflow-wrap:anywhere}
+  .buzz{flex:none;width:min(46vmin,240px);height:min(46vmin,240px);margin:auto 0;border-radius:50%;border:none;
+    background:radial-gradient(circle at 35% 30%,#ff8d7e,var(--hot) 55%,#b3261c);color:#fff;font-size:clamp(20px,6vmin,34px);font-weight:900;letter-spacing:1px;
+    box-shadow:0 12px 0 #7d1a13,0 22px 40px rgba(0,0,0,.5);transition:transform .06s,box-shadow .06s,filter .15s;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+  .buzz:active:not(:disabled){transform:translateY(8px);box-shadow:0 4px 0 #7d1a13,0 10px 20px rgba(0,0,0,.5)}
+  .buzz:focus-visible{outline:3px solid var(--accent);outline-offset:6px}
+  .buzz:disabled{filter:grayscale(.75) brightness(.7)}
+  .buzz.mine{background:radial-gradient(circle at 35% 30%,#8af0b4,var(--ok) 55%,#1c7d49);box-shadow:0 12px 0 #14562f,0 22px 40px rgba(0,0,0,.5);filter:none}
+  .hint{font-size:12px;color:var(--muted);text-align:center}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+  .btn{padding:9px 14px;border-radius:10px;border:1px solid var(--line);background:rgba(255,255,255,.05);font-size:13px;font-weight:700;min-height:40px}
+  .btn:hover:not(:disabled){background:rgba(255,255,255,.1)}
+  .btn.primary{border:none;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#021022}
+  .btn:disabled{opacity:.45}
+  .side{flex:none;width:280px;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  .side-head{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid var(--line);font-size:12px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+  .link{border:none;background:none;padding:0;color:var(--muted);font-size:11px;text-decoration:underline}
+  .board{flex:1;min-height:0;overflow:auto;padding:6px}
+  .row{display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:10px}
+  .row.me{background:rgba(43,195,255,.08)}
+  .row.away{opacity:.5}
+  .pic{flex:none;width:32px;height:32px;border-radius:50%;object-fit:cover;background:#26364a;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px}
+  .who{flex:1;min-width:0;display:flex;flex-direction:column}
+  .who-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .who-tag{font-size:11px;color:var(--muted)}
+  .who-tag.first{color:var(--gold)}
+  .score{flex:none;min-width:28px;text-align:right;font-size:18px;font-weight:900;font-variant-numeric:tabular-nums}
+  .step{flex:none;width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:rgba(255,255,255,.05);font-weight:800}
+  .step:hover{background:rgba(255,255,255,.12)}
+  .cheers{position:fixed;inset:0;pointer-events:none;overflow:hidden}
+  .cheer{position:absolute;bottom:-40px;font-size:30px;animation:rise 1.6s ease-out forwards}
+  @keyframes rise{to{transform:translateY(-70vh) rotate(18deg);opacity:0}}
+  @media (max-width:720px){
+    body{overflow:auto}
+    .wrap{flex-direction:column;padding:8px;gap:8px;min-height:auto}
+    .stage{flex:none;overflow:visible}
+    .buzz{margin:8px 0}
+    .side{width:auto;flex:none}
+    .board{overflow:visible}
+    .step{width:40px;height:40px}
+  }
+  @media (prefers-reduced-motion:reduce){.cheer{animation-duration:.01s}.stage,.buzz{transition:none}}
+</style>
+</head>
+<body>
+<div class="note" id="note" hidden></div>
+<div class="wrap">
+  <main class="stage" id="stage">
+    <div class="round"><span id="roundLabel">Round 1</span><span class="pill" id="lockPill">Open</span></div>
+    <div class="result" aria-live="polite">
+      <div class="result-first" id="first">Connecting…</div>
+      <div class="result-rest" id="rest"></div>
+    </div>
+    <button class="buzz" id="buzz" type="button" disabled>BUZZ</button>
+    <div class="hint" id="hint">Space or Enter works too</div>
+    <div class="controls">
+      <button class="btn primary" id="next" type="button" disabled>Next round</button>
+      <button class="btn" id="award" type="button" disabled>+1 to first</button>
+      <button class="btn" id="lock" type="button" disabled>Lock buzzers</button>
+      <button class="btn" id="cheer" type="button" disabled>👏 Cheer</button>
+    </div>
+  </main>
+  <aside class="side">
+    <div class="side-head"><span>Scoreboard</span><button class="link" id="resetScores" type="button">Reset scores</button></div>
+    <div class="board" id="board"></div>
+  </aside>
+</div>
+<div class="cheers" id="cheers" aria-hidden="true"></div>
+
+<!-- The SDK. Served by every LAN Party server at this path. Opened straight from disk this request
+     fails (there is no server), which is what the small stand-in further down is for. -->
+<script src="/sdk/lanparty.js"></script>
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var lp = null;
+  var me = { username: 'you', displayName: 'You', avatarUrl: '' };
+  // The order people buzzed in this round, as THIS page saw the server accept them.
+  var order = [];
+  var orderRound = 0;
+  var myBuzzSentAt = 0;
+  // Which of my own changes the server has answered. An event that is "by me" confirms my OLDEST
+  // unanswered change, which is not necessarily my buzz: give a point and then buzz straight away,
+  // and the first event by me is the point. Taking that as the buzz would put me on the list ahead
+  // of someone whose buzz the server accepted in between.
+  var inFlight = 0;      // my changes sent and not yet answered
+  var lastSentAt = 0;
+  var buzzAhead = -1;    // how many of those were sent before my buzz; -1 when no buzz is waiting
+
+  // Every change this page makes goes through here, so the count above is right.
+  function change(patch) {
+    // The SDK gives up on an unanswered change after 4 s; so does this count.
+    if (Date.now() - lastSentAt > 4500) inFlight = 0;
+    if (!lp.setState(patch)) return false;
+    if (!lp.standalone) { inFlight += 1; lastSentAt = Date.now(); }
+    return true;
+  }
+  // Called for every 'state' event. True when the event is the server accepting my buzz.
+  function buzzLanded(info) {
+    if (!info || info.local) return false;
+    var mine = info.by === me.username;
+    if (!mine && !info.rejected) return false;
+    // Either way one of my changes has been answered: accepted (by me) or refused (rejected).
+    if (inFlight > 0) inFlight -= 1;
+    if (buzzAhead > 0) { buzzAhead -= 1; return false; }
+    if (buzzAhead < 0) return false;
+    buzzAhead = -1;
+    return mine;
+  }
+
+  // Keys are capped at 64 characters by the bridge, so a very long name is shortened.
+  function buzzKey(u) { return 'b:' + String(u).slice(0, 60); }
+  function scoreKey(u) { return 's:' + String(u).slice(0, 60); }
+  function roundOf(state) { return typeof state.round === 'number' ? state.round : 1; }
+  function buzzedThisRound(state, u) { var b = state[buzzKey(u)]; return !!b && typeof b === 'object' && b.r === roundOf(state); }
+  function scoreOf(state, u) { var s = state[scoreKey(u)]; return s && typeof s.p === 'number' ? s.p : 0; }
+  function nameOf(u) {
+    var list = lp ? lp.participants : [];
+    for (var i = 0; i < list.length; i++) if (list[i].username === u) return list[i].displayName || u;
+    var s = lp && lp.state[scoreKey(u)];
+    return (s && typeof s.n === 'string' && s.n) || u;
+  }
+
+  // Work out who buzzed, in order.
+  //
+  // Each accepted change arrives as its own 'state' event, in the order the server accepted it, and
+  // says whose change it was (info.by). So when a buzz shows up, its author goes on the end of the
+  // list — no clocks involved, which matters because two players' clocks never agree to the
+  // millisecond. My own buzz is shown to me at once (optimistically) but only goes on the list when
+  // the server confirms it, i.e. when the event arrives that answers the buzz itself (buzzLanded).
+  function syncOrder(state, info) {
+    var landed = buzzLanded(info);
+    var r = roundOf(state);
+    if (r !== orderRound) { order = []; orderRound = r; }
+    order = order.filter(function (u) { return buzzedThisRound(state, u); });
+    var fresh = [];
+    Object.keys(state).forEach(function (k) {
+      if (k.indexOf('b:') !== 0) return;
+      var u = k.slice(2);
+      if (state[k] && state[k].r === r && order.indexOf(u) === -1) fresh.push(u);
+    });
+    if (!fresh.length) return;
+    var mineConfirmed = !info || lp.standalone || landed
+      // Safety net: an unconfirmed change is dropped by the SDK after 4 s, so a buzz of mine that
+      // is still here after that was accepted even if I missed the event that said so.
+      || (myBuzzSentAt && Date.now() - myBuzzSentAt > 4500);
+    var byTime = function (a, b) { return (state[buzzKey(a)].t || 0) - (state[buzzKey(b)].t || 0); };
+    // Buzzes I can only date by their own timestamp: the ones already there when I arrived.
+    var others = fresh.filter(function (u) { return u !== me.username && !(info && u === info.by); }).sort(byTime);
+    order = order.concat(others);
+    if (info && info.by && info.by !== me.username && fresh.indexOf(info.by) !== -1) order.push(info.by);
+    if (fresh.indexOf(me.username) !== -1 && mineConfirmed) {
+      if (!info) { order.push(me.username); order.sort(byTime); } else order.push(me.username);
+    }
+  }
+
+  function avatar(person) {
+    var el;
+    if (person.avatarUrl) {
+      el = document.createElement('img');
+      el.alt = '';
+      el.referrerPolicy = 'no-referrer';
+      el.src = person.avatarUrl;
+    } else {
+      el = document.createElement('span');
+      el.textContent = (person.displayName || '?').slice(0, 1).toUpperCase();
+    }
+    el.className = 'pic';
+    return el;
+  }
+
+  // Everything on screen is built with textContent. Names and state come from other people; they
+  // are never parsed as HTML.
+  function render() {
+    var state = lp.state;
+    var r = roundOf(state);
+    var locked = state.locked === true;
+    var iBuzzed = buzzedThisRound(state, me.username);
+    var first = order[0];
+
+    $('roundLabel').textContent = 'Round ' + r;
+    $('lockPill').textContent = locked ? 'Locked' : 'Open';
+    $('lockPill').className = 'pill' + (locked ? ' locked' : '');
+    $('lock').textContent = locked ? 'Unlock buzzers' : 'Lock buzzers';
+
+    var firstEl = $('first');
+    firstEl.textContent = '';
+    if (first) {
+      firstEl.appendChild(document.createTextNode('🔔 '));
+      var b = document.createElement('b');
+      b.textContent = first === me.username ? 'You' : nameOf(first);
+      firstEl.appendChild(b);
+      firstEl.appendChild(document.createTextNode(' buzzed first!'));
+    } else {
+      firstEl.textContent = locked ? 'Buzzers are locked' : 'Ready…';
+    }
+    $('rest').textContent = order.length > 1 ? 'Then: ' + order.slice(1).map(nameOf).join(', ') : '';
+
+    var buzz = $('buzz');
+    buzz.disabled = lp.closed || locked || iBuzzed;
+    buzz.className = 'buzz' + (iBuzzed ? ' mine' : '');
+    buzz.textContent = iBuzzed ? (first === me.username ? 'FIRST!' : 'BUZZED') : 'BUZZ';
+    $('hint').textContent = iBuzzed ? 'Wait for the next round' : locked ? 'Someone has locked the buzzers' : 'Space or Enter works too';
+
+    $('next').disabled = lp.closed;
+    $('lock').disabled = lp.closed;
+    $('cheer').disabled = lp.closed;
+    $('award').disabled = lp.closed || !first;
+    $('award').textContent = first ? '+1 to ' + (first === me.username ? 'you' : nameOf(first)) : '+1 to first';
+
+    // Scoreboard: everyone who has joined, plus anyone with a score who has since left.
+    var present = {};
+    var rows = lp.participants.map(function (p) { present[p.username] = true; return p; });
+    Object.keys(state).forEach(function (k) {
+      if (k.indexOf('s:') !== 0 || present[k.slice(2)]) return;
+      rows.push({ username: k.slice(2), displayName: nameOf(k.slice(2)), avatarUrl: '', away: true });
+    });
+    rows.sort(function (a, b) { return scoreOf(state, b.username) - scoreOf(state, a.username) || a.displayName.localeCompare(b.displayName); });
+    var board = $('board');
+    board.textContent = '';
+    rows.forEach(function (p) {
+      var row = document.createElement('div');
+      row.className = 'row' + (p.username === me.username ? ' me' : '') + (p.away ? ' away' : '');
+      row.appendChild(avatar(p));
+      var who = document.createElement('div');
+      who.className = 'who';
+      var nm = document.createElement('span');
+      nm.className = 'who-name';
+      nm.textContent = p.displayName + (p.username === me.username ? ' (you)' : '');
+      var tag = document.createElement('span');
+      var place = order.indexOf(p.username);
+      tag.className = 'who-tag' + (place === 0 ? ' first' : '');
+      tag.textContent = p.away ? 'left' : place === 0 ? 'buzzed first' : place > 0 ? 'buzzed #' + (place + 1) : '';
+      who.appendChild(nm);
+      who.appendChild(tag);
+      row.appendChild(who);
+      var minus = document.createElement('button');
+      minus.type = 'button'; minus.className = 'step'; minus.textContent = '−';
+      minus.setAttribute('aria-label', 'Take a point from ' + p.displayName);
+      minus.onclick = function () { addPoints(p.username, -1); };
+      var score = document.createElement('span');
+      score.className = 'score';
+      score.textContent = String(scoreOf(state, p.username));
+      var plus = document.createElement('button');
+      plus.type = 'button'; plus.className = 'step'; plus.textContent = '+';
+      plus.setAttribute('aria-label', 'Give a point to ' + p.displayName);
+      plus.onclick = function () { addPoints(p.username, 1); };
+      row.appendChild(minus); row.appendChild(score); row.appendChild(plus);
+      board.appendChild(row);
+    });
+  }
+
+  // ---- Actions ----
+  function doBuzz() {
+    var state = lp.state;
+    if (lp.closed || state.locked === true || buzzedThisRound(state, me.username)) return;
+    var patch = {};
+    patch[buzzKey(me.username)] = { r: roundOf(state), t: Date.now() };
+    var ahead = Date.now() - lastSentAt > 4500 ? 0 : inFlight;
+    if (!change(patch)) return;
+    myBuzzSentAt = Date.now();
+    buzzAhead = lp.standalone ? -1 : ahead;
+    // The buzz itself is state. The noise it makes is not: emit reaches the others once, now, and
+    // is not kept for anyone who joins later.
+    lp.emit({ type: 'buzz' });
+    flash();
+    setTimeout(function () { syncOrder(lp.state, { local: false, by: null }); render(); }, 4600);
+  }
+  function nextRound() {
+    var state = lp.state;
+    var patch = { round: roundOf(state) + 1, locked: null };
+    // null deletes a key. Clearing last round's buzzes keeps the shared object small.
+    Object.keys(state).forEach(function (k) { if (k.indexOf('b:') === 0) patch[k] = null; });
+    myBuzzSentAt = 0;
+    buzzAhead = -1; // the patch clears my buzz along with everyone else's
+    change(patch);
+  }
+  function addPoints(username, delta) {
+    var patch = {};
+    patch[scoreKey(username)] = { n: nameOf(username), p: scoreOf(lp.state, username) + delta };
+    change(patch);
+  }
+  function resetScores() {
+    var patch = {};
+    Object.keys(lp.state).forEach(function (k) { if (k.indexOf('s:') === 0) patch[k] = null; });
+    if (Object.keys(patch).length) change(patch);
+  }
+
+  // ---- Effects (local only) ----
+  var audio = null;
+  function beep() {
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      var osc = audio.createOscillator();
+      var gain = audio.createGain();
+      osc.type = 'square';
+      osc.frequency.value = 220;
+      gain.gain.setValueAtTime(0.12, audio.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + 0.35);
+      osc.connect(gain); gain.connect(audio.destination);
+      osc.start(); osc.stop(audio.currentTime + 0.36);
+    } catch (e) { /* no audio until this page has been clicked; the flash still shows */ }
+  }
+  function flash() {
+    var stage = $('stage');
+    stage.classList.add('flash');
+    setTimeout(function () { stage.classList.remove('flash'); }, 450);
+    beep();
+  }
+  function cheer() {
+    var box = $('cheers');
+    for (var i = 0; i < 8; i++) {
+      var el = document.createElement('span');
+      el.className = 'cheer';
+      el.textContent = ['👏', '🎉', '🙌', '✨'][i % 4];
+      el.style.left = (8 + Math.random() * 84) + '%';
+      el.style.animationDelay = (Math.random() * 0.4) + 's';
+      box.appendChild(el);
+      setTimeout(function (node) { node.remove(); }, 2200, el);
+    }
+  }
+
+  // Opened straight from disk there is no server to fetch the SDK from. This stand-in covers just
+  // what this page calls, so the file can still be opened and poked at. Anywhere the real SDK
+  // loaded, it is not used.
+  function offlineStandIn() {
+    var state = {};
+    var handlers = { state: [], participants: [], message: [], closed: [] };
+    var self = { username: 'you', displayName: 'You', avatarUrl: '' };
+    return {
+      standalone: true, closed: false, me: self, participants: [self],
+      get state() { return state; },
+      setState: function (patch) {
+        var next = {};
+        Object.keys(state).forEach(function (k) { next[k] = state[k]; });
+        Object.keys(patch).forEach(function (k) { if (patch[k] === null) delete next[k]; else next[k] = patch[k]; });
+        state = next;
+        handlers.state.forEach(function (h) { h(state, { local: true, by: self.username }); });
+        return true;
+      },
+      emit: function () { return true; },
+      on: function (type, h) { handlers[type].push(h); return function () {}; },
+    };
+  }
+
+  function start(connection) {
+    lp = connection;
+    me = lp.me;
+    if (lp.standalone) {
+      $('note').hidden = false;
+      $('note').textContent = 'Preview mode — you are on your own here. Start Buzzer from Things To Do in a voice channel to play with the room.';
+    }
+    syncOrder(lp.state, null);
+    lp.on('state', function (state, info) { syncOrder(state, info); render(); });
+    lp.on('participants', render);
+    lp.on('message', function (m) {
+      if (!m.data || typeof m.data !== 'object') return;
+      if (m.data.type === 'buzz') flash();
+      else if (m.data.type === 'cheer') cheer();
+    });
+    lp.on('closed', function () {
+      $('note').hidden = false;
+      $('note').textContent = 'This session has ended.';
+      render();
+    });
+
+    $('buzz').onclick = doBuzz;
+    $('next').onclick = nextRound;
+    $('award').onclick = function () { if (order[0]) addPoints(order[0], 1); };
+    $('lock').onclick = function () { change({ locked: lp.state.locked === true ? null : true }); };
+    $('cheer').onclick = function () { lp.emit({ type: 'cheer' }); cheer(); };
+    $('resetScores').onclick = resetScores;
+    document.addEventListener('keydown', function (e) {
+      if (e.repeat || (e.code !== 'Space' && e.code !== 'Enter')) return;
+      // Leave the keys alone on the other buttons, where they already mean "press this".
+      if (e.target && e.target.tagName === 'BUTTON' && e.target.id !== 'buzz') return;
+      e.preventDefault();
+      doBuzz();
+    });
+    render();
+  }
+
+  if (window.LANParty) window.LANParty.connect().then(start);
+  else start(offlineStandIn());
+})();
+</script>
+</body>
+</html>

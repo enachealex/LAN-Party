@@ -22,7 +22,9 @@ Trusted Web Activity APK for Android.
   the 📡 directory and jump in.
 - **Soundboard, entrance sounds, Activities** (Watch Together, Music, Movie Night, Whiteboard,
   Polls, Tic-Tac-Toe) and **collaborative image editing**.
-- **Apps directory**: links or uploaded web-app bundles, hosted by LAN Party.
+- **Apps directory**: links or uploaded web-app bundles, hosted by LAN Party. An uploaded app can
+  be started as a Thing To Do in a voice channel and share state through a small SDK:
+  [docs/APP-INTEGRATION.md](docs/APP-INTEGRATION.md).
 - **Feedback** tab that files tickets in Vaultline, and **Vault Player** single sign-on.
 
 ## Run locally
@@ -62,4 +64,5 @@ Device and privacy policy: **[DEVICE-PRIVACY.md](DEVICE-PRIVACY.md)**.
 | `desktop/` | Electron shell for Windows: tray, call overlay, screen-share picker, auto-update |
 | `android/` | Bubblewrap Trusted Web Activity that builds the Android APK |
 | `deploy/` | Example coturn config, for the optional TURN relay |
-| `docs/` | Integration specs (Vault Player SSO) |
+| `docs/` | Integration specs (Vault Player SSO, building apps) |
+| `examples/` | Sample apps for the App Directory |

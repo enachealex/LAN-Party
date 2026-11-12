@@ -60,7 +60,7 @@ function findEntry(relPaths) {
  * Extract an uploaded bundle into destDir.
  * @param {{ buffer: Buffer, originalname: string, mimetype?: string }} file
  * @param {string} destDir  must not exist yet (created here)
- * @returns {{ entry: string }} the entry path relative to destDir (usually 'index.html')
+ * @returns {{ entry: string }} the entry path relative to destDir (always 'index.html')
  */
 function extractBundle(file, destDir) {
   const name = (file.originalname || '').toLowerCase();
@@ -98,8 +98,19 @@ function extractBundle(file, destDir) {
 
   const entry = findEntry(Object.keys(safe));
   if (!entry) throw new Error('Zip must contain an index.html');
-  writeFiles(destDir, safe);
-  return { entry };
+  // The app is always served from /app-bundles/<dir>/, which opens the index.html at the top of
+  // destDir. A zip of a FOLDER (myapp/index.html, myapp/game.js — what most zip tools make) has its
+  // entry one level down, where that url would only ever 404. So the entry's folder becomes the
+  // root: what is inside it is written without the prefix, and anything outside it (which the app
+  // could not have reached with a relative path anyway) is left out.
+  const prefix = entry.slice(0, entry.length - 'index.html'.length);
+  /** @type {Record<string, Uint8Array>} */
+  const rooted = {};
+  for (const [rel, bytes] of Object.entries(safe)) {
+    if (rel.startsWith(prefix)) rooted[rel.slice(prefix.length)] = bytes;
+  }
+  writeFiles(destDir, rooted);
+  return { entry: 'index.html' };
 }
 
 module.exports = { extractBundle, safeRelativePath, findEntry, MAX_FILES, MAX_TOTAL_BYTES };
