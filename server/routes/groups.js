@@ -88,6 +88,16 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     for (const username of await memberUsernames(groupId)) io.to(`user:${username}`).emit(event, payload);
   }
 
+  // "X is typing" in a group. Only a member may announce it, and it goes to everyone else in the
+  // group; the membership check is what stops a stranger learning a group exists by poking at ids.
+  async function emitTyping(groupId, from) {
+    const members = await memberUsernames(groupId);
+    if (!members.includes(from)) return;
+    for (const username of members) {
+      if (username !== from) io.to(`user:${username}`).emit('typing', { scope: 'group', groupId, from });
+    }
+  }
+
   // Validate a list of usernames to add. Returns the user rows, or { error, status } for the first
   // problem found.
   async function resolveInvitees(me, usernames, existingIds = new Set()) {
@@ -319,7 +329,7 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     return row ? row.group_id : null;
   }
 
-  return { groupOfMessageForMember, emitToMembers };
+  return { groupOfMessageForMember, emitToMembers, emitTyping };
 }
 
 module.exports = { registerGroupRoutes, GROUP_MAX_MEMBERS };

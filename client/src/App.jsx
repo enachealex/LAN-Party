@@ -1300,6 +1300,26 @@ export default function App() {
   // Unread channel-message counts: { [serverId]: { [channelId]: n } } (loaded from /unreads,
   // bumped live by unread:bump, cleared when a channel is viewed).
   const [channelUnreads, setChannelUnreads] = useState({})
+  // Unread messages that @mention me, per channel: { serverId: { channelId: n } }. Kept apart from
+  // the unread count because it is a different question ("did anyone ask for me?") with its own badge.
+  const [channelMentions, setChannelMentions] = useState({})
+  // Who is typing where: { conversationKey: { username: expiresAtMs } }. An entry expires on its own,
+  // so a "typing" that is never followed by a message (they gave up, or the stop was lost) clears.
+  const [typingBy, setTypingBy] = useState({})
+  const lastTypingSentRef = useRef(0)
+  const TYPING_SHOWN_MS = 5000
+  const clearTyping = (key, who) => setTypingBy((prev) => {
+    if (!prev[key] || !(who in prev[key])) return prev
+    const rest = { ...prev[key] }
+    delete rest[who]
+    const next = { ...prev }
+    if (Object.keys(rest).length) next[key] = rest
+    else delete next[key]
+    return next
+  })
+  // @mention autocomplete in the composer.
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const [mentionDismissedFor, setMentionDismissedFor] = useState(null)
   // Pinned messages of the currently-viewed channel, newest pin first (from pins:updated).
   const [channelPins, setChannelPins] = useState([])
   const [showPinsModal, setShowPinsModal] = useState(false)   // "View Pins" list
@@ -2779,6 +2799,7 @@ export default function App() {
       const chatKey = chatStorageKey(fromUserId)
       appendHomeMessage(chatKey, message)
       updateDmConversationPreview(fromUserId, fromUsername, message)
+      if (fromUsername) clearTyping(`dm:${fromUsername}`, fromUsername)
       const viewingThisDm = homeChatRef.current?.peerUsername === fromUsername &&
         selectedServerIdRef.current === 'home'
       if (fromUsername && fromUsername !== userName) playUiSound(viewingThisDm && !document.hidden ? 'receive' : 'notify')
@@ -2865,6 +2886,8 @@ export default function App() {
         if (selectedServerIdRef.current !== 'home') s.emit('channel:read', { serverId: msg.serverId, channelId: msg.channelId })
       }
       if (msg && msg.author && msg.author !== userName) playUiSound('receive')
+      // Their message has arrived, so they are no longer "typing" it.
+      if (msg && msg.author) clearTyping(`channel:${msg.serverId}:${msg.channelId}`, msg.author)
       setMessages(prev => {
         if (prev.some((m) => m.id === msg.id)) return prev
         return oldestMessagesFirst([...prev, msg])
@@ -2882,7 +2905,27 @@ export default function App() {
         srv[channelId] = (srv[channelId] || 0) + 1
         return { ...prev, [serverId]: srv }
       })
+      // Named in a channel I am not looking at: its own badge and its own sound, so it stands out
+      // from ordinary chatter (which makes no sound at all from another channel).
+      if ((bump.mentions || []).includes(userName)) {
+        setChannelMentions((prev) => {
+          const srv = { ...(prev[serverId] || {}) }
+          srv[channelId] = (srv[channelId] || 0) + 1
+          return { ...prev, [serverId]: srv }
+        })
+        playUiSound('mention')
+      }
       maybeNotify('channel', bump)
+    })
+    // Someone started typing in a conversation. Keyed the same way the composer works out which
+    // conversation is on screen (see renderComposer), so the line shows only where it belongs.
+    s.on('typing', (p = {}) => {
+      if (!p.from || p.from === userName) return
+      const key = p.scope === 'channel' ? `channel:${p.serverId}:${p.channelId}`
+        : p.scope === 'dm' ? `dm:${p.from}`
+          : p.scope === 'group' ? `group:${p.groupId}` : null
+      if (!key) return
+      setTypingBy((prev) => ({ ...prev, [key]: { ...(prev[key] || {}), [p.from]: Date.now() + TYPING_SHOWN_MS } }))
     })
     // A server was created/removed somewhere — refresh the rail.
     s.on('servers:updated', () => { loadServers() })
@@ -2992,6 +3035,7 @@ export default function App() {
       if (!groupId || !message) return
       appendHomeMessage(groupId, message)
       updateGroupConversationPreview(groupId, message)
+      if (message.author) clearTyping(`group:${groupId}`, message.author)
       const me = localStorage.getItem('lanparty_user') || userName
       if (message.author === me) return
       const reading = isOpenGroup(groupId) && !document.hidden
@@ -3584,13 +3628,32 @@ export default function App() {
   // Viewing a channel zeroes its badge (the server's read marker is advanced by joinChannel /
   // channel:read on its side).
   const clearChannelUnread = (serverId, channelId) => {
-    setChannelUnreads((prev) => {
+    const without = (prev) => {
       if (!prev[serverId]?.[channelId]) return prev
       const srv = { ...prev[serverId] }
       delete srv[channelId]
       return { ...prev, [serverId]: srv }
-    })
+    }
+    setChannelUnreads(without)
+    setChannelMentions(without) // opening the channel is reading the mention
   }
+
+  // Drop typing entries once they expire. Only ticks while someone is actually typing.
+  useEffect(() => {
+    if (Object.keys(typingBy).length === 0) return undefined
+    const id = setInterval(() => setTypingBy((prev) => {
+      const now = Date.now()
+      let changed = false
+      const next = {}
+      for (const [key, people] of Object.entries(prev)) {
+        const live = Object.fromEntries(Object.entries(people).filter(([, until]) => until > now))
+        if (Object.keys(live).length !== Object.keys(people).length) changed = true
+        if (Object.keys(live).length) next[key] = live
+      }
+      return changed ? next : prev
+    }), 1000)
+    return () => clearInterval(id)
+  }, [typingBy])
 
   const loadUnreads = async () => {
     const t = token || localStorage.getItem('lanparty_token')
@@ -3600,6 +3663,7 @@ export default function App() {
       if (!res.ok) return
       const data = await res.json()
       setChannelUnreads(data.unreads || {})
+      setChannelMentions(data.mentions || {})
     } catch (e) { /* offline — badges just stay stale */ }
   }
 
@@ -4923,6 +4987,9 @@ export default function App() {
   const serverUnreadTotals = Object.fromEntries(
     Object.entries(channelUnreads).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
   )
+  const serverMentionTotals = Object.fromEntries(
+    Object.entries(channelMentions).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
+  )
   const activeChannelObj = serverChannels.find((c) => c.id === activeChannel)
   const activeChannelType = activeChannelObj ? activeChannelObj.type : 'text'
   const activeChannelName = activeChannelObj?.name || activeChannel
@@ -6089,8 +6156,67 @@ export default function App() {
     // step. A plain typed message with no stack still takes the normal path.
     const handleSend = () => {
       if (!canSend) return
+      lastTypingSentRef.current = 0 // the next thing typed should announce itself straight away
       if (composerStack.length) { sendStackedMessage(); return }
       onSend()
+    }
+
+    // Which conversation this composer belongs to. The same keys the 'typing' listener files under.
+    const inHomeChat = Boolean(showHomeChat && homeChat)
+    const convKey = inHomeChat
+      ? (homeChat.type === 'group' ? `group:${homeChat.id}` : `dm:${homeChat.peerUsername || homeChat.name}`)
+      : `channel:${currentServerId()}:${activeChannel}`
+    const typingNames = Object.keys(typingBy[convKey] || {})
+    const typingLabel = typingNames.length === 0 ? ''
+      : typingNames.length === 1 ? `${typingNames[0]} is typing…`
+        : typingNames.length === 2 ? `${typingNames[0]} and ${typingNames[1]} are typing…`
+          : 'Several people are typing…'
+
+    // Tell the others, at most once every few seconds: the receiving side keeps the line up for
+    // TYPING_SHOWN_MS, so a steady typist stays "typing" without an event per keystroke.
+    const noteTyping = () => {
+      const now = Date.now()
+      if (now - lastTypingSentRef.current < 2500) return
+      lastTypingSentRef.current = now
+      const s = socketRef.current
+      if (!s) return
+      if (inHomeChat) {
+        if (homeChat.type === 'group') s.emit('typing', { scope: 'group', groupId: homeChat.id })
+        else s.emit('typing', { scope: 'dm', to: homeChat.peerUsername || homeChat.name })
+      } else {
+        s.emit('typing', { scope: 'channel', serverId: currentServerId(), channelId: activeChannel })
+      }
+    }
+
+    // @mention autocomplete: offered while the text ends in "@partial". People who can actually be
+    // named here — the server's members in a channel, the group's members in a group. A 1:1 chat has
+    // nobody to pick between, so it offers nothing.
+    const mentionMatch = /(^|\s)@([\w.-]*)$/.exec(text)
+    const mentionPool = inHomeChat ? (homeChat.type === 'group' ? groupParticipants : []) : serverMembers
+    const mentionOptions = mentionMatch && mentionDismissedFor !== text
+      ? mentionPool
+        .filter((m) => !m.isYou)
+        .map((m) => m.username || m.name)
+        .filter((n, i, all) => n && all.indexOf(n) === i)
+        .filter((n) => n.toLowerCase().startsWith(mentionMatch[2].toLowerCase()))
+        .slice(0, 6)
+      : []
+    const mentionOpen = mentionOptions.length > 0
+    const mentionActive = Math.min(mentionIndex, Math.max(0, mentionOptions.length - 1))
+    const pickMention = (who) => {
+      if (!mentionMatch) return
+      setText(`${text.slice(0, mentionMatch.index + mentionMatch[1].length)}@${who} `)
+      setMentionIndex(0)
+    }
+    const onComposerKeyDown = (e) => {
+      if (mentionOpen) {
+        if (e.key === 'ArrowDown') { e.preventDefault(); setMentionIndex((mentionActive + 1) % mentionOptions.length); return }
+        if (e.key === 'ArrowUp') { e.preventDefault(); setMentionIndex((mentionActive - 1 + mentionOptions.length) % mentionOptions.length); return }
+        // Enter picks a name here rather than sending: sending a half-typed "@sa" is never what was meant.
+        if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMention(mentionOptions[mentionActive]); return }
+        if (e.key === 'Escape') { e.preventDefault(); setMentionDismissedFor(text); return }
+      }
+      if (e.key === 'Enter') handleSend()
     }
     // Treat the selected File like an attachment for type detection (File has .type and .name).
     const pendingIsGif = pendingFile && isGifAttachment(pendingFile)
@@ -6189,6 +6315,30 @@ export default function App() {
             ))}
           </div>
         )}
+        {mentionOpen && (
+          <div className="mention-popup" role="listbox" aria-label="Mention someone">
+            {mentionOptions.map((who, i) => (
+              <button
+                key={who}
+                type="button"
+                role="option"
+                aria-selected={i === mentionActive}
+                className={`mention-option${i === mentionActive ? ' active' : ''}`}
+                // mousedown, not click: a click would blur the input first and close the list.
+                onMouseDown={(e) => { e.preventDefault(); pickMention(who) }}
+                onMouseEnter={() => setMentionIndex(i)}
+              >
+                <span className="mention-at">@</span>{who}
+              </button>
+            ))}
+            <span className="mention-hint">↑↓ to choose · Enter to pick · Esc to dismiss</span>
+          </div>
+        )}
+        {/* Always rendered at a fixed height, so the message list does not jump every time someone
+            starts or stops typing. */}
+        <div className="typing-line" aria-live="polite">
+          {typingLabel && (<><span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>{typingLabel}</>)}
+        </div>
         <div className="composer-inner">
           <button type="button" className="attach" onClick={() => fileInputRef.current?.click()} title="Attach file" aria-label="Attach file">
             <PaperclipIcon />
@@ -6201,9 +6351,13 @@ export default function App() {
           </button>
           <input
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value)
+              setMentionIndex(0)
+              if (e.target.value.trim()) noteTyping()
+            }}
             placeholder={placeholder}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleSend() }}
+            onKeyDown={onComposerKeyDown}
             onPaste={handleComposerPaste}
           />
           <button className="send" onClick={handleSend} disabled={!canSend} aria-disabled={!canSend}>
@@ -6394,6 +6548,8 @@ export default function App() {
         onSetMemberRole={setMemberRole}
         channelUnreads={channelUnreads[selectedServerId] || {}}
         serverUnreadTotals={serverUnreadTotals}
+        channelMentions={channelMentions[selectedServerId] || {}}
+        serverMentionTotals={serverMentionTotals}
       />
 
       <div className="main">

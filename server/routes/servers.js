@@ -1,6 +1,8 @@
 // Server + channel management: the rail list, unread totals, create/rename/delete for servers
 // and channels, private-channel member lists, and membership (roster/invite/kick/role/leave).
 // Role checks and the state broadcasts are shared with the socket layer, so they are injected.
+const { mentionedUsernames } = require('../services/push');
+
 /** @param {Record<string, any>} deps */
 function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile }) {
   // The rail shows only the servers the user owns or has been invited to. New users start with an
@@ -27,7 +29,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
        GROUP BY m.server_id, m.channel_id`,
       me, me
     );
-    if (!counts.length) return res.json({ unreads: {} });
+    if (!counts.length) return res.json({ unreads: {}, mentions: {} });
     // Roles for my servers, from membership rows (no implicit public server anymore).
     const memberships = await db.all('SELECT server_id, role FROM server_members WHERE username = ?', me);
     const myRole = new Map(memberships.map((m) => [m.server_id, m.role]));
@@ -41,7 +43,24 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
         (unreads[sid] ||= {})[c.channel_id] = c.n;
       }
     }
-    return res.json({ unreads });
+    // Of those unread messages, how many mention me — so the "@" badge survives a reload instead of
+    // existing only for mentions that arrived while this tab happened to be open. The LIKE is a cheap
+    // pre-filter; mentionedUsernames is the one definition of a mention (the push and the live badge
+    // use it too), so "@sam" inside "@samantha" or an email address does not count.
+    const candidates = await db.all(
+      `SELECT m.server_id, m.channel_id, m.text
+       FROM messages m
+       LEFT JOIN channel_reads r ON r.username = ? AND r.server_id = m.server_id AND r.channel_id = m.channel_id
+       WHERE m.ts > COALESCE(r.last_read_ts, 0) AND m.author != ? AND m.text LIKE '%@' || ? || '%'`,
+      me, me, me
+    );
+    const mentions = {};
+    for (const row of candidates) {
+      if (!unreads[row.server_id] || unreads[row.server_id][row.channel_id] == null) continue; // not a channel I can see
+      if (!mentionedUsernames(row.text).includes(me)) continue;
+      (mentions[row.server_id] ||= {})[row.channel_id] = (mentions[row.server_id][row.channel_id] || 0) + 1;
+    }
+    return res.json({ unreads, mentions });
   });
 
   // Create a server: the creator becomes its owner + first member.

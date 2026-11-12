@@ -1366,6 +1366,41 @@ async function main() {
       await markChannelRead(socketUser, serverId, channelId);
     });
 
+    // "X is typing…". Purely ephemeral: nothing is stored, and a lost event just means the hint does
+    // not show. It is still held to the same access rules as sending a message, because announcing
+    // that you are typing in a private channel or to a stranger is itself information. Throttled per
+    // socket so a client cannot use it to flood a room; the client sends one every few seconds.
+    let lastTypingAt = 0;
+    socket.on('typing', async (payload = {}) => {
+      if (!socketUser) return;
+      const now = Date.now();
+      if (now - lastTypingAt < 1000) return;
+      lastTypingAt = now;
+      try {
+        if (payload.scope === 'channel') {
+          const serverId = String(payload.serverId || '');
+          const channelId = String(payload.channelId || '');
+          const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+          if (!ch) return;
+          const role = await roleOf(serverId, socketUser);
+          if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, role))) return;
+          // The channel room holds exactly the sockets with that channel open: the only people for
+          // whom "someone is typing here" means anything.
+          socket.to(`channel:${serverId}:${channelId}`).emit('typing', { scope: 'channel', serverId, channelId, from: socketUser });
+        } else if (payload.scope === 'dm') {
+          const me = await getUserByUsername(socketUser);
+          const peer = await getUserByUsername(String(payload.to || ''));
+          if (!me || !peer || peer.id === me.id) return;
+          if (!(await canDirectMessage(me.id, me.username, peer.id, peer.username))) return;
+          io.to(`user:${peer.username}`).emit('typing', { scope: 'dm', from: socketUser });
+        } else if (payload.scope === 'group') {
+          await groups.emitTyping(payload.groupId, socketUser);
+        }
+      } catch (err) {
+        console.warn('typing relay failed:', err && err.message);
+      }
+    });
+
     socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment, quotes } = {}) => {
       // Refuse writes to channels the user can't see (belongs to server + private-access check).
       // Rejections are answered with message:error (echoing the text) instead of a silent drop,
@@ -1680,8 +1715,11 @@ async function main() {
       delete clients[socket.id];
       if (info) {
         const serverId = info.serverId;
-        const members = getMembersForServer(serverId);
-        io.to(`server:${serverId}`).emit('server:state', { server: { id: serverId }, members });
+        // The full, per-socket state — the same thing a join sends. This used to emit a bare
+        // `{ server: { id } }`, and the client replaces its whole server state with whatever arrives,
+        // so one person closing their tab blanked the server name and channel list for everyone else
+        // looking at that server until they clicked it again.
+        broadcastServerState(serverId).catch((err) => console.warn('state after disconnect failed:', err && err.message));
         if (info.username) {
           setUserPresenceByUsername(info.username, 'offline')
             .then((status) => broadcastPresenceToFriends(info.username, status))

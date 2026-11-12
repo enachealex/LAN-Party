@@ -98,6 +98,7 @@ function RailIcon({
   onContextMenu,
   longPress,   // touch equivalent of onContextMenu (see longPress.js); spread onto the button
   badge,
+  mentions = 0,
   className = '',
   home = false,
   voiceActive = false,
@@ -118,7 +119,10 @@ function RailIcon({
         {voiceActive && <VoiceTileScrim />}
       </button>
       {/* Badge lives outside the (overflow-hidden) tile so it can sit over the top-right corner. */}
-      {badge != null && badge > 0 && (
+      {/* Mentions outrank the plain unread count: "someone named you" is the one a person acts on. */}
+      {mentions > 0 ? (
+        <span className="dc-rail-badge dc-rail-badge-mention" title={`${mentions} mention${mentions === 1 ? '' : 's'}`}>@{mentions > 99 ? '99+' : mentions}</span>
+      ) : badge != null && badge > 0 && (
         <span className="dc-rail-badge">{badge > 99 ? '99+' : badge}</span>
       )}
     </div>
@@ -218,6 +222,8 @@ export default function AppLeftPane({
   onSetMemberRole,
   channelUnreads = {},
   serverUnreadTotals = {},
+  channelMentions = {},      // { channelId: count } of unread messages naming me, for the server on screen
+  serverMentionTotals = {},  // { serverId: count }
   paneTab = 'channels',   // which view the server side panel is showing: 'channels' | 'members'
   onPaneTabChange,
   homeTileUrl = null,     // custom Home tile image (per-user); null = the default house icon
@@ -338,6 +344,7 @@ export default function AppLeftPane({
             active={selectedServerId === s.id}
             voiceActive={inVoice && voiceRailTarget === s.id}
             badge={serverUnreadTotals[s.id] || 0}
+            mentions={serverMentionTotals[s.id] || 0}
             onClick={() => onSelectServer?.(s.id)}
             onContextMenu={(e) => openCtxMenu(e, serverMenuItem(s))}
             longPress={longPressProps((e) => openCtxMenu(e, serverMenuItem(s)))}
@@ -455,6 +462,7 @@ export default function AppLeftPane({
                 </div>
                 {channels.filter((c) => c.type === 'text').map((ch) => {
                   const unread = channelUnreads[ch.id] || 0
+                  const mentions = channelMentions[ch.id] || 0
                   return (
                     <button
                       key={ch.id}
@@ -467,6 +475,7 @@ export default function AppLeftPane({
                       <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
                       <span>{ch.name}</span>
                       {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
+                      {mentions > 0 && <span className="dc-channel-mention" title={`You were mentioned ${mentions === 1 ? 'once' : `${mentions} times`}`}>@{mentions > 99 ? '99+' : mentions}</span>}
                       {unread > 0 && <span className="dc-channel-unread">{unread > 99 ? '99+' : unread}</span>}
                     </button>
                   )

@@ -58,6 +58,9 @@ const SOUNDS = {
   send:       (c, t) => tone(c, { freq: 520, start: t, dur: 0.10, type: 'sine', gain: 0.16, glideTo: 900 }),
   receive:    (c, t) => { tone(c, { freq: 740, start: t, dur: 0.08, type: 'sine', gain: 0.12 }); tone(c, { freq: 990, start: t + 0.06, dur: 0.10, type: 'sine', gain: 0.10 }) },
   notify:     (c, t) => { tone(c, { freq: 880, start: t, dur: 0.11, type: 'sine', gain: 0.16 }); tone(c, { freq: 1320, start: t + 0.10, dur: 0.16, type: 'sine', gain: 0.14 }) },
+  // Being named is more specific than "something arrived", so it gets its own three-note figure
+  // rather than reusing notify — you can tell from another room that it was for you.
+  mention:    (c, t) => [988, 1319, 1568].forEach((f, i) => tone(c, { freq: f, start: t + i * 0.07, dur: 0.12, type: 'sine', gain: 0.15 })),
   joinVoice:  (c, t) => { tone(c, { freq: 523, start: t, dur: 0.12, type: 'triangle', gain: 0.16 }); tone(c, { freq: 784, start: t + 0.10, dur: 0.18, type: 'triangle', gain: 0.16 }) },
   leaveVoice: (c, t) => { tone(c, { freq: 784, start: t, dur: 0.12, type: 'triangle', gain: 0.16 }); tone(c, { freq: 523, start: t + 0.10, dur: 0.18, type: 'triangle', gain: 0.14 }) },
   peerJoin:   (c, t) => tone(c, { freq: 500, start: t, dur: 0.16, type: 'sine', gain: 0.15, glideTo: 1000 }), // someone else joined the call

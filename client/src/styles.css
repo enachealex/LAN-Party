@@ -2363,3 +2363,27 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .video-tile-volume-btn:hover{background:rgba(255,255,255,.14)}
 .video-tile-volume-slider{width:96px;accent-color:var(--accent-end)}
 @media (hover:none){.video-tile-volume{opacity:1}}
+
+
+/* ---- Typing indicator: a fixed-height line above the composer ---- */
+.typing-line{height:18px;margin:0 0 4px 4px;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.typing-dots{display:inline-flex;gap:3px}
+.typing-dots i{width:5px;height:5px;border-radius:50%;background:var(--muted);animation:typing-bounce 1.2s infinite ease-in-out}
+.typing-dots i:nth-child(2){animation-delay:.15s}
+.typing-dots i:nth-child(3){animation-delay:.3s}
+@keyframes typing-bounce{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
+@media (prefers-reduced-motion:reduce){.typing-dots i{animation:none;opacity:.7}}
+
+/* ---- @mention autocomplete, sitting directly above the input ---- */
+.mention-popup{display:flex;flex-direction:column;gap:2px;margin-bottom:6px;padding:6px;border-radius:10px;background:#111820;border:1px solid rgba(255,255,255,.1);box-shadow:0 8px 22px rgba(0,0,0,.4);max-width:320px}
+.mention-option{display:flex;align-items:center;gap:2px;width:100%;padding:7px 9px;border:none;border-radius:7px;background:transparent;color:var(--text);font:inherit;font-size:14px;text-align:left;cursor:pointer}
+.mention-option.active{background:rgba(255,255,255,.1)}
+.mention-at{color:var(--accent-start);font-weight:800}
+.mention-hint{padding:4px 9px 1px;font-size:11px;color:var(--muted)}
+
+/* ---- Mention badges: distinct from the plain unread count ---- */
+.dc-channel-mention{margin-left:auto;padding:1px 7px;border-radius:9px;background:#f23f43;color:#fff;font-size:11px;font-weight:800;flex-shrink:0}
+.dc-channel-mention + .dc-channel-unread{margin-left:6px}
+.dc-rail-badge.dc-rail-badge-mention{background:#f23f43;letter-spacing:0}
+@media (max-width: 820px){.mention-option{min-height:44px}.mention-popup{max-width:none}}
+.dc-channel-lock + .dc-channel-mention{margin-left:6px}
