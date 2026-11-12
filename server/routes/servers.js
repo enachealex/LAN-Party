@@ -116,6 +116,18 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
   // Rebroadcast a server's state (role-filtered per socket).
   async function pushServerState(serverId) { await broadcastServerState(serverId); }
 
+  // Minting invite links is a staff power, and a link keeps admitting people for as long as it is
+  // live. So the links someone minted are revoked the moment they stop being staff of that server
+  // (kicked, demoted, or gone of their own accord): otherwise the power outlives the role, and a
+  // removed admin could let themselves, or anyone else, back in with a link made beforehand.
+  // Revoked rather than deleted, like a manual revoke, so the record of who minted what survives.
+  async function revokeInvitesBy(serverId, username) {
+    await db.run(
+      'UPDATE server_invites SET revoked_at = ? WHERE server_id = ? AND created_by = ? AND revoked_at IS NULL',
+      Date.now(), serverId, username
+    );
+  }
+
   // Rename a server (owner/admin; the public commons can't be renamed).
   app.patch('/servers/:serverId', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
@@ -174,6 +186,9 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     await db.run('DELETE FROM channels WHERE server_id = ?', serverId);
     await db.run('DELETE FROM channel_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_emojis WHERE server_id = ?', serverId);
+    // A link to a server that no longer exists must stop resolving, not sit there as a dead row.
+    await db.run('DELETE FROM server_invites WHERE server_id = ?', serverId);
+    await db.run('DELETE FROM server_removed WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
     if (srv.icon_url) removeTileIconFile(srv.icon_url); // otherwise the icon outlives its server
@@ -237,6 +252,9 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (!user) return res.status(404).json({ error: `No user named "${target}"` });
     if (await isMember(serverId, target)) return res.status(400).json({ error: `${target} is already a member` });
     await db.run('INSERT INTO server_members (server_id, username, role) VALUES (?, ?, ?)', serverId, target, 'member');
+    // Staff asking for someone by name is the way back in after a kick, so it lifts the block that
+    // keeps a removed person from rejoining through an invite link.
+    await db.run('DELETE FROM server_removed WHERE server_id = ? AND username = ?', serverId, target);
     io.to(`user:${target}`).emit('servers:updated');
     io.to(`user:${target}`).emit('server:invited', { serverId, name: srv.name, by: req.user.username });
     await broadcastServerState(serverId);
@@ -257,6 +275,14 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (myRole === 'admin' && targetRole === 'admin') return res.status(403).json({ error: "Admins can't remove other admins" });
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, target);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, target);
+    // A kick has to hold against invite links too. Remembering who was removed is what stops them
+    // rejoining through ANY live link (one they were sent, one a friend forwards); revoking the ones
+    // they minted stops them handing the server out to others.
+    await db.run(
+      'INSERT OR REPLACE INTO server_removed (server_id, username, removed_by, removed_at) VALUES (?, ?, ?, ?)',
+      serverId, target, req.user.username, Date.now()
+    );
+    await revokeInvitesBy(serverId, target);
     io.to(`user:${target}`).emit('servers:updated');
     io.to(`user:${target}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);
@@ -274,6 +300,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const role = (req.body || {}).role === 'admin' ? 'admin' : 'member';
     if (!(await isMember(serverId, target))) return res.status(404).json({ error: 'Not a member' });
     await db.run('UPDATE server_members SET role = ? WHERE server_id = ? AND username = ?', role, serverId, target);
+    if (role === 'member') await revokeInvitesBy(serverId, target); // no longer staff: see revokeInvitesBy
     io.to(`user:${target}`).emit('servers:updated');
     await broadcastServerState(serverId);
     return res.json({ success: true, role });
@@ -290,6 +317,9 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (!(await isMember(serverId, me))) return res.status(400).json({ error: 'Not a member' });
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, me);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, me);
+    // An admin who walks out takes their links with them. Nothing is written to server_removed:
+    // leaving is not being removed, so they may come back through a link someone else made.
+    await revokeInvitesBy(serverId, me);
     io.to(`user:${me}`).emit('servers:updated');
     io.to(`user:${me}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);

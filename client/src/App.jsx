@@ -32,6 +32,9 @@ import MicTest from './components/MicTest'
 import BootSplash from './components/BootSplash'
 import ImageCropModal from './components/ImageCropModal'
 import PrivateMessageModal from './components/PrivateMessageModal'
+import InviteLinkSection from './components/InviteLinkSection'
+import InviteJoinDialog, { InviteJoinNotice, useInviteJoin } from './components/InviteJoin'
+import { syncPush, stopPush, pushSupported, pushCovers, windowFocused, useNotificationTarget } from './push'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported, warmUpEffects } from './webcamEffects'
@@ -1093,6 +1096,13 @@ export default function App() {
   const [inviteBusy, setInviteBusy] = useState(new Set()) // usernames currently being invited
   const [inviteLoadingMembers, setInviteLoadingMembers] = useState(false)
   const [inviteQuery, setInviteQuery] = useState('') // filter the friends list in the invite modal
+  // An invite link this page was opened through (/app/?invite=CODE), if any. The hook takes the code
+  // out of the address bar and holds it across login, so it is declared up here with no dependency
+  // on auth state: a signed-out visitor still needs it looked up.
+  const inviteJoin = useInviteJoin(SERVER_URL)
+  // The conversation a clicked push notification wants opened (/app/?open=…, or a message from the
+  // service worker when a window was already open). Acted on further down, once signed in and loaded.
+  const notificationTarget = useNotificationTarget()
   // Whether the profile customization controls (picture/border/overlay/name style) are expanded.
   const [showProfileEditor, setShowProfileEditor] = useState(false)
   // Editable username (in Edit Profile) — changing it reissues the auth token.
@@ -1342,6 +1352,10 @@ export default function App() {
   const chatHistoryLoadSeqRef = useRef({})
   const restoredViewRef = useRef(false)
   const viewPersistenceReadyRef = useRef(false)
+  // The same moment as restoredViewRef, as state: friends, conversations and groups are loaded and
+  // the saved view has been put back. Opening a notification's conversation waits for it, because
+  // doing so any earlier would be overwritten by that restore.
+  const [viewRestored, setViewRestored] = useState(false)
   const messagesListRef = useRef(null)
   // Number of unread messages captured when a chat is opened, so we can land the
   // scroll on the first unread message instead of the bottom. Cleared once applied.
@@ -1627,7 +1641,9 @@ export default function App() {
     (async () => {
       try {
         const res = await fetch(`${SERVER_URL}/auth/me`, { headers: { 'Authorization': `Bearer ${t}` } })
-        if (!res.ok) { localStorage.removeItem('lanparty_token'); return }
+        // The session did not survive, so this is a signed-out browser now: it must stop receiving
+        // that account's pushes too (there is no token left to tell the server with; see stopPush).
+        if (!res.ok) { localStorage.removeItem('lanparty_token'); stopPush(); return }
         const data = await res.json()
         setToken(t)
         setIsAuthenticated(true)
@@ -1673,6 +1689,10 @@ export default function App() {
       } catch (err) {
         console.warn('Restore session failed', err)
         localStorage.removeItem('lanparty_token')
+        // Same rule as the !res.ok exit above: this browser is now signed out, so it must not keep
+        // showing that account's message previews. Without this a restore that failed on the network
+        // (server restarting, device offline) left the subscription live on the login screen.
+        stopPush()
       } finally {
         setAuthChecked(true)
       }
@@ -1806,6 +1826,7 @@ export default function App() {
     const saved = readSavedViewState()
     restoredViewRef.current = true
     viewPersistenceReadyRef.current = true
+    setViewRestored(true)
     if (!saved || Object.keys(saved).length === 0) return
     if (saved.username && username && saved.username !== username) return
 
@@ -3155,6 +3176,7 @@ export default function App() {
       const data = await res.json().catch(() => ({}))
       if (!res.ok) { setFlowError(data.error || 'Could not deactivate the account'); return }
       try { socketRef.current?.disconnect() } catch (_) {}
+      stopPush() // the server already dropped this account's subscriptions along with the account
       localStorage.removeItem('lanparty_token'); localStorage.removeItem('lanparty_user')
       setIsAuthenticated(false); setToken(null); setName('')
       setAccountFlow(null)
@@ -3343,6 +3365,17 @@ export default function App() {
     } finally {
       setInviteBusy((prev) => { const n = new Set(prev); n.delete(username); return n })
     }
+  }
+  // Link controls in the invite dialog are for owner/admins. The rail already knows my role in each server.
+  const inviteModalIsStaff = !!inviteModal && ['owner', 'admin'].includes(serversList.find((s) => s.id === inviteModal.serverId)?.role)
+  // Accept the invite link this page was opened through, then land in the server it led to.
+  const acceptServerInvite = async () => {
+    const joined = await inviteJoin.accept(authedFetch)
+    if (!joined) return // the dialog is already showing why
+    // The rail must know the server before it is selected, or the tile highlight has nothing to land on.
+    await loadServers()
+    handleSelectServer(joined.server.id)
+    setToast(joined.alreadyMember ? `You’re already in ${joined.server.name}` : `Joined ${joined.server.name}`)
   }
   const leaveServer = async (serverId, serverName2) => {
     if (!window.confirm(`Leave "${serverName2}"? You'll need a new invite to rejoin.`)) return
@@ -3643,6 +3676,9 @@ export default function App() {
     const mentioned = (info.mentions || []).includes(me)
     // Channel chatter only notifies when hidden; @mentions and DMs also notify while visible.
     if (kind === 'channel' && !document.hidden && !mentioned) return
+    // With this browser registered for Web Push, the server pushes DMs, group messages and @mentions
+    // whenever no window has focus. Raising our own as well would alert twice for one message.
+    if (pushCovers(kind, mentioned)) return
     try {
       const title = kind === 'dm'
         ? `💬 ${info.author}`
@@ -3663,6 +3699,8 @@ export default function App() {
     if (notifyEnabled) {
       setNotifyEnabled(false)
       localStorage.setItem('lanparty_notify', '0')
+      // Off means off with the app closed as well: unregister this browser for push.
+      stopPush(authedFetch)
       return
     }
     if (typeof Notification === 'undefined') { alert('This browser does not support desktop notifications.'); return }
@@ -3671,7 +3709,102 @@ export default function App() {
     if (perm !== 'granted') { alert('Notifications are blocked for this site — allow them in your browser settings, then try again.'); return }
     setNotifyEnabled(true)
     localStorage.setItem('lanparty_notify', '1')
+    // Registering for push happens in the effect below, the same way it does at login.
   }
+
+  // Notifications while the app is closed. Whenever someone is signed in with the toggle on — a
+  // fresh login, a restored session, or the toggle just switched on — make sure this browser is
+  // subscribed and registered to THEM. Where push is not possible (the desktop app, iOS outside an
+  // installed web app, a server without it) this does nothing and the toggle keeps meaning what it
+  // always did: notifications while the page is open.
+  useEffect(() => {
+    if (!isAuthenticated || !notifyEnabled) return
+    syncPush(authedFetch)
+  }, [isAuthenticated, notifyEnabled])
+
+  // Tell the server whether this window is in front of its user. It is what keeps a push from
+  // buzzing a phone about a message that is already on screen here; the server only pushes someone
+  // who has no focused window at all. Per socket, so it is sent again after every reconnect.
+  useEffect(() => {
+    if (!socket) return
+    const report = () => { if (socket.connected) socket.emit('presence:focus', { focused: windowFocused() }) }
+    socket.on('connect', report)
+    window.addEventListener('focus', report)
+    window.addEventListener('blur', report)
+    document.addEventListener('visibilitychange', report)
+    report()
+    return () => {
+      socket.off('connect', report)
+      window.removeEventListener('focus', report)
+      window.removeEventListener('blur', report)
+      document.removeEventListener('visibilitychange', report)
+    }
+  }, [socket])
+
+  // Go to the conversation a clicked notification was about, the same way a click in the UI would.
+  const openNotificationTarget = async (target) => {
+    if (target.kind === 'requests') {
+      setSelectedServerId('home')
+      setLeftNav('friends')
+      setMobileNavOpen(true) // on phones the requests live in the nav drawer
+      loadFriendsData()
+      return
+    }
+    if (target.kind === 'dm') {
+      const matches = (item) => String(item.id) === target.userId || (item.peerUsername || item.name) === target.username
+      const known = dmConversations.find(matches) || friends.find(matches)
+      setSelectedServerId('home')
+      setLeftNav('messages')
+      // A first message from someone who is not a friend (a server co-member) is in neither list
+      // yet, which is why the notification carries their id: it is what the chat is keyed by.
+      openPeerChat('dm', known
+        ? { ...known, peerUsername: known.peerUsername || known.name }
+        : { id: target.userId, name: target.username, peerUsername: target.username })
+      return
+    }
+    if (target.kind === 'group') {
+      const find = (list) => (list || []).find((g) => String(g.id) === target.groupId)
+      // Not in the list we have: it may simply be newer than our last load.
+      const group = find(groupChats) || find(await loadGroupsData())
+      if (!group) return // no longer a member; there is nothing to open
+      setSelectedServerId('home')
+      setLeftNav('messages')
+      handleSelectGroup(group)
+      return
+    }
+    if (target.kind === 'channel') {
+      const s = socketRef.current
+      if (!s) return
+      setMobileNavOpen(false) // reveal the chat on phones
+      // Only ask; the server's channel:joined answer is what moves the view. A channel that has been
+      // deleted, or that we can no longer see, is then simply never entered.
+      const hop = () => s.emit('joinChannel', { serverId: target.serverId, channelId: target.channelId })
+      if (selectedServerIdRef.current === target.serverId) {
+        if (activeChannelRef.current !== target.channelId) hop()
+        return
+      }
+      // Entering a server lands in its first channel. Wait for that to be confirmed before moving
+      // on: sent together, the two answers race and the first channel can win.
+      const onJoined = ({ serverId, channelId } = {}) => {
+        if (serverId !== target.serverId) return
+        s.off('channel:joined', onJoined)
+        clearTimeout(giveUp)
+        if (channelId !== target.channelId) hop()
+      }
+      const giveUp = setTimeout(() => s.off('channel:joined', onJoined), 8000)
+      s.on('channel:joined', onJoined)
+      handleSelectServer(target.serverId)
+    }
+  }
+
+  useEffect(() => {
+    const target = notificationTarget.target
+    // Held until there is a session and its lists are in: a notification clicked while signed out
+    // opens its conversation right after login.
+    if (!target || !isAuthenticated || !bootDone || !viewRestored) return
+    notificationTarget.clear()
+    openNotificationTarget(target)
+  }, [notificationTarget.target, isAuthenticated, bootDone, viewRestored])
 
   const sendMessage = async () => {
     if (!socket || (!text.trim() && !pendingFile)) return
@@ -4588,6 +4721,10 @@ export default function App() {
     socketRef.current = null
     restoredViewRef.current = false
     viewPersistenceReadyRef.current = false
+    setViewRestored(false)
+    // Whoever signs in here next must not receive this account's notifications. confirmSignOut has
+    // normally told the server already; this makes sure the browser itself lets go either way.
+    stopPush()
     setIsAuthenticated(false)
     setToken(null)
     setName('')
@@ -4619,6 +4756,9 @@ export default function App() {
   }
 
   const confirmSignOut = async () => {
+    // Before the token is revoked: have the server forget this browser's push subscription, so the
+    // account stops being notified here the moment it signs out. Never blocks signing out.
+    await stopPush(authedFetch)
     // attempt server-side logout (revoke token) but always clear local state
     try {
       if (token) {
@@ -7022,6 +7162,7 @@ export default function App() {
             )}
           </div>
           <div className="auth-right">
+            <InviteJoinNotice invite={inviteJoin.state} onDismiss={inviteJoin.dismiss} onRetry={inviteJoin.retry} resolveSrc={emojiSrc} />
             <div className="auth-tabs">
               <button className={authMode==='login' ? 'active' : ''} onClick={() => setAuthMode('login')}>Log in</button>
               <button className={authMode==='register' ? 'active' : ''} onClick={() => { setAuthMode('register'); clearRegisterForm(); }}>Register Account</button>
@@ -7286,7 +7427,7 @@ export default function App() {
       {/* Invite friends to a server — friends already in the server show a ✓ instead of Add. */}
       {inviteModal && (
         <div className="invite-overlay" role="dialog" aria-modal="true" aria-labelledby="invite-title" onMouseDown={(e) => { if (e.target === e.currentTarget) setInviteModal(null) }}>
-          <div className="invite-card">
+          <div className={`invite-card${inviteModalIsStaff ? ' has-links' : ''}`}>
             <div className="invite-header">
               <span id="invite-title" className="invite-title">Invite friends to <strong>{inviteModal.serverName}</strong></span>
               <button className="invite-close" aria-label="Close" onClick={() => setInviteModal(null)}>✕</button>
@@ -7339,12 +7480,26 @@ export default function App() {
             })()}
             {inviteLoadingMembers && <div className="invite-loading">Checking who’s already in…</div>}
 
+            {/* Links are minted by owner/admins only; the server enforces it, this just hides the controls. */}
+            {inviteModalIsStaff && <InviteLinkSection serverId={inviteModal.serverId} authedFetch={authedFetch} />}
+
             <div className="invite-actions">
               <button className="feedback-btn primary" onClick={() => setInviteModal(null)}>Done</button>
             </div>
           </div>
         </div>
       )}
+
+      {/* Arrived through an invite link: confirm before joining. Held back until the boot splash and
+          first-login onboarding are out of the way, so it is never fighting them for the screen. */}
+      <InviteJoinDialog
+        open={isAuthenticated && bootDone && !showOnboarding}
+        invite={inviteJoin.state}
+        resolveSrc={emojiSrc}
+        onAccept={acceptServerInvite}
+        onDismiss={inviteJoin.dismiss}
+        onRetry={inviteJoin.retry}
+      />
 
       {/* Direct friend call: incoming ring, or the in-call bar (remote audio plays via RemoteMedia) */}
       {call && (
@@ -7772,7 +7927,7 @@ export default function App() {
               </button>
               <div className="notify-setting-text">
                 <span className="notify-setting-title">Desktop notifications</span>
-                <span className="notify-setting-hint">Receive Message notifications.</span>
+                <span className="notify-setting-hint">{pushSupported() ? 'Receive Message notifications, even when LAN Party is closed.' : 'Receive Message notifications.'}</span>
               </div>
             </div>
 

@@ -112,6 +112,8 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
         await db.run('DELETE FROM channels WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_members WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_emojis WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_invites WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_removed WHERE server_id = ?', s.id);
         await db.run('DELETE FROM servers WHERE id = ?', s.id);
       }
       await db.run('DELETE FROM server_members WHERE username = ?', username);
@@ -121,6 +123,12 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       await db.run('DELETE FROM messages WHERE author = ?', username);
       await db.run('UPDATE messages SET pinned_by = NULL WHERE pinned_by = ?', username);
       await db.run('DELETE FROM server_emojis WHERE created_by = ?', username);
+      // Links they minted for servers they did not own. Left alone, a link would outlive its author
+      // and be credited to whoever registers the freed username next.
+      await db.run('DELETE FROM server_invites WHERE created_by = ?', username);
+      // A kick is about a person, not a name: whoever registers the freed username next must not
+      // inherit it.
+      await db.run('DELETE FROM server_removed WHERE username = ?', username);
       await db.run('DELETE FROM apps WHERE created_by = ?', username);
       await db.run('DELETE FROM gifs WHERE created_by = ?', username);
       await db.run('DELETE FROM sounds WHERE created_by = ?', username);
@@ -139,6 +147,9 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       await db.run('DELETE FROM group_messages WHERE group_id NOT IN (SELECT group_id FROM group_members)');
       await db.run('DELETE FROM group_chats WHERE id NOT IN (SELECT group_id FROM group_members)');
       await db.run('DELETE FROM auth_tokens WHERE user_id = ?', userId);
+      // Their browsers stop being notified. Left behind, the rows would deliver to whoever registers
+      // the freed username next.
+      await db.run('DELETE FROM push_subscriptions WHERE username = ?', username);
       await db.run('DELETE FROM users WHERE id = ?', userId);
       await db.run('COMMIT');
     } catch (e) {

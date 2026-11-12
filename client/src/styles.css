@@ -1296,6 +1296,55 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .invite-loading{padding:8px 4px 0;text-align:center;color:#6f8092;font-size:12px}
 .invite-actions{display:flex;justify-content:flex-end;margin-top:14px}
 
+/* Invite link block (owner/admins) under the friends list. With it present the card holds two
+   lists, so the friends list gives up height and the card itself may scroll on a short screen
+   rather than push its Done button off the bottom. */
+.invite-card.has-links{overflow-x:hidden;overflow-y:auto}
+.invite-card.has-links .invite-list{min-height:92px;max-height:min(30vh,232px);flex-shrink:0}
+.invite-card.has-links .invite-empty{min-height:72px}
+.invite-link-section{margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;gap:8px;flex-shrink:0}
+.invite-link-title{font-size:13px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#8ea0b2}
+.invite-link-hint{font-size:12.5px;color:#8ea0b2;line-height:1.45;margin-top:-4px}
+.invite-link-controls{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap}
+.invite-link-field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#8ea0b2;flex:1 1 96px;min-width:0}
+.invite-link-field select,.invite-link-field input,.invite-link-url{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:8px;background:#0c1015;border:1px solid rgba(255,255,255,.14);color:#edf3fb;font-size:13.5px;font-family:inherit}
+.invite-link-field select:focus,.invite-link-field input:focus,.invite-link-url:focus{outline:none;border-color:var(--accent-start)}
+.invite-link-field input::placeholder{color:#6f8092}
+.invite-link-controls .invite-add-btn{padding:8px 14px}
+.invite-link-fresh{display:flex;gap:8px;align-items:center}
+.invite-link-url{flex:1;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.invite-link-error{font-size:12.5px;color:#ffb4b4}
+.invite-link-note{font-size:12.5px;font-weight:700;color:#2bc36f}
+.invite-link-btn{padding:6px 11px;border-radius:7px;background:transparent;border:1px solid rgba(255,255,255,.16);color:#cdd8e4;font-size:12.5px;font-weight:700;cursor:pointer;flex-shrink:0}
+.invite-link-btn:hover:not(:disabled){border-color:rgba(255,255,255,.32);color:#edf3fb}
+.invite-link-btn:disabled{opacity:.6;cursor:default}
+.invite-link-btn.danger{color:#ffb4b4;border-color:rgba(255,120,120,.3)}
+.invite-link-btn.danger:hover:not(:disabled){color:#ffd0d0;border-color:rgba(255,120,120,.6)}
+.invite-link-toggle{align-self:flex-start;background:transparent;border:none;padding:2px 0;color:#b7c4d4;font-size:13px;font-weight:700;cursor:pointer}
+.invite-link-toggle:hover{color:#edf3fb}
+.invite-link-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px;overflow-x:hidden;overflow-y:auto;max-height:148px;flex-shrink:0}
+.invite-link-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 8px;border-radius:9px}
+.invite-link-row:hover{background:rgba(255,255,255,.04)}
+.invite-link-row-main{display:flex;flex-direction:column;gap:2px;min-width:0}
+.invite-link-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;color:#e6eef7}
+.invite-link-meta{font-size:12px;color:#8ea0b2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.invite-link-row-actions{display:flex;gap:6px;flex-shrink:0}
+
+/* Arriving through an invite link: the notice on the sign-in screen, and the pieces the join
+   dialog adds to the private-message modal shell it borrows. */
+.invite-join-notice{position:relative;display:flex;flex-direction:column;gap:8px;margin-bottom:12px;padding:10px 34px 10px 12px;border-radius:10px;background:rgba(43,195,255,.08);border:1px solid rgba(43,195,255,.28);color:var(--text);font-size:13.5px;line-height:1.45;text-align:left}
+.invite-join-notice.bad{background:rgba(255,0,0,.06);border-color:rgba(255,120,120,.3);color:#ffb4b4}
+.invite-join-line{color:inherit}
+.invite-join-dismiss{position:absolute;top:4px;right:4px;width:28px;height:28px;border:none;border-radius:7px;background:transparent;color:inherit;font-size:13px;cursor:pointer;opacity:.75}
+.invite-join-dismiss:hover{opacity:1;background:rgba(255,255,255,.08)}
+.invite-join-link{background:none;border:none;padding:0;color:inherit;font:inherit;font-weight:700;text-decoration:underline;cursor:pointer}
+.invite-join-server{display:flex;align-items:center;gap:12px;min-width:0}
+.invite-join-icon{width:44px;height:44px;border-radius:14px;flex-shrink:0;object-fit:cover;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--accent-start),var(--accent-end));color:#04121f;font-size:18px;font-weight:800}
+.invite-join-text{min-width:0}
+.invite-join-name{font-size:15px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.invite-join-meta{font-size:12.5px;color:var(--muted)}
+.invite-join-question{font-size:17px;font-weight:700;color:var(--text)}
+
 /* Direct friend calls: DM-header call button, incoming ring overlay, in-call bar */
 .call-btn{padding:7px 14px;border-radius:8px;border:1px solid rgba(255,255,255,.16);background:transparent;color:var(--text);font-size:13px;font-weight:800;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
 .call-btn:hover{background:rgba(43,182,115,.18);border-color:#2bb673}

@@ -245,6 +245,65 @@ const MIGRATIONS = [
       await db.exec('CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages (group_id, created_at)');
     },
   },
+  {
+    // Shareable invite links: a server admin hands out a URL instead of adding people by exact
+    // username. The code IS the credential (random, unguessable), so it is the primary key and is
+    // never derived from anything. expires_at / max_uses are NULL for "never" / "unlimited".
+    // Revoking sets revoked_at rather than deleting the row, so the record of who minted a link
+    // survives; a revoked code is refused exactly like one that never existed.
+    name: '0007_server_invites',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_invites (
+        code TEXT PRIMARY KEY,
+        server_id TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        max_uses INTEGER,
+        uses INTEGER NOT NULL DEFAULT 0,
+        revoked_at INTEGER
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_server_invites_server ON server_invites (server_id)');
+    },
+  },
+  {
+    // Web Push subscriptions: one row per browser/device that asked for notifications while the app
+    // is closed. The endpoint is the push service's URL for that browser, unique to it and a secret
+    // in its own right, so it is the primary key: the same browser subscribing again (or a second
+    // person signing in on it) replaces the row instead of adding one. Keyed to the username like
+    // the other per-user tables, so a rename has to carry it along (POST /user/username).
+    // last_success_at is NULL until a push has actually been accepted for delivery.
+    name: '0008_push_subscriptions',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        user_agent TEXT,
+        created_at INTEGER NOT NULL,
+        last_success_at INTEGER
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions (username)');
+    },
+  },
+  {
+    // People a server's staff removed. Until invite links existed, being kicked was final until
+    // staff added the username again; with links, anyone holding a live one could walk straight back
+    // in. A row here is what a link checks before it admits someone (routes/invites.js). It is
+    // cleared when staff invite that username by hand, and never written when someone leaves of
+    // their own accord. removed_by / removed_at are a record only; nothing reads them.
+    name: '0009_server_removed',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_removed (
+        server_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        removed_by TEXT,
+        removed_at INTEGER NOT NULL,
+        PRIMARY KEY (server_id, username)
+      )`);
+    },
+  },
 ];
 
 /**

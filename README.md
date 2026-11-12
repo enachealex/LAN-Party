@@ -9,8 +9,8 @@ Trusted Web Activity APK for Android.
 
 ## Features
 
-- **Servers & channels**: text and voice channels, private channels, owner/admin roles, invites,
-  custom server icons.
+- **Servers & channels**: text and voice channels, private channels, owner/admin roles, invites by
+  username or by shareable link, custom server icons.
 - **Chat**: file uploads (deleted after 7 days), GIFs (Tenor plus your own library), custom emojis,
   reactions with customizable quick reactions, quoted replies, pins, and edits and deletes that are
   saved and shown to everyone.

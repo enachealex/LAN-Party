@@ -148,6 +148,7 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `PUBLIC_APP_URL` | Public base URL for links the server hands out, e.g. feedback screenshots in Vaultline tickets |
 | `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED` | Voice networking, above |
 | `STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web Push (notifications while the app is closed). All optional: with none set, a keypair is generated on first boot and kept in `DATA_DIR/vapid.json`, and the subject is `mailto:admin@<CLIENT_ORIGIN host>`. See below. |
 | `TENOR_API_KEY` / `tenor.key` | GIF search |
 | `YOUTUBE_API_KEY` / `youtube.key` | Watch Together search |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI` / `spotify.key` | Spotify |
@@ -156,6 +157,21 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `VAULT_SSO_SECRET` (also `/srv/apps/lan-party/vault-sso.key`) | Vault Player SSO; see [docs/VAULT-PLAYER-INTEGRATION.md](docs/VAULT-PLAYER-INTEGRATION.md) |
 
 Music playback also needs `yt-dlp` on the PATH (`/usr/local/bin/yt-dlp` on the host).
+
+## Push notifications
+
+Standard Web Push, sent straight from the server to each browser's push service (outbound HTTPS to
+Google, Mozilla, Apple, Microsoft). No account or API key is involved.
+
+- Needs the `web-push` module, which is a **new runtime dependency**: install it per "Server change"
+  above. Without it the server boots normally, logs `[push] web-push is not installed`, and clients
+  keep their in-page notifications. With it, the log says `[push] notifications on`.
+- `DATA_DIR/vapid.json` (mode 600) is the server's identity to the push services. **Back it up with
+  the database and never replace it**: every browser is subscribed against that key, and a new one
+  silently orphans them all until each person next opens the app. It lives in `DATA_DIR`, so a
+  restore that brings the database back brings the key with it.
+- Subscriptions are rows in `push_subscriptions`. A browser that has gone away is removed the first
+  time its push service answers 404/410.
 
 ## Scale
 

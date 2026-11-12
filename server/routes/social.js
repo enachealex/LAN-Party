@@ -3,7 +3,7 @@
 // read, send, delete). Leans on shared helpers (friend-graph, DM-unread, presence broadcasts) that
 // also serve the socket layer, so they are injected rather than moved.
 /** @param {Record<string, any>} deps */
-function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes }) {
+function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push }) {
   app.post('/user/presence', authMiddleware, async (req, res) => {
     const status = normalizePresence(req.body?.status);
     const username = req.user.username;
@@ -126,6 +126,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
       createdAt
     );
     await emitPendingUpdate(target.username);
+    // A request is the one thing here that is useless until its recipient sees it, and someone with
+    // the app closed otherwise finds out days later. Not awaited: it never fails the request.
+    push.notifyFriendRequest({ from: me.username, to: target.username });
     return res.json({ success: true });
   });
 
@@ -344,6 +347,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     });
     await emitDmUnreadUpdate(peer.username);
     await emitDmUnreadUpdate(me.username);
+    // For a recipient whose app is closed. Fire-and-forget: the message is already stored and
+    // emitted, and a push service being slow or down must not delay or fail the send.
+    push.notifyDirectMessage({ from: me.username, fromUserId: me.id, to: peer.username, text: body, attachment });
     return res.json({ success: true, message: msg });
   });
 

@@ -12,18 +12,21 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('./email');
 const vaultline = require('./vaultline');
-const { feedbackInput, inviteInput, validate } = require('./validation');
+const { feedbackInput, inviteInput, inviteLinkInput, pushSubscribeInput, pushUnsubscribeInput, validate } = require('./validation');
 const { migrate } = require('./db/schema');
 const { createActivities } = require('./services/activities');
 const { createMessages } = require('./services/messages');
 const { createSfu } = require('./services/sfu');
+const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./services/push');
 const { registerMediaRoutes } = require('./routes/media');
 const { registerAuthRoutes } = require('./routes/auth');
 const { registerSocialRoutes } = require('./routes/social');
 const { registerGroupRoutes } = require('./routes/groups');
 const { registerVaultRoutes } = require('./routes/vault');
 const { registerServerRoutes } = require('./routes/servers');
+const { registerInviteRoutes } = require('./routes/invites');
 const { registerLibraryRoutes } = require('./routes/library');
+const { registerPushRoutes } = require('./routes/push');
 const { rateLimit } = require('./rateLimit');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
@@ -33,6 +36,8 @@ const PORT = process.env.PORT || 3000;
 //  CLIENT_DIST    path to the built client (client/dist) to serve; enables single-origin hosting
 //  CLIENT_ORIGIN  comma-separated allowed origins for CORS/Socket.IO ('*' = any, the default)
 //  STUN_URLS / TURN_URLS / TURN_USERNAME / TURN_CREDENTIAL  WebRTC ICE servers sent to clients
+//  VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT  Web Push identity; see services/push.js
+//                 (unset = a keypair is generated once and kept in DATA_DIR/vapid.json)
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const CLIENT_DIST = process.env.CLIENT_DIST || path.join(__dirname, '..', 'client', 'dist');
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
@@ -422,6 +427,10 @@ async function main() {
     parseAttachment, normalizeAttachment, parseReactions, formatReactions,
     sanitizeQuotes, parseQuotes, mapMessageRow, channelPins, toggleReaction,
   } = createMessages({ db });
+
+  // Web Push for people whose app is closed (services/push.js). Off, harmlessly, when the web-push
+  // module is not installed on this host.
+  const push = createPush({ db, dataDir: DATA_DIR, clientOrigin: CLIENT_ORIGIN });
 
   // Return deduped members for a server: prefer username when available, keep latest connection per key
   function getMembersForServer(serverId) {
@@ -923,6 +932,12 @@ async function main() {
       await db.run('UPDATE messages SET pinned_by = ? WHERE pinned_by = ?', newUsername, oldUsername);
       await db.run('UPDATE servers SET owner = ? WHERE owner = ?', newUsername, oldUsername);
       await db.run('UPDATE server_emojis SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_invites SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      // A kick follows the person through a rename; otherwise changing your name would be a way back
+      // in through an invite link. (The new name was just checked to be free, and deleting an account
+      // clears its rows, so nothing can clash.)
+      await db.run('UPDATE server_removed SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE push_subscriptions SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE apps SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
       await db.run('UPDATE gifs SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
       await db.run('UPDATE sounds SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
@@ -1038,7 +1053,9 @@ async function main() {
   async function emitUnreadBump(serverId, channelId, privacy, author, text) {
     const srv = await db.get('SELECT name FROM servers WHERE id = ?', serverId);
     const ch = await db.get('SELECT name FROM channels WHERE id = ?', channelId);
-    const mentions = [...String(text || '').matchAll(/@(\w[\w.-]*)/g)].map((m) => m[1]);
+    // One definition of "mentioned" for the badge, the in-page notification and the push: if they
+    // disagreed, a background tab and a push would each announce the same message.
+    const mentions = mentionedUsernames(text);
     const payload = {
       serverId, channelId, author,
       serverName: srv?.name, channelName: ch?.name,
@@ -1055,6 +1072,38 @@ async function main() {
       if (privacy === 'private' && !isStaffRole(m.role) && !granted.has(m.username)) continue;
       io.to(`user:${m.username}`).emit('unread:bump', payload);
     }
+  }
+  // Push the people a channel message @mentions, and nobody else: ordinary channel chatter is what
+  // the unread badge is for, and a phone that buzzed for every line in a busy channel would have its
+  // notifications switched off within the hour. A mention only reaches someone who could open the
+  // channel and read it, so naming a person cannot leak a private channel's contents to them.
+  async function pushMentions({ serverId, channelId, privacy, sender, text, attachment }) {
+    if (!push.available()) return;
+    // Bounded before any lookups, so a wall of @names costs a fixed number of queries.
+    const candidates = mentionedUsernames(text).filter((name) => name !== sender).slice(0, MAX_MENTION_TARGETS * 2);
+    const to = [];
+    let senderRow = null;
+    for (const name of candidates) {
+      if (to.length >= MAX_MENTION_TARGETS) break;
+      const user = await getUserByUsername(name);
+      if (!user || to.includes(user.username)) continue;
+      const role = await roleOf(serverId, user.username);
+      if (!(await canAccessChannel(serverId, channelId, user.username, privacy, role))) continue;
+      // The public commons counts every account as a member, so "can open the channel" is no filter
+      // at all there: any stranger could ring any phone. In the commons a mention only pushes someone
+      // the sender could already message directly (a friend, or someone they share a real server
+      // with) — the same line DMs draw. The mention still shows in the channel for everyone.
+      if (serverId === DEMO_ID) {
+        senderRow = senderRow || await getUserByUsername(sender);
+        if (!senderRow || !(await canDirectMessage(senderRow.id, sender, user.id, user.username))) continue;
+      }
+      to.push(user.username);
+    }
+    if (to.length === 0) return;
+    if (!push.allowMentionPush(sender)) return;
+    const srv = await db.get('SELECT name FROM servers WHERE id = ?', serverId);
+    const ch = await db.get('SELECT name FROM channels WHERE id = ?', channelId);
+    await push.notifyMention({ serverId, channelId, serverName: srv?.name, channelName: ch?.name, from: sender, to, text, attachment });
   }
 
   // Broadcast a server's state to everyone in its room, filtered per-socket (private channels are
@@ -1076,6 +1125,12 @@ async function main() {
   // Servers / channels / membership (routes/servers.js).
   registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, visibleChannelsFor, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile });
 
+  // Shareable invite links (routes/invites.js).
+  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput });
+
+  // Web Push subscriptions (routes/push.js).
+  registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
+
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
   registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir });
 
@@ -1083,8 +1138,8 @@ async function main() {
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });
 
   // Presence / friends / direct messages (routes/social.js).
-  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
-  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes });
+  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push });
+  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
   registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
@@ -1241,6 +1296,17 @@ async function main() {
         .catch((err) => console.warn('presence on connect failed', err));
     }
 
+    // Is this window in front of its user right now? The client says so whenever that changes
+    // (focus, blur, tab hidden, reconnect). It is what decides whether a message is pushed: someone
+    // looking at the app does not need their phone to buzz about what is already on screen. Kept per
+    // socket, so a phone in a pocket never mutes the laptop and one focused window is enough.
+    // The ack exists so a caller can know the state has landed before relying on it.
+    socket.on('presence:focus', (state, ack) => {
+      const focused = state && typeof state === 'object' ? state.focused === true : state === true;
+      push.setFocus(socket.id, socketUser, focused);
+      if (typeof ack === 'function') ack({ ok: true });
+    });
+
     socket.on('join', async ({ serverId = 'demo', name = 'Anonymous' } = {}) => {
       const serverRow = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
       if (!serverRow) return; // unknown server id (e.g. stale client state) — ignore
@@ -1318,6 +1384,10 @@ async function main() {
       const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE rowid = last_insert_rowid()');
       // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
       io.to(`channel:${serverId}:${channelId}`).emit('message', { ...mapMessageRow(msgRow), serverId, channelId });
+      // Not awaited: the message is stored and on everyone's screen, and nothing about pushing it to
+      // a closed app is allowed to hold up or fail the send.
+      pushMentions({ serverId, channelId, privacy: ch.privacy, sender: socketUser, text: body, attachment: fileAttachment })
+        .catch((err) => console.warn('[push] mention lookup failed:', err && err.message));
       await emitUnreadBump(serverId, channelId, ch.privacy, author, body);
     });
 
@@ -1605,6 +1675,7 @@ async function main() {
     });
 
     socket.on('disconnect', () => {
+      push.dropSocket(socket.id); // a closed window is not looking at anything
       const info = clients[socket.id];
       delete clients[socket.id];
       if (info) {

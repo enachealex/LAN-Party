@@ -11,6 +11,8 @@ server/youtube.key
 server/spotify.key
 server/smtp.key
 server/vaultline.key
+# Web Push keypair. Generated into DATA_DIR on first boot, which is server/ when running locally.
+server/vapid.json
 desktop/certs/
 # Host-only files the production box keeps beside the checkout: pm2 config (holds JWT_SECRET and
 # VAULT_SSO_SECRET), the raw secrets, and deploy leftovers

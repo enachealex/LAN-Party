@@ -15,7 +15,7 @@ const GROUP_MAX_MEMBERS = 25;
 const GROUP_NAME_MAX = 60;
 
 /** @param {Record<string, any>} deps */
-function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes }) {
+function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push }) {
   const newGroupId = () => `grp-${crypto.randomBytes(8).toString('hex')}`;
 
   /** @returns {Promise<{ group_id: string, user_id: number, joined_at: number, last_read_at: number } | undefined>} */
@@ -104,6 +104,15 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
       users.push(user);
     }
     return { users };
+  }
+
+  // The members are read again here rather than passed in, so this runs entirely after the response
+  // path and a slow lookup can only ever delay the push.
+  async function pushToGroup(groupId, from, text, attachment) {
+    if (!push.available()) return;
+    const group = await db.get('SELECT name FROM group_chats WHERE id = ?', groupId);
+    const to = (await memberUsernames(groupId)).filter((username) => username !== from);
+    await push.notifyGroupMessage({ groupId, groupName: group ? group.name : '', from, to, text, attachment });
   }
 
   const cleanName = (raw) => String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, GROUP_NAME_MAX);
@@ -261,6 +270,9 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     const message = mapMessageRow(row);
     // Everyone, the sender included: their other windows need it, and the sending tab de-dupes by id.
     await emitToMembers(ctx.groupId, 'group:message', { groupId: ctx.groupId, message });
+    // Everyone else in the group, for those whose app is closed. Not awaited: the message is stored
+    // and emitted, and pushing must never delay or fail the send.
+    pushToGroup(ctx.groupId, ctx.me.username, body, attachment).catch(() => {});
     return res.json({ success: true, message });
   });
 
