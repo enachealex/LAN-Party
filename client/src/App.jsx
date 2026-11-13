@@ -4929,6 +4929,10 @@ export default function App() {
   // resize let the player run off-screen.
   const startDragStream = (e) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return
+    // A press on the header's own buttons (Expand, Close) is a click, not a drag. Starting a drag
+    // there captured the pointer to the header, which retargets the click to the header too, so the
+    // buttons never received it and the miniplayer could not be expanded or closed.
+    if (e.target instanceof Element && e.target.closest('button, a, input, select, textarea')) return
     const startX = e.clientX, startY = e.clientY
     const origin = { ...streamPos }
     const { w: W, h: H } = streamSize
