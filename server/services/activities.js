@@ -150,6 +150,9 @@ function createActivities({ io, clients }) {
       url: `/app-bundles/${row.bundle_dir}/`,
       iconUrl: row.icon_url || '',
       createdBy: row.created_by,
+      // False while the app is a draft or waiting for review: the instance owner has not looked at
+      // it, and the join card says so. Only ever true for a published app.
+      approved: row.status === 'published',
       // Names this run of the app. Its events carry it back, so one that was meant for an earlier
       // activity in the room (still on the wire when that was replaced) can be told apart and dropped.
       run: crypto.randomBytes(8).toString('hex'),

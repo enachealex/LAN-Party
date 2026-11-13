@@ -29,9 +29,12 @@ function hookCleanup() {
 // `opts.env` adds/overrides environment variables for this server, so a test can boot a feature that
 // is gated behind config (e.g. VAULT_SSO_SECRET) — and can also boot it WITHOUT that config to prove
 // the feature stays disabled.
+// `opts.dataDir` boots on a directory an earlier server left behind (stopped with
+// `stop({ keepData: true })`), for what only shows across a restart: config that refers to accounts
+// which must already exist.
 async function startServer(opts = {}) {
   hookCleanup();
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanparty-test-'));
+  const dataDir = opts.dataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'lanparty-test-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
     env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', ...(opts.env || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -67,7 +70,7 @@ async function startServer(opts = {}) {
     base,
     dataDir,
     log: () => log,
-    async stop() {
+    async stop({ keepData = false } = {}) {
       if (child.exitCode === null) {
         // SIGKILL: a lingering server holds the runner's pipes open and hangs the test command.
         const exited = new Promise((resolve) => child.once('exit', resolve));
@@ -75,6 +78,7 @@ async function startServer(opts = {}) {
         await Promise.race([exited, new Promise((r) => setTimeout(r, 3000))]);
       }
       running.delete(child);
+      if (keepData) return;
       try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
     },
   };

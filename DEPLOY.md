@@ -145,6 +145,7 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 |---|---|
 | `JWT_SECRET` | Required. Signs logins; rotating it logs everyone out. |
 | `PORT`, `DATA_DIR`, `CLIENT_DIST`, `CLIENT_ORIGIN` | `5280`, `/mnt/data/lan-party/data`, `/srv/apps/lan-party/client/dist`, `https://lanparty.thejumpvault.com` |
+| `INSTANCE_OWNERS` | Optional. Comma-separated usernames who run the instance; today that means approving uploaded apps for the public app directory. When set and non-empty it replaces the default, which is the oldest account (lowest `users.id`). **The accounts must already exist**, spelled exactly as registered (case matters): a listed name that no account has makes nobody an owner and is logged as a warning at every boot. A listed name is reserved in any capitalisation — it cannot be registered or renamed into — and the list does not follow a rename, so a listed account cannot change its username until this variable is changed (then restart). |
 | `PUBLIC_APP_URL` | Public base URL for links the server hands out, e.g. feedback screenshots in Vaultline tickets |
 | `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED` | Voice networking, above |
 | `STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build |

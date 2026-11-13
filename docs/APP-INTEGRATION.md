@@ -3,12 +3,15 @@
 An **app** is a small web page somebody uploads to the App Directory: a single `.html` file, or a
 `.zip` with an `index.html` and its assets. LAN Party hosts it and runs it in a sandbox.
 
-Any uploaded app can be started as a **Thing To Do** in a voice channel, where everyone who joins
-it shares one piece of state. To take part in that, the app loads a small script — the **bridge
+An uploaded app can be started as a **Thing To Do** in a voice channel, where everyone who joins
+it shares one piece of state. Whoever uploaded it can do that straight away; it is listed for
+everybody else once an instance owner has approved it (see
+[Drafts, review and publishing](#drafts-review-and-publishing)). To take part in that, the app loads a small script — the **bridge
 SDK** — which tells it who is looking, who else has joined, and gives it a shared object and a way
 to send short messages. Nothing has to be changed on the server to add an app.
 
 - [Upload an app](#upload-an-app)
+- [Drafts, review and publishing](#drafts-review-and-publishing)
 - [A complete example](#a-complete-example)
 - [The SDK](#the-sdk)
 - [Limits](#limits)
@@ -22,15 +25,17 @@ a game-night buzzer with a scoreboard.
 
 ## Upload an app
 
-1. Open the **App Directory** and choose **Upload App → Upload a mini-app**.
+1. Open the **App Directory**, go to the **Developer** tab and choose **Upload an app → Upload a
+   mini-app**.
 2. Give it a name, a description and (optionally) an icon.
 3. Pick a `.html` file, or a `.zip` that contains `index.html`. If there is none at the top level
    of the zip (you zipped a folder, say), the `index.html` nearest the top is used and **its folder
    becomes the app**: files outside that folder are not kept, so keep everything the app needs
    beside or below its `index.html`. Uploads are limited to 15 MB; a zip may hold up to 300 files
    and 60 MB unpacked.
-4. Publish. The app appears in the directory for everyone, and under **Community apps** in the
-   **Things To Do** menu of every voice channel.
+4. Upload. The app is saved as a **draft**: it is listed under **My apps** in the Developer tab,
+   and under **Community apps** in the **Things To Do** menu — for you only. When it is ready for
+   everyone, choose **Submit for review**.
 
 There are two ways to run it:
 
@@ -43,8 +48,95 @@ There are two ways to run it:
 - **On your own.** *Open* in the App Directory runs the same app by itself. The SDK still works —
   you are the only participant and the state is yours alone, kept until you close the viewer.
 
-You can remove an app you uploaded from the directory. If it is running somewhere at that moment,
-it ends there.
+You can delete an app you uploaded. If it is running somewhere at that moment, it ends there.
+
+## Drafts, review and publishing
+
+Anyone can upload an app and use it themselves. Making it visible to everyone takes the approval
+of an **instance owner** — a person who runs this LAN Party server.
+
+Every app is in one of four states:
+
+| Status | Shown as | Who sees it in the directory | Who can start it in a voice channel |
+| --- | --- | --- | --- |
+| `draft` | Draft | its uploader, instance owners | its uploader, instance owners¹ |
+| `pending` | In review | its uploader, instance owners | its uploader, instance owners |
+| `published` | Published | everyone | everyone |
+| `rejected` | Changes requested | its uploader, instance owners | nobody, while it is in this state² |
+
+¹ The server accepts it, but the **Things To Do** menu only lists somebody else's app for an
+instance owner once it is **in review**. An owner who wants to try another person's draft opens it
+on its own from the Review tab.
+
+² Rejected is a status, not a ban. The uploader can submit the app again, withdraw it or replace
+its bundle; it is then in review or a draft like any other, and theirs to start in a voice channel
+again (marked as not approved). An instance owner who wants an app gone deletes it — and nothing
+stops the same file being uploaded again as a new draft, which only its uploader can start.
+
+A new upload is a draft. (An instance owner's own upload is published at once: there is nobody
+else to ask.) Apps that existed before review was introduced stayed published.
+
+A **link** app needs a full web address (`http://` or `https://`); the upload form refuses
+anything else. The address is shown in full to the uploader and the reviewer, and cannot be
+changed after uploading — delete the app and add it again.
+
+**What the uploader can do**, from the Developer tab:
+
+- **Open** it on its own, in any status, and **start it in a voice channel** they are in while it
+  is a draft or in review.
+- **Submit for review** (draft or changes requested → in review) and **Withdraw** (back to draft).
+  An uploader who is an instance owner has nobody to submit to: they get **Publish** instead.
+- **Edit details** — name, description, icon — in any status. This never changes the status.
+- **Replace bundle** — upload new files for the same app, with the same checks and limits as a
+  first upload. The app goes back to **Draft**, because what was reviewed is no longer what would
+  run; submit it again. The old files are deleted and the app gets a new address, so a room running
+  it is ended. If the new upload is refused, the old files and the status stay as they were.
+- **Unpublish** a published app (back to draft), and **Delete** it.
+- **Check app** — loads the bundle out of sight for a few seconds and reports three things: did the
+  page load, did it say hello to the bridge, did it set any state. It is a diagnostic for the
+  developer. It is not a review, and it says nothing about whether the app will be approved.
+
+**What an instance owner can do**, from the **Review** tab (which only they are shown):
+
+- open any app to test it;
+- **Approve** an app that is in review — or publish a draft or a sent-back app directly. Approving
+  a bundle approves the files the owner was shown: the request names them (`POST /apps/:id/approve`
+  with `{ "url": "<the app's url as listed>" }`), and if the uploader has replaced the bundle since,
+  the server refuses with 409 and nothing is published. The Review tab marks such an app and asks
+  for it to be opened again first. A link needs no `url`;
+- **Reject** an app that is in review or published, with an optional note (up to 500 characters)
+  that the uploader sees next to the app;
+- **Unpublish** or **Delete** anyone's app.
+
+The uploader is told when their app is approved, sent back, unpublished or removed; instance
+owners are told when an app is submitted.
+
+**An unapproved app in a voice channel.** When an uploader starts their draft, the other people in
+the channel get the same card as for any app, with one difference: it says clearly that the app is
+**not approved yet**, and by whom it was started. Nothing loads for anyone who does not press
+Join. If the app is approved while it is running, the warning goes away; if it is rejected,
+unpublished, replaced or deleted while it is running, it ends for the room.
+
+**What a draft is not.** A draft is hidden from the directory, and nobody else can find out that it
+exists. But an app's files are served from an address that is long and random, not from one that
+asks who you are — so "draft" is not access control on the files themselves. Somebody you start a
+draft with, or give the address to, can load it.
+
+**Who is an instance owner.** By default, the oldest account on the server (the first one that was
+created). The person running the server can name the owners instead, with the `INSTANCE_OWNERS`
+environment variable: usernames separated by commas. When it names at least one username it
+replaces the default — the oldest account is then an owner only if it is on the list. Left unset,
+or set to nothing but commas and spaces, the default stands.
+
+The names are matched exactly, capitals included, and the accounts must exist before they are
+listed:
+
+- a listed name that no account has makes nobody an owner (the server says so in its log at every
+  start), so a typo can leave an instance with nobody to review apps;
+- a listed name cannot be registered or renamed into, in any capitalisation — otherwise the role
+  would go to whoever took the name;
+- the list does not follow a rename, so an account that is an owner by name cannot change its
+  username until the list is changed.
 
 ## A complete example
 
@@ -222,8 +314,10 @@ Ways to get there:
   (`https://your-lan-party-host/sdk/lanparty.js` — it is served with open CORS), or do what the
   buzzer sample does and fall back to a few lines of stand-in when `window.LANParty` is missing.
 
-To try it with other people before uploading for everyone, there is no private mode yet: upload it,
-test it in a voice channel, and remove it again if it is not ready.
+To try it with other people before it is published, upload it and start it yourself in a voice
+channel: a draft is yours to run, and the others see it marked as not approved and choose whether
+to join. **Check app** in the Developer tab is the quickest way to see whether the uploaded copy
+reaches the SDK at all.
 
 ## Patterns that work
 
@@ -250,7 +344,6 @@ Planned, not built — do not design around them:
 - **Registered apps with credentials.** Client ids and secrets, and a server-to-server API.
 - **Scopes.** Asking for more than name and avatar, with the user's consent.
 - **Sign-in with LAN Party** for apps hosted elsewhere.
-- **Review before publishing.** Today an upload is visible to everyone at once.
 - **Storage that outlives a session**, per app or per player.
 
 ## For people working on LAN Party itself
@@ -261,8 +354,12 @@ Planned, not built — do not design around them:
 | Host side of the bridge (iframe ↔ LAN Party) | `client/src/appBridge.ts` |
 | The Join card and the frame in a voice channel | `client/src/components/AppActivity.tsx` |
 | The solo viewer | `client/src/components/AppViewer.jsx` |
+| The directory: Browse, Developer and Review tabs | `client/src/components/AppDirectoryModal.jsx`, `AppDeveloperTab.tsx`, `AppReviewTab.tsx`, `AppDirectoryDialog.tsx` |
+| "Check app" | `client/src/appCheck.ts` |
+| Statuses, transitions, who may see and change an app | `server/routes/library.js` |
+| Who is an instance owner | `server/services/instanceOwners.js` |
 | Server rules: limits, joined list, rate limit | `server/services/activities.js` (`applyAppEvent`), socket handlers in `server/index.js` |
-| Tests | `server/test/appActivity.test.js` |
+| Tests | `server/test/appActivity.test.js`, `server/test/appApproval.test.js` |
 
 The app and the host talk over `postMessage`. Every message is an object with `lanparty: 1` and a
 `type`. App to host: `hello`, `set`, `replace`, `emit`. Host to app: `welcome`, `state`, `ack`,

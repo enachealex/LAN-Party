@@ -7,8 +7,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('../email');
 
-/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean }} deps */
-function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword }) {
+/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, isInstanceOwner: (username: string) => Promise<boolean>, isReservedOwnerName: (name: unknown) => boolean }} deps */
+function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName }) {
   app.post('/auth/register', rateLimit({ id: 'register', windowMs: 60 * 60_000, max: 10 }), async (req, res) => {
     const { username, email, password, passwordConfirm } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
@@ -19,6 +19,9 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     // ensure username and email are unique with specific feedback
     const byUsername = await db.get('SELECT id FROM users WHERE username = ?', username);
     if (byUsername) return res.status(409).json({ error: 'Username already exists', field: 'username' });
+    // A name listed in INSTANCE_OWNERS would make whoever registers it an instance owner, so it is
+    // not available — in any spelling of its case, and answered exactly like a taken name.
+    if (isReservedOwnerName(username)) return res.status(409).json({ error: 'Username already exists', field: 'username' });
     const byEmail = await db.get('SELECT id FROM users WHERE email = ?', email);
     if (byEmail) return res.status(409).json({ error: 'Email already exists', field: 'email' });
     const defaultSettings = {
@@ -42,7 +45,7 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     if (!username && !email) return res.status(400).json({ error: 'Missing username or email' });
     if (username) {
       const byUsername = await db.get('SELECT id FROM users WHERE username = ?', username);
-      if (byUsername) return res.json({ username: false });
+      if (byUsername || isReservedOwnerName(username)) return res.json({ username: false });
     }
     if (email) {
       const byEmail = await db.get('SELECT id FROM users WHERE email = ?', email);
@@ -60,14 +63,16 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
     const settings = user.settings ? JSON.parse(user.settings) : {};
     const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: remember ? '90d' : '7d' });
-    return res.json({ success: true, token, user: { username: user.username, email: user.email, settings } });
+    // instanceOwner tells the client which controls to SHOW (the app review tab). It grants nothing:
+    // every route that acts on it asks isInstanceOwner again with the name from the token.
+    return res.json({ success: true, token, user: { username: user.username, email: user.email, settings, instanceOwner: await isInstanceOwner(user.username) } });
   });
 
   app.get('/auth/me', authMiddleware, async (req, res) => {
     const username = req.user.username;
     const user = await db.get('SELECT username, email, settings FROM users WHERE username = ?', username);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    return res.json({ success: true, user: { username: user.username, email: user.email, settings: JSON.parse(user.settings || '{}') } });
+    return res.json({ success: true, user: { username: user.username, email: user.email, settings: JSON.parse(user.settings || '{}'), instanceOwner: await isInstanceOwner(user.username) } });
   });
 
   const newAuthToken = () => crypto.randomBytes(24).toString('base64url');

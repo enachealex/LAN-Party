@@ -309,15 +309,26 @@ export function createAppBridge({ getFrameWindow, getSnapshot, transport }: Brid
   }
 }
 
+/** What a solo host may want to know about the app it is running. Only the "Check app"
+ *  diagnostic uses it; the callbacks are told that something happened, never handed app data. */
+export interface SoloBridgeWatch {
+  /** The app said hello and was welcomed (once per hello, and the SDK may repeat it). */
+  onHello?: () => void
+  /** A set/replace from the app was accepted; `keys` is how many keys the state now has. */
+  onStateChange?: (keys: number) => void
+}
+
 /** The bridge for an app opened on its own from the directory: the same SDK works, but there is
  *  no room. Identity is the viewer, the participants are just the viewer, and the shared state
  *  lives in this object — never sent anywhere, gone when the viewer closes. */
-export function createSoloBridge({ getFrameWindow, getMe }: { getFrameWindow: () => Window | null; getMe: () => BridgePerson }): AppBridge {
+export function createSoloBridge({ getFrameWindow, getMe, watch }: { getFrameWindow: () => Window | null; getMe: () => BridgePerson; watch?: SoloBridgeWatch }): AppBridge {
   let shared: SharedState = {}
   let rev = 0
   const bridge: AppBridge = createAppBridge({
     getFrameWindow,
-    getSnapshot: () => { const me = getMe(); return { me, participants: [me], shared, rev } },
+    // Only ever asked for when a hello is being answered, which is what makes it the place to
+    // notice one.
+    getSnapshot: () => { const me = getMe(); watch?.onHello?.(); return { me, participants: [me], shared, rev } },
     transport: {
       change(kind, value, done) {
         const result = applySharedChange(shared, kind, value)
@@ -326,6 +337,7 @@ export function createSoloBridge({ getFrameWindow, getMe }: { getFrameWindow: ()
         rev += 1
         bridge.pushState(shared, rev, getMe().username)
         done({ ok: true, rev })
+        watch?.onStateChange?.(Object.keys(shared).length)
       },
       emit() { /* nobody else is here to receive it */ },
     },

@@ -18,6 +18,7 @@ const { createActivities } = require('./services/activities');
 const { createMessages } = require('./services/messages');
 const { createSfu } = require('./services/sfu');
 const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./services/push');
+const { createInstanceOwners } = require('./services/instanceOwners');
 const { registerMediaRoutes } = require('./routes/media');
 const { registerAuthRoutes } = require('./routes/auth');
 const { registerSocialRoutes } = require('./routes/social');
@@ -40,6 +41,11 @@ const PORT = process.env.PORT || 3000;
 //  STUN_URLS / TURN_URLS / TURN_USERNAME / TURN_CREDENTIAL  WebRTC ICE servers sent to clients
 //  VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT  Web Push identity; see services/push.js
 //                 (unset = a keypair is generated once and kept in DATA_DIR/vapid.json)
+//  INSTANCE_OWNERS  comma-separated usernames who run this instance: they approve uploaded apps for
+//                 the public directory (unset or empty = the oldest account). The accounts must
+//                 already exist, spelled exactly: a listed name can no longer be registered or
+//                 renamed into, and one that matches no account is logged at boot.
+//                 services/instanceOwners.js
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const CLIENT_DIST = process.env.CLIENT_DIST || path.join(__dirname, '..', 'client', 'dist');
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
@@ -372,6 +378,12 @@ async function main() {
 
   const db = await open({ filename: path.join(DATA_DIR, 'data.sqlite'), driver: sqlite3.Database });
   await migrate(db);
+  // Who runs this instance (services/instanceOwners.js). Always asked with a username the server
+  // established itself (a verified token), never one a client sent.
+  const { instanceOwners, isInstanceOwner, isReservedName: isReservedOwnerName, isListedName: isListedOwnerName, configProblems: instanceOwnerProblems } = createInstanceOwners({ db });
+  // Said at every boot rather than refused: a typo here must not keep the whole server down, but it
+  // does mean nobody can review apps, and nothing else would ever say so.
+  for (const problem of await instanceOwnerProblems()) console.warn(problem);
 
   // Rescue profile pictures that were uploaded before avatars had their own folder. They sit in
   // uploads/, which the 7-day sweep empties, so without this every existing avatar still disappears —
@@ -444,11 +456,22 @@ async function main() {
   } = createActivities({ io, clients });
   // An app that is deleted while a room is running it: end it there. The bundle's files are about to
   // go, and a room left pointing at them would offer everyone a "Join" that opens a 404.
+  // The same goes for one that is rejected or unpublished (the room would keep running an app that
+  // is no longer everyone's to start) or has its bundle replaced (the files it points at are going).
   function endAppActivities(appId) {
     for (const [room, act] of Object.entries(activities)) {
       if (act.type !== APP_ACTIVITY || act.state.appId !== appId) continue;
       delete activities[room];
       io.to(room).emit('activity:update', null);
+    }
+  }
+  // An app that is published while its uploader has it running as a draft: the rooms' join cards
+  // stop saying it is unapproved. Each person gets their own view again, as on any other update.
+  function approveAppActivities(appId) {
+    for (const [room, act] of Object.entries(activities)) {
+      if (act.type !== APP_ACTIVITY || act.state.appId !== appId || act.state.approved) continue;
+      act.state.approved = true;
+      broadcastActivity(room, act);
     }
   }
 
@@ -650,7 +673,7 @@ async function main() {
   }
 
   // Auth + account lifecycle (routes/auth.js).
-  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword });
+  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName });
 
   app.get('/user/settings', authMiddleware, async (req, res) => {
     const username = req.user.username;
@@ -949,6 +972,12 @@ async function main() {
     if (newUsername === oldUsername) return res.status(400).json({ error: 'That is already your username' });
     const me = await db.get('SELECT id FROM users WHERE username = ?', oldUsername);
     if (!me) return res.status(404).json({ error: 'User not found' });
+    // A name in INSTANCE_OWNERS carries the instance-owner role with it (services/instanceOwners.js).
+    // Nobody renames into one, in any spelling of its case — answered like any taken name — and the
+    // account that holds the role under its name does not rename away from it: the list would not
+    // follow, the role would be lost without a word, and the name would be left behind for no one.
+    if (isReservedOwnerName(newUsername)) return res.status(409).json({ error: 'Username already taken' });
+    if (isListedOwnerName(oldUsername)) return res.status(409).json({ error: 'This account is named in the server’s INSTANCE_OWNERS setting. Whoever runs the server has to change that setting before the name can change.' });
     if (await db.get('SELECT id FROM users WHERE username = ?', newUsername)) return res.status(409).json({ error: 'Username already taken' });
     try {
       await db.run('BEGIN');
@@ -969,6 +998,7 @@ async function main() {
       await db.run('UPDATE server_removed SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE push_subscriptions SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE apps SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE apps SET reviewed_by = ? WHERE reviewed_by = ?', newUsername, oldUsername);
       await db.run('UPDATE gifs SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
       await db.run('UPDATE sounds SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
       await db.run('COMMIT');
@@ -1162,7 +1192,7 @@ async function main() {
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners });
 
   // Tenor / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });
@@ -1304,7 +1334,9 @@ async function main() {
         }
         result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
       }
-      return res.json({ servers: result });
+      // instanceOwner: whether the caller runs this instance (may review uploaded apps). Sent here
+      // as well as on login and /auth/me because this is what a client calls on every start.
+      return res.json({ servers: result, instanceOwner: await isInstanceOwner(me) });
     } catch (e) {
       console.error('[sync] error:', e);
       return res.status(500).json({ error: 'Server error' });
@@ -1656,9 +1688,23 @@ async function main() {
         if (!appEventAllowed(socket.id)) return; // a start costs a query and a room-wide broadcast
         // Name, url and icon come from this row. Whatever else the client sent is ignored, so a
         // start can never point the room at a url of the sender's choosing.
-        const row = await db.get("SELECT id, name, icon_url, created_by, bundle_dir FROM apps WHERE id = ? AND kind = 'bundle' AND bundle_dir IS NOT NULL AND bundle_dir != ''", appId);
+        // Asked BEFORE the app's row is read, so that nothing is awaited between reading its status
+        // and acting on it: a reject or unpublish landing in between would otherwise have ended the
+        // app's rooms just before this one started it.
+        const starterIsOwner = await isInstanceOwner(socketUser);
+        const row = await db.get("SELECT id, name, icon_url, created_by, bundle_dir, status FROM apps WHERE id = ? AND kind = 'bundle' AND bundle_dir IS NOT NULL AND bundle_dir != ''", appId);
         // Re-checked after the await: they may have left the room while the query ran.
         if (!row || !socket.rooms.has(room)) return;
+        // A published app is anyone's to start. One still on its way there (draft, or waiting for
+        // review) can be started by its uploader, to try it with real people, or by an instance
+        // owner, to review it; the room is told it is unapproved (state.approved) and each person
+        // decides whether to join. An app that is 'rejected' runs in no room, whoever asks — which
+        // lasts exactly as long as the status does. Its uploader may submit it again, withdraw it
+        // or replace its bundle, and it is then pending or a draft like any other and theirs to
+        // start. That is deliberate: the same file could be uploaded as a new draft anyway, so a
+        // rule here would only look like a ban. Deleting the app is how an owner removes it.
+        const ownDraft = (row.status === 'draft' || row.status === 'pending') && !!socketUser && (row.created_by === socketUser || starterIsOwner);
+        if (row.status !== 'published' && !ownDraft) return;
         const act = { type: APP_ACTIVITY, state: appActivityInit(row), by: appName() };
         activities[room] = act;
         // Whoever starts it has already chosen to run it, so they are joined from the first update.

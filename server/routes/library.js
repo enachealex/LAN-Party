@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const { extractBundle } = require('../services/appBundles');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -56,34 +56,128 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
     return res.json({ success: true, emojis });
   });
 
-  // --- Public app directory ---
+  // --- App directory ---
   // A 'link' app keeps its external url; a 'bundle' app is LAN-Party-hosted, so its url is the
   // internal sandboxed path. `embeddable` tells the client it can be shown in the in-app viewer.
-  async function listApps() {
-    const rows = await db.all("SELECT id, name, description, url, icon_url AS iconUrl, created_by AS createdBy, created_at AS createdAt, COALESCE(kind, 'link') AS kind, bundle_dir AS bundleDir FROM apps ORDER BY created_at DESC");
-    return rows.map((r) => {
-      const isBundle = r.kind === 'bundle' && r.bundleDir;
-      const { bundleDir, ...rest } = r;
-      return { ...rest, url: isBundle ? `/app-bundles/${bundleDir}/` : r.url, embeddable: !!isBundle };
-    });
-  }
+  //
+  // "Anyone drafts, the instance owner publishes." Every app has a status:
+  //   draft      only its uploader (and the instance owners) can see it
+  //   pending    the uploader has asked for it to be published
+  //   published  in everyone's directory, startable in any room
+  //   rejected   an instance owner said no, optionally with a note for the uploader
+  // Who may move an app between them is in APP_TRANSITIONS below.
+  //
+  // What a draft is NOT: access control on the files. A bundle is served from
+  // /app-bundles/<bundle_dir>/ to anyone who has that path, signed in or not. The path is long and
+  // random, and nothing here hands it to anyone but the uploader and the instance owners (or the
+  // people in a voice room the uploader starts it in), so an unpublished app is hidden from the
+  // directory — it is not secret from someone who has been given its url.
+  const APP_COLUMNS = "id, name, description, url, icon_url, created_by, created_at, COALESCE(kind, 'link') AS kind, bundle_dir, status, review_note, reviewed_by, reviewed_at, submitted_at";
+  const REVIEW_NOTE_MAX = 500;
+  const bundleUrl = (dir) => `/app-bundles/${dir}/`;
 
-  // Publish a link-style app (external URL) to the public directory.
+  // The shape a given viewer gets. The review fields exist only for the people the review concerns:
+  // the uploader and the instance owners. Which instance owner decided is for instance owners alone.
+  function appView(row, viewer, viewerIsOwner) {
+    const isBundle = row.kind === 'bundle' && !!row.bundle_dir;
+    /** @type {Record<string, any>} */
+    const view = {
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      url: isBundle ? bundleUrl(row.bundle_dir) : row.url,
+      iconUrl: row.icon_url,
+      createdBy: row.created_by,
+      createdAt: row.created_at,
+      kind: row.kind,
+      embeddable: isBundle,
+      status: row.status,
+    };
+    if (viewerIsOwner || row.created_by === viewer) {
+      view.reviewNote = row.review_note || '';
+      view.submittedAt = row.submitted_at || null;
+      view.reviewedAt = row.reviewed_at || null;
+    }
+    if (viewerIsOwner) view.reviewedBy = row.reviewed_by || null;
+    return view;
+  }
+  // Published apps for everyone, plus the caller's own in any status; an instance owner gets all.
+  async function listApps(viewer, viewerIsOwner) {
+    const rows = viewerIsOwner
+      ? await db.all(`SELECT ${APP_COLUMNS} FROM apps ORDER BY created_at DESC`)
+      : await db.all(`SELECT ${APP_COLUMNS} FROM apps WHERE status = 'published' OR created_by = ? ORDER BY created_at DESC`, viewer);
+    return rows.map((r) => appView(r, viewer, viewerIsOwner));
+  }
+  // The app a per-app route is about, or the response that ends the request. An app the caller may
+  // not see gets the very same 404 as an id that was never used, on every route and before any
+  // other check, so nothing about an unpublished app (not even that it exists) can be read off the
+  // status codes.
+  async function loadApp(req, res) {
+    const id = parseInt(req.params.id, 10);
+    if (!id) { res.status(400).json({ error: 'Invalid app id' }); return null; }
+    const me = req.user.username;
+    const isOwner = await isInstanceOwner(me);
+    const row = await db.get(`SELECT ${APP_COLUMNS} FROM apps WHERE id = ?`, id);
+    const isUploader = !!row && row.created_by === me;
+    if (!row || !(row.status === 'published' || isUploader || isOwner)) {
+      res.status(404).json({ error: 'App not found' });
+      return null;
+    }
+    return { id, row, me, isOwner, isUploader };
+  }
+  async function appResponse(id, me, isOwner) {
+    const row = await db.get(`SELECT ${APP_COLUMNS} FROM apps WHERE id = ?`, id);
+    return { success: true, app: row ? appView(row, me, isOwner) : null, apps: await listApps(me, isOwner) };
+  }
+  // A bundle's folder, removed. Resolved and confirmed to sit strictly inside appBundlesDir first:
+  // the name comes from the database, and this is a recursive delete.
+  function removeBundleDir(dir) {
+    if (!dir) return;
+    const target = path.resolve(appBundlesDir, dir);
+    const rel = path.relative(appBundlesDir, target);
+    const contained = !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    if (contained) {
+      try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+    }
+  }
+  const newBundleDir = () => `${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
+
+  // Notifications ride the per-user socket rooms and carry the app's id, name and status, nothing
+  // else: enough to show a toast or refetch GET /apps, which is where the details (and the
+  // visibility rules) live.
+  //   app:submitted     -> instance owners: an app is waiting for review
+  //   app:review-queue  -> instance owners: something they list changed some other way
+  //                        (withdrawn, decided, unpublished, bundle replaced, deleted)
+  //   app:reviewed      -> the uploader: an instance owner approved, rejected or unpublished it
+  async function tellOwners(event, payload) {
+    const owners = await instanceOwners();
+    if (owners.length) io.to(owners.map((u) => `user:${u}`)).emit(event, payload);
+  }
+  const tellUploader = (row, payload) => { if (row.created_by) io.to(`user:${row.created_by}`).emit('app:reviewed', payload); };
+
+  // An upload by an instance owner needs nobody's approval but their own, so it skips the queue.
+  const initialStatus = (uploaderIsOwner) => (uploaderIsOwner ? 'published' : 'draft');
+
+  // Add a link-style app (external URL). A draft until an instance owner publishes it.
   app.post('/apps', authMiddleware, async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!name) return res.status(400).json({ error: 'App name is required' });
     const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 500) : '';
     const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     const iconUrl = typeof req.body?.iconUrl === 'string' && req.body.iconUrl.startsWith('/uploads/') ? req.body.iconUrl : '';
-    await db.run(
-      "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'link')",
-      name.slice(0, 80), description, url, iconUrl, req.user.username, Date.now()
+    const me = req.user.username;
+    const isOwner = await isInstanceOwner(me);
+    const created = await db.run(
+      "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind, status) VALUES (?, ?, ?, ?, ?, ?, 'link', ?)",
+      name.slice(0, 80), description, url, iconUrl, me, Date.now(), initialStatus(isOwner)
     );
-    return res.json({ success: true, apps: await listApps() });
+    return res.json(await appResponse(created.lastID, me, isOwner));
   });
 
   app.get('/apps', authMiddleware, async (req, res) => {
-    return res.json({ apps: await listApps() });
+    const me = req.user.username;
+    const isOwner = await isInstanceOwner(me);
+    return res.json({ apps: await listApps(me, isOwner), instanceOwner: isOwner });
   });
 
   // Upload a self-contained mini-app (single .html or a .zip). The server extracts it into a private
@@ -99,7 +193,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
       if (!name) return res.status(400).json({ error: 'App name is required' });
       const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 500) : '';
       const iconUrl = typeof req.body?.iconUrl === 'string' && req.body.iconUrl.startsWith('/uploads/') ? req.body.iconUrl : '';
-      const dir = `${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
+      const dir = newBundleDir();
       const destDir = path.join(appBundlesDir, dir);
       try {
         extractBundle(req.file, destDir); // throws on unsafe/invalid archive; requires an index.html
@@ -107,34 +201,198 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
         try { fs.rmSync(destDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
         return res.status(400).json({ error: e.message || 'Could not process the bundle' });
       }
-      await db.run(
-        "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind, bundle_dir) VALUES (?, ?, '', ?, ?, ?, 'bundle', ?)",
-        name.slice(0, 80), description, iconUrl, req.user.username, Date.now(), dir
+      const me = req.user.username;
+      const isOwner = await isInstanceOwner(me);
+      const created = await db.run(
+        "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind, bundle_dir, status) VALUES (?, ?, '', ?, ?, ?, 'bundle', ?, ?)",
+        name.slice(0, 80), description, iconUrl, me, Date.now(), dir, initialStatus(isOwner)
       );
-      return res.json({ success: true, apps: await listApps() });
+      return res.json(await appResponse(created.lastID, me, isOwner));
     });
   });
 
-  // Remove an app — only its uploader may. For bundles, delete the hosted files too.
+  // Edit an app's name, description or icon — its uploader only, in any status. The status stays
+  // as it is: what gets reviewed is what the app runs, and these fields change none of that.
+  app.patch('/apps/:id', authMiddleware, async (req, res) => {
+    const found = await loadApp(req, res);
+    if (!found) return;
+    const { id, row, me, isOwner, isUploader } = found;
+    if (!isUploader) return res.status(403).json({ error: 'You can only edit apps you uploaded' });
+    const body = req.body || {};
+    let { name, description, icon_url: iconUrl } = row;
+    let changed = false;
+    if (body.name !== undefined) {
+      if (typeof body.name !== 'string' || !body.name.trim()) return res.status(400).json({ error: 'App name is required' });
+      name = body.name.trim().slice(0, 80);
+      changed = true;
+    }
+    if (body.description !== undefined) {
+      if (typeof body.description !== 'string') return res.status(400).json({ error: 'Invalid description' });
+      description = body.description.trim().slice(0, 500);
+      changed = true;
+    }
+    if (body.iconUrl !== undefined) {
+      // An empty string clears the icon; anything else has to be a file this server stored.
+      if (typeof body.iconUrl !== 'string' || (body.iconUrl !== '' && !body.iconUrl.startsWith('/uploads/'))) return res.status(400).json({ error: 'Invalid icon url' });
+      iconUrl = body.iconUrl;
+      changed = true;
+    }
+    if (!changed) return res.status(400).json({ error: 'Nothing to change' });
+    await db.run('UPDATE apps SET name = ?, description = ?, icon_url = ? WHERE id = ?', name, description, iconUrl, id);
+    return res.json(await appResponse(id, me, isOwner));
+  });
+
+  // Status changes. `by` says who may ask, `from` which statuses it is valid in, `to` where the app
+  // ends up. Order of the answers: 404 for an app the caller cannot see, then 403 for the wrong
+  // person, then 409 for the wrong status — so the 409 only ever tells someone who was allowed to
+  // ask what state the app is in.
+  const APP_TRANSITIONS = {
+    submit: { by: 'uploader', from: ['draft', 'rejected'], to: 'pending', denied: 'Only the uploader can submit an app for review' },
+    withdraw: { by: 'uploader', from: ['pending'], to: 'draft', denied: 'Only the uploader can withdraw an app from review' },
+    // No 'pending' required: an instance owner may publish an app straight from draft or rejected.
+    // For a bundle the request must also name the files that were looked at; see the handler.
+    approve: { by: 'owner', from: ['pending', 'draft', 'rejected'], to: 'published', denied: 'Only an instance owner can publish an app' },
+    reject: { by: 'owner', from: ['pending', 'published'], to: 'rejected', denied: 'Only an instance owner can reject an app' },
+    unpublish: { by: 'either', from: ['published'], to: 'draft', denied: 'Only the uploader or an instance owner can unpublish an app' },
+  };
+  for (const [action, rule] of Object.entries(APP_TRANSITIONS)) {
+    app.post(`/apps/:id/${action}`, authMiddleware, async (req, res) => {
+      const found = await loadApp(req, res);
+      if (!found) return;
+      const { id, row, me, isOwner, isUploader } = found;
+      const allowed = rule.by === 'uploader' ? isUploader : rule.by === 'owner' ? isOwner : (isUploader || isOwner);
+      if (!allowed) return res.status(403).json({ error: rule.denied });
+      let note = null;
+      if (action === 'reject' && req.body?.note !== undefined && req.body.note !== null) {
+        // Refused rather than cut short: a note that silently lost its ending is worse than a
+        // reviewer being asked to shorten it.
+        if (typeof req.body.note !== 'string') return res.status(400).json({ error: 'Invalid note' });
+        note = req.body.note.trim();
+        if (note.length > REVIEW_NOTE_MAX) return res.status(400).json({ error: `Note is longer than ${REVIEW_NOTE_MAX} characters` });
+        if (!note) note = null;
+      }
+      // Approving a bundle approves particular files, and its uploader can swap them at any moment
+      // (PUT /apps/:id/bundle) — after the reviewer opened the app, even after submitting it again
+      // under the same name. So the request says which files were reviewed, as the url the reviewer
+      // was shown, and anything but the bundle being served right now publishes nothing. (A link's
+      // address cannot be changed after upload, so there is nothing to pin for one.)
+      const isBundle = row.kind === 'bundle' && !!row.bundle_dir;
+      if (action === 'approve' && isBundle && typeof req.body?.url !== 'string') {
+        return res.status(400).json({ error: 'Say which bundle you reviewed: send the url the app had when you opened it' });
+      }
+      if (!rule.from.includes(row.status)) return res.status(409).json({ error: `This app is ${row.status}; it cannot be changed that way` });
+      if (action === 'approve' && isBundle && req.body.url !== bundleUrl(row.bundle_dir)) {
+        return res.status(409).json({ error: 'The bundle was replaced since you opened it. Open the app again and review the new files before publishing.' });
+      }
+      const now = Date.now();
+      // Each update names the status it expects to replace, so two requests racing for the same app
+      // cannot both win: the second finds nothing to change and is told so.
+      let done;
+      if (action === 'submit') {
+        // The last rejection's note stays until the next decision: it is what the reviewer asked for.
+        done = await db.run('UPDATE apps SET status = ?, submitted_at = ? WHERE id = ? AND status = ?', rule.to, now, id, row.status);
+      } else if (action === 'approve') {
+        // ...and names the bundle as well: a replace landing between the check above and this
+        // update must not be published by it. (IS, so that a link's NULL matches itself.)
+        done = await db.run('UPDATE apps SET status = ?, review_note = NULL, reviewed_by = ?, reviewed_at = ? WHERE id = ? AND status = ? AND bundle_dir IS ?', rule.to, me, now, id, row.status, row.bundle_dir);
+      } else if (action === 'reject') {
+        done = await db.run('UPDATE apps SET status = ?, review_note = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ? AND status = ?', rule.to, note, me, now, id, row.status);
+      } else {
+        done = await db.run('UPDATE apps SET status = ? WHERE id = ? AND status = ?', rule.to, id, row.status);
+      }
+      if (!done.changes) return res.status(409).json({ error: 'This app was changed by someone else; reload and try again' });
+
+      // A room running an app that just stopped being everyone's to start is told it ended, the way
+      // a deleted app's rooms are. (After a withdraw the uploader may still run their own draft.)
+      if (action === 'reject' || action === 'unpublish') endAppActivities(id);
+      // The other way round: rooms already running it as "not yet approved" lose the warning.
+      if (action === 'approve') approveAppActivities(id);
+
+      const payload = { id, name: row.name, status: rule.to };
+      if (action === 'submit') await tellOwners('app:submitted', payload);
+      else await tellOwners('app:review-queue', payload);
+      // The uploader hears about a decision made by someone else — never about their own action
+      // (an instance owner publishing their own app, an uploader unpublishing theirs).
+      const decided = !isUploader && (action === 'approve' || action === 'reject' || action === 'unpublish');
+      if (decided) tellUploader(row, payload);
+      return res.json(await appResponse(id, me, isOwner));
+    });
+  }
+
+  // Replace a bundle app's files with a new upload (same checks and limits as a first upload). The
+  // app goes back to 'draft': what was approved is no longer what is being served. An instance
+  // owner replacing their own app has nobody else to ask, so theirs keeps its status. Either way a
+  // review still in progress is not fooled: approve has to name the bundle it is about.
+  //
+  // The new files get a new folder, so the app's url changes with them. The old one is deleted
+  // rather than overwritten in place: these files are cacheable, and a browser (or a room) still
+  // holding the old url must stop getting an app at it, not get a mix of old and new files.
+  app.put('/apps/:id/bundle', authMiddleware, async (req, res) => {
+    // Who is asking is settled before the upload is read, so a stranger cannot make the server
+    // buffer 15 MB for an app that is not theirs.
+    const found = await loadApp(req, res);
+    if (!found) return;
+    if (!found.isUploader) return res.status(403).json({ error: 'You can only replace the bundle of an app you uploaded' });
+    if (found.row.kind !== 'bundle' || !found.row.bundle_dir) return res.status(400).json({ error: 'Only an uploaded bundle can be replaced' });
+    const { id, me } = found;
+    bundleUpload.single('bundle')(req, res, async (err) => {
+      if (err) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Bundle is larger than 15 MB' });
+        return res.status(400).json({ error: err.message || 'Upload failed' });
+      }
+      if (!req.file) return res.status(400).json({ error: 'Missing bundle file' });
+      const dir = newBundleDir();
+      const destDir = path.join(appBundlesDir, dir);
+      try {
+        extractBundle(req.file, destDir);
+      } catch (e) {
+        // Nothing else has been touched yet: the app keeps its old files and its status.
+        try { fs.rmSync(destDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        return res.status(400).json({ error: e.message || 'Could not process the bundle' });
+      }
+      // Read again: the upload took a while, and the app may have been deleted, reviewed or
+      // replaced from another window in the meantime.
+      const row = await db.get(`SELECT ${APP_COLUMNS} FROM apps WHERE id = ?`, id);
+      const isOwner = await isInstanceOwner(me);
+      // An instance owner's app keeps its status by this update not touching it. Writing back the
+      // status read above would undo a reject or unpublish by ANOTHER instance owner that landed
+      // in between — they would have been answered "rejected", and the app would be published.
+      const done = !(row && row.created_by === me && row.bundle_dir) ? null
+        : isOwner ? await db.run('UPDATE apps SET bundle_dir = ? WHERE id = ? AND bundle_dir = ?', dir, id, row.bundle_dir)
+          : await db.run("UPDATE apps SET bundle_dir = ?, status = 'draft' WHERE id = ? AND bundle_dir = ?", dir, id, row.bundle_dir);
+      if (!done || !done.changes) {
+        try { fs.rmSync(destDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        if (!row || row.created_by !== me) return res.status(404).json({ error: 'App not found' });
+        return res.status(409).json({ error: 'This app was changed by someone else; reload and try again' });
+      }
+      // Rooms running the old files are told it ended before those files go — also when the status
+      // did not change, because the url they were given is about to 404.
+      endAppActivities(id);
+      removeBundleDir(row.bundle_dir);
+      // What it is now is read back, not assumed. Owners are told whenever their list could be
+      // showing something stale: the status moved, or an app in their queue has new files.
+      const answer = await appResponse(id, me, isOwner);
+      const status = answer.app ? answer.app.status : row.status;
+      if (status !== row.status || status === 'pending') await tellOwners('app:review-queue', { id, name: row.name, status });
+      return res.json(answer);
+    });
+  });
+
+  // Remove an app — its uploader or an instance owner. For bundles, delete the hosted files too.
   app.delete('/apps/:id', authMiddleware, async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!id) return res.status(400).json({ error: 'Invalid app id' });
-    const row = await db.get('SELECT created_by, kind, bundle_dir FROM apps WHERE id = ?', id);
-    if (!row) return res.status(404).json({ error: 'App not found' });
-    if (row.created_by !== req.user.username) return res.status(403).json({ error: 'You can only remove apps you uploaded' });
+    const found = await loadApp(req, res);
+    if (!found) return;
+    const { id, row, me, isOwner, isUploader } = found;
+    if (!isUploader && !isOwner) return res.status(403).json({ error: 'You can only remove apps you uploaded' });
     await db.run('DELETE FROM apps WHERE id = ?', id);
     // Any voice room running this app as its activity is told it ended, before the files go.
-    if (typeof endAppActivities === 'function') endAppActivities(id);
-    if (row.kind === 'bundle' && row.bundle_dir) {
-      // Resolve + confirm the target stays strictly inside appBundlesDir before recursive delete.
-      const target = path.resolve(appBundlesDir, row.bundle_dir);
-      const rel = path.relative(appBundlesDir, target);
-      const contained = !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
-      if (contained) {
-        try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) { /* best effort */ }
-      }
-    }
-    return res.json({ success: true, apps: await listApps() });
+    endAppActivities(id);
+    if (row.kind === 'bundle') removeBundleDir(row.bundle_dir);
+    // 'deleted' is not a status an app can have; it is how the people listing it learn to drop it.
+    const payload = { id, name: row.name, status: 'deleted' };
+    await tellOwners('app:review-queue', payload);
+    if (!isUploader) tellUploader(row, payload);
+    return res.json({ success: true, apps: await listApps(me, isOwner) });
   });
 
   // --- Shared GIF library ---

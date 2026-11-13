@@ -36,9 +36,12 @@ describe('app activity reducer', () => {
     assert.ok(!a.ACTIVITY_TYPES.includes('app'), 'an app cannot be started through activityInit(type)');
     const { run, ...rest } = a.appActivityInit(row);
     assert.deepEqual(rest, {
-      appId: 7, name: 'Buzzer', url: '/app-bundles/abc-123/', iconUrl: '', createdBy: 'uploader',
+      appId: 7, name: 'Buzzer', url: '/app-bundles/abc-123/', iconUrl: '', createdBy: 'uploader', approved: false,
       shared: {}, rev: 0, lastBy: null, joined: [],
     });
+    // Approved only when the row says published, and for no other status (or none at all).
+    assert.equal(a.appActivityInit({ ...row, status: 'published' }).approved, true);
+    for (const status of ['draft', 'pending', 'rejected', undefined]) assert.equal(a.appActivityInit({ ...row, status }).approved, false);
     // Every start is its own run, so events meant for an earlier one can be told apart.
     assert.match(run, /^[0-9a-f]{16}$/);
     assert.notEqual(a.appActivityInit(row).run, run);
@@ -387,7 +390,8 @@ describe('app activity (sockets)', () => {
     const { run, ...rest } = act.state;
     assert.match(run, /^[0-9a-f]{16}$/);
     assert.deepEqual(rest, {
-      appId: bundleApp.id, name: 'Bridge App', url: bundleApp.url, iconUrl: '', createdBy: 'ann',
+      // ann registered first, so she is the instance owner and her uploads are published at once.
+      appId: bundleApp.id, name: 'Bridge App', url: bundleApp.url, iconUrl: '', createdBy: 'ann', approved: true,
       shared: {}, rev: 0, lastBy: null, joined: ['ann'],
     });
     assert.match(act.state.url, /^\/app-bundles\/[^/]+\/$/);

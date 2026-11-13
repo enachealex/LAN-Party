@@ -1147,6 +1147,16 @@ export default function App() {
   // Whether that list has ever been fetched. An empty array alone cannot tell "there are no apps"
   // from "not asked yet" or "the request failed", and the launcher must not claim the first.
   const [publicAppsStatus, setPublicAppsStatus] = useState('idle') // 'idle' | 'loading' | 'ready' | 'error'
+  // Whether the server says this account runs the instance (may review uploaded apps). It comes
+  // with the app list and only decides what is DRAWN; the server re-checks on every request.
+  const [instanceOwner, setInstanceOwner] = useState(false)
+  // Every request that answers with the app list takes a number when it starts, and a list is only
+  // put on screen if no later-started request has already put its own there: a slow GET must not
+  // paint over the answer to the approve that was sent after it.
+  const appsSeqRef = useRef(0)
+  const appsAppliedRef = useRef(0)
+  // True while the solo viewer was opened from the directory, which then comes back when it closes.
+  const viewerFromDirectoryRef = useRef(false)
   const [showSettingsPanel, setShowSettingsPanel] = useState(false)
   const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
   // Feedback / bug-report modal (submissions forward to Vaultline via the server's /feedback route).
@@ -3281,6 +3291,9 @@ export default function App() {
       notifyAppHostRef.current({ type: 'reconnected' })
       // The usual reason for a reconnect is the server restarting for a deploy.
       checkForUpdateRef.current(false)
+      // The app list, and with it whether this account is an instance owner (the review badge on
+      // the rail). Also what catches up on app notifications missed while the socket was down.
+      loadPublicApps(authToken)
       markBoot('connect', 'done')
       markBoot('sync', 'active')
       // allSettled, not all: one failing fetch must not strand the splash. The individual loaders
@@ -3360,6 +3373,26 @@ export default function App() {
     s.on('server:removed', ({ serverId } = {}) => {
       loadServers()
       if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
+    })
+    // Community app review (server/routes/library.js). Each carries { id, name, status } and
+    // nothing else, so the list is fetched again: GET /apps is where the details and the
+    // visibility rules live. 'deleted' is not a real status, only how a removal is announced.
+    const appLabel = (appName) => (typeof appName === 'string' && appName ? `“${appName.slice(0, 80)}”` : 'An app')
+    // To instance owners: an app is waiting for review.
+    s.on('app:submitted', ({ name: appName } = {}) => {
+      loadPublicApps(authToken)
+      setToast(`${appLabel(appName)} was submitted for review`)
+    })
+    // To instance owners: something they list changed some other way. Counts only, no toast.
+    s.on('app:review-queue', () => loadPublicApps(authToken))
+    // To the uploader: someone else decided about their app.
+    s.on('app:reviewed', ({ name: appName, status } = {}) => {
+      loadPublicApps(authToken)
+      const label = appLabel(appName).replace(/^An app$/, 'Your app')
+      if (status === 'published') { playUiSound('success'); setToast(`${label} was approved and is now published`) }
+      else if (status === 'rejected') setToast(`${label} was sent back for changes — see App Directory → Developer`)
+      else if (status === 'draft') setToast(`${label} was unpublished by an instance owner`)
+      else if (status === 'deleted') setToast(`${label} was removed by an instance owner`)
     })
     s.on('server:denied', ({ serverId } = {}) => {
       if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
@@ -4986,7 +5019,17 @@ export default function App() {
     startedAppId: startedApp && Date.now() - startedApp.at < 15000 ? startedApp.appId : null,
     descriptionFor: (appId) => publicApps.find((a) => a.id === appId)?.description || '',
   }
-  const launchableApps = publicApps.filter((a) => a.embeddable)
+  // What this person may start in a room, which is what the server will accept: any published
+  // bundle; their own while it is a draft or in review; and, for an instance owner, anyone's that
+  // is waiting for review (to try it with people before deciding). Never a rejected one.
+  const appLaunchNote = (a) => {
+    const status = a.status || 'published'
+    if (status === 'published') return ''
+    if (status !== 'draft' && status !== 'pending') return null
+    if (a.createdBy === name) return status === 'draft' ? 'Draft — only you can start this' : 'In review — only you can start this'
+    return instanceOwner && status === 'pending' ? `In review — by ${a.createdBy || 'someone'}, not approved yet` : null
+  }
+  const launchableApps = publicApps.filter((a) => a.embeddable && appLaunchNote(a) !== null)
   const closeActivity = () => { socketRef.current?.emit('activity:stop', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1' }) }
 
   // Keyboard shortcuts on the pre-join dialog: Esc cancels, Enter joins.
@@ -6849,14 +6892,24 @@ export default function App() {
   }
 
   // ---- Public app directory ----
-  const loadPublicApps = async () => {
-    const t = token || localStorage.getItem('lanparty_token')
+  // Put a list the server sent on screen, unless a newer one already is. A plain GET is numbered
+  // when it STARTS (the later-started fetch wins); a change is numbered when its ANSWER arrives,
+  // see appsRequest.
+  const applyAppList = (seq, data) => {
+    if (seq < appsAppliedRef.current) return
+    appsAppliedRef.current = seq
+    setPublicApps(Array.isArray(data?.apps) ? data.apps : [])
+    if (typeof data?.instanceOwner === 'boolean') setInstanceOwner(data.instanceOwner)
+  }
+  const loadPublicApps = async (authToken) => {
+    const t = authToken || token || localStorage.getItem('lanparty_token')
     if (!t) return
+    const seq = ++appsSeqRef.current
     // A refresh that fails keeps the list already on screen; only a first load can end in 'error'.
     setPublicAppsStatus((s) => (s === 'ready' ? s : 'loading'))
     try {
       const res = await fetch(`${SERVER_URL}/apps`, { headers: { Authorization: `Bearer ${t}` } })
-      if (res.ok) { const data = await res.json(); setPublicApps(data.apps || []); setPublicAppsStatus('ready') }
+      if (res.ok) { applyAppList(seq, await res.json()); setPublicAppsStatus('ready') }
       else setPublicAppsStatus((s) => (s === 'ready' ? s : 'error'))
     } catch (err) {
       console.warn('loadPublicApps failed', err)
@@ -6874,55 +6927,53 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeAppId])
 
-  // Upload an app to the public directory. `source` is 'link' (external URL) or 'bundle' (an uploaded
-  // .html/.zip that LAN Party hosts + runs sandboxed). Both may carry an optional icon image.
-  const uploadApp = async ({ source = 'link', name, description, url, iconFile, bundleFile }) => {
+  // Every change to an app goes through here (upload, edit, submit, approve, delete...; the
+  // directory's tabs build the calls). The server answers each with the caller's whole list, and
+  // that list replaces the one on screen: nothing is guessed ahead of the answer. Rejects with the
+  // server's own message.
+  const appsRequest = async (path, { method = 'GET', json, form } = {}) => {
     const t = token || localStorage.getItem('lanparty_token')
     if (!t) throw new Error('You must be signed in.')
-    let iconUrl = ''
-    if (iconFile) {
-      if (iconFile.size > MAX_FILE_SIZE) throw new Error('Icon is larger than 100 MB.')
-      const fd = new FormData()
-      fd.append('file', iconFile)
-      const up = await fetch(`${SERVER_URL}/files/upload`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
-      const upData = await up.json()
-      if (!up.ok) throw new Error(upData.error || 'Icon upload failed')
-      iconUrl = upData.attachment.url
-    }
+    const headers = { Authorization: `Bearer ${t}` }
+    if (json !== undefined) headers['Content-Type'] = 'application/json'
     let res
-    let data
-    if (source === 'bundle') {
-      if (!bundleFile) throw new Error('Choose a .html file or a .zip bundle.')
-      const fd = new FormData()
-      fd.append('name', name)
-      fd.append('description', description || '')
-      if (iconUrl) fd.append('iconUrl', iconUrl)
-      fd.append('bundle', bundleFile)
-      res = await fetch(`${SERVER_URL}/apps/bundle`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
-      data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || 'Failed to publish app')
-    } else {
-      res = await fetch(`${SERVER_URL}/apps`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
-        body: JSON.stringify({ name, description, url, iconUrl }),
-      })
-      data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Failed to publish app')
+    try {
+      res = await fetch(`${SERVER_URL}${path}`, { method, headers, body: form || (json !== undefined ? JSON.stringify(json) : undefined) })
+    } catch (_) {
+      throw new Error('Could not reach the server.')
     }
-    setPublicApps(data.apps || [])
-  }
-
-  // Remove one of your own uploaded apps (window.confirm works in Electron; only prompt doesn't).
-  const removeApp = async (id) => {
-    const t = token || localStorage.getItem('lanparty_token')
-    if (!t) return
-    if (!window.confirm('Remove this app from the directory?')) return
-    const res = await fetch(`${SERVER_URL}/apps/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${t}` } })
     const data = await res.json().catch(() => ({}))
-    if (res.ok) setPublicApps(data.apps || [])
-    else alert(data.error || 'Could not remove app')
+    if (!res.ok) throw new Error(data.error || `The server refused that (${res.status}).`)
+    // Numbered now, not when the request started: the list in this answer was read after the
+    // change was written, so it is newer than any GET that began while a slow upload was still on
+    // its way — and that GET, numbered lower, can no longer replace it. Numbered at the start, a
+    // refresh landing mid-upload made the upload's own answer look stale: the new app was missing
+    // from My apps, and a replaced bundle kept the url of files the server had just deleted.
+    if (Array.isArray(data.apps)) applyAppList(++appsSeqRef.current, data)
+    return data
   }
+  // An app's icon is an ordinary upload; the app only stores its /uploads/ path.
+  const uploadAppIcon = async (iconFile) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) throw new Error('You must be signed in.')
+    if (iconFile.size > MAX_FILE_SIZE) throw new Error('Icon is larger than 100 MB.')
+    const fd = new FormData()
+    fd.append('file', iconFile)
+    const up = await fetch(`${SERVER_URL}/files/upload`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: fd })
+    const upData = await up.json().catch(() => ({}))
+    if (!up.ok || !upData.attachment?.url) throw new Error(upData.error || 'Icon upload failed')
+    return upData.attachment.url
+  }
+  // Signing out: the next account must not see this one's drafts or its Review tab, and an answer
+  // still on its way for this account must not land in the next one's list.
+  useEffect(() => {
+    if (isAuthenticated) return
+    appsAppliedRef.current = ++appsSeqRef.current
+    setPublicApps([])
+    setInstanceOwner(false)
+    setPublicAppsStatus('idle')
+  }, [isAuthenticated])
+  const pendingAppReviews = instanceOwner ? publicApps.filter((a) => a.status === 'pending').length : 0
 
   // Custom emojis for the server currently on screen.
   const serverEmojiGroups = serverState?.server
@@ -7294,6 +7345,7 @@ export default function App() {
         profile={profile}
         resolveAvatarSrc={emojiSrc}
         onOpenAppDirectory={openAppDirectory}
+        appReviewCount={pendingAppReviews}
         onOpenDiscover={openDiscover}
         liveCount={discoverStreams.length}
         connected={connected}
@@ -7731,13 +7783,14 @@ export default function App() {
                                     : <span className="activity-launch-icon activity-launch-appicon activity-launch-appicon-fallback">{(a.name || '?').slice(0, 1).toUpperCase()}</span>}
                                   <span className="activity-launch-text">
                                     <span className="activity-launch-label">{a.name}</span>
+                                    {appLaunchNote(a) && <span className="activity-launch-draft">{appLaunchNote(a)}</span>}
                                     <span className="activity-launch-hint">{a.description || `by ${a.createdBy || 'someone'}`}</span>
                                   </span>
                                 </button>
                               ))}
                               {launchableApps.length === 0 && publicAppsStatus === 'ready' && (
                                 <div className="activity-launch-empty">
-                                  No apps yet. Upload a mini-app in the App Directory and it shows up here for the whole room.
+                                  No apps yet. Upload a mini-app in the App Directory: you can start your own here straight away, and everyone can once it is approved.
                                   <button type="button" className="activity-launch-link" onClick={() => { setShowActivityMenu(false); openAppDirectory() }}>Open App Directory</button>
                                 </div>
                               )}
@@ -8790,16 +8843,28 @@ export default function App() {
       <AppDirectoryModal
         open={showAppDirectory}
         apps={publicApps}
+        instanceOwner={instanceOwner}
         onClose={() => setShowAppDirectory(false)}
-        onUpload={uploadApp}
-        onRemove={removeApp}
-        onOpenApp={(app) => { setViewerApp(app); setShowAppDirectory(false) }}
+        onRefresh={loadPublicApps}
+        request={appsRequest}
+        uploadIcon={uploadAppIcon}
+        onOpenApp={(app) => { viewerFromDirectoryRef.current = true; setViewerApp(app); setShowAppDirectory(false) }}
+        me={describeAppPerson(name)}
         currentUser={name}
         resolveSrc={emojiSrc}
       />
 
-      {/* Sandboxed viewer for embedded (uploaded) mini-apps */}
-      <AppViewer app={viewerApp} resolveSrc={emojiSrc} me={describeAppPerson(name)} onClose={() => setViewerApp(null)} />
+      {/* Sandboxed viewer for embedded (uploaded) mini-apps. Opened from the directory, it sits
+          under that modal, so the directory steps aside for it and comes back when it closes. */}
+      <AppViewer
+        app={viewerApp}
+        resolveSrc={emojiSrc}
+        me={describeAppPerson(name)}
+        onClose={() => {
+          setViewerApp(null)
+          if (viewerFromDirectoryRef.current) { viewerFromDirectoryRef.current = false; openAppDirectory() }
+        }}
+      />
 
       {/* Install panel (fallback) */}
       <div className={`members-panel install-panel ${showInstallPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showInstallPanel}>

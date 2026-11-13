@@ -318,6 +318,39 @@ const MIGRATIONS = [
       await db.exec('CREATE INDEX IF NOT EXISTS idx_group_messages_group_id ON group_messages (group_id, id)');
     },
   },
+  {
+    // Publish approval for the app directory: an upload is a 'draft' only its uploader (and the
+    // instance owners) can see until an instance owner publishes it. status is one of
+    // 'draft' | 'pending' | 'published' | 'rejected'; the transitions live in routes/library.js.
+    //
+    // The column's own default is 'draft', so an insert that forgets to say is hidden, not public.
+    // Every app that exists when this runs was already visible to everyone, and stays that way: they
+    // are marked 'published' once, at the moment the column is created. The two steps share a
+    // transaction because apart they are not safe to repeat — a crash between them would leave the
+    // column in place, and the next boot (which only fills it in when it has just added it) would
+    // leave every existing app hidden. Tied to the column being new, rather than run every time, so
+    // that re-running this on a database that has lost its migration record cannot publish drafts.
+    //
+    // review_note is the instance owner's optional message on a rejection; reviewed_by/reviewed_at
+    // record the last decision and submitted_at the last request for one.
+    name: '0011_app_publish_approval',
+    up: async (db) => {
+      await db.exec('BEGIN');
+      try {
+        if (await addColumn(db, 'apps', 'status', `TEXT NOT NULL DEFAULT 'draft'`)) {
+          await db.run(`UPDATE apps SET status = 'published'`);
+        }
+        await db.exec('COMMIT');
+      } catch (e) {
+        await db.exec('ROLLBACK').catch(() => {});
+        throw e;
+      }
+      await addColumn(db, 'apps', 'review_note', 'TEXT');
+      await addColumn(db, 'apps', 'reviewed_by', 'TEXT');
+      await addColumn(db, 'apps', 'reviewed_at', 'INTEGER');
+      await addColumn(db, 'apps', 'submitted_at', 'INTEGER');
+    },
+  },
 ];
 
 /**

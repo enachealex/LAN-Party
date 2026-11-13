@@ -147,6 +147,7 @@ export default function AppLeftPane({
   profile = null,
   resolveAvatarSrc = (u) => u,
   onOpenAppDirectory,
+  appReviewCount = 0,
   onOpenDiscover,
   liveCount = 0,
   connected = false,
@@ -366,7 +367,8 @@ export default function AppLeftPane({
         <RailIcon title="Add a Server" className="dc-rail-action" onClick={onCreateServer}>
           <img src={ADD_SERVER_ICON_URL} alt="" className="dc-rail-action-img dc-add-server-img" draggable={false} />
         </RailIcon>
-        <RailIcon title="Download / Upload Apps" className="dc-rail-action" onClick={onOpenAppDirectory}>
+        {/* The badge is only ever non-zero for an instance owner: apps waiting for their review. */}
+        <RailIcon title={appReviewCount > 0 ? `Download / Upload Apps — ${appReviewCount} waiting for review` : 'Download / Upload Apps'} className="dc-rail-action" onClick={onOpenAppDirectory} badge={appReviewCount}>
           <img src={DOWNLOAD_APPS_ICON_URL} alt="" className="dc-rail-action-img dc-download-apps-img" draggable={false} />
         </RailIcon>
         <RailIcon title="Discover live streams" className="dc-rail-action" onClick={onOpenDiscover} badge={liveCount}>

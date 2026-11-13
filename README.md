@@ -41,6 +41,10 @@ Register an account at http://localhost:5173 and you're in. Optional integration
 next to the server or an env var: `server/tenor.key` (`TENOR_API_KEY`) for GIF search,
 `youtube.key`, `spotify.key`, `smtp.key`, `vaultline.key`. See [DEPLOY.md](DEPLOY.md).
 
+The first account registered is the instance owner: uploaded apps start as drafts, and the
+instance owner publishes them to everyone. Set `INSTANCE_OWNERS` (comma-separated usernames of
+accounts that already exist, spelled exactly) to name someone else.
+
 Checks before shipping:
 
 ```bash

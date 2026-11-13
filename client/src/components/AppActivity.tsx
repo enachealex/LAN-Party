@@ -16,6 +16,9 @@ interface AppActivityState {
   url: string
   iconUrl: string
   createdBy: string
+  /** False while the app has not been approved by an instance owner: its uploader (or an instance
+   *  owner) started it to try it out. The card says so, and each person decides whether to join. */
+  approved?: boolean
   /** Names this run of the app; sent back with every event so a stale one can be dropped. */
   run: string
   shared: Record<string, unknown>
@@ -235,6 +238,8 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
   // it is checked for the one shape it can legitimately have.
   const src = typeof state.url === 'string' && /^\/app-bundles\/[A-Za-z0-9_-]+\/$/.test(state.url) ? resolveSrc(state.url) : ''
   const name = state.name || 'App'
+  // Anything but an explicit yes from the server is treated as not approved.
+  const unapproved = state.approved !== true
   const icon = state.iconUrl
     ? <img className="app-activity-icon" src={resolveSrc(state.iconUrl)} alt="" />
     : <span className="app-activity-icon app-activity-icon-fallback">{name.slice(0, 1).toUpperCase()}</span>
@@ -245,6 +250,7 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
         <span className="activity-head-title app-activity-head-title">
           {icon}
           <span className="app-activity-head-name">{name}</span>
+          {unapproved && <span className="app-activity-unapproved-chip" title="This app has not been approved by an instance owner">Not approved</span>}
           <span className="activity-by">· started by {by}</span>
         </span>
         <span className="app-activity-head-actions">
@@ -271,6 +277,11 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
               <div className="app-activity-card-name">{name}</div>
               <div className="app-activity-card-meta">Started by {by} · by {state.createdBy || 'someone'}</div>
               {description && <div className="app-activity-card-desc">{description}</div>}
+              {unapproved && (
+                <div className="app-activity-unapproved" role="note">
+                  <b>Not approved yet.</b> This app has not been reviewed by whoever runs this LAN Party. {by} started it to try it out — joining is up to you.
+                </div>
+              )}
               <div className="app-activity-joined">
                 {participants.length > 0
                   ? participants.map((p) => <PersonChip key={p.username} person={p} />)

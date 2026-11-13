@@ -1,161 +1,194 @@
 import React, { useEffect, useRef, useState } from 'react'
+import AppDeveloperTab from './AppDeveloperTab'
+import AppReviewTab from './AppReviewTab'
+import AppDirectoryDialog from './AppDirectoryDialog'
+import { safeLinkUrl, statusOf } from './AppDirectoryParts'
 
-const MAX_BUNDLE_BYTES = 15 * 1024 * 1024 // must match the server's bundleUpload limit
+// Centered modal for community apps. An app is either a LINK (opens an external URL in a new tab)
+// or an uploaded BUNDLE (a self-contained .html/.zip that LAN Party hosts + runs sandboxed inside
+// the in-app viewer). Three tabs:
+//   Browse    — the published apps, for everyone;
+//   Developer — the SDK essentials, the upload form and the viewer's own apps in any status;
+//   Review    — only for an instance owner: what is waiting for approval, and what is published.
+//
+// `apps` is the list exactly as GET /apps answered it for this viewer, and every change goes
+// through `request`, which replaces that list with the one in the server's answer. Nothing here
+// edits the list itself: what is on screen after an action is what the server says is true.
+// `instanceOwner` only decides whether the Review tab is DRAWN; the server decides, per request,
+// whether the person asking may do any of it.
+export default function AppDirectoryModal({ open, apps = [], instanceOwner = false, onClose, onOpenApp, onRefresh, request, uploadIcon, me, currentUser = '', resolveSrc = (u) => u }) {
+  const [mode, setMode] = useState('browse') // 'browse' | 'developer' | 'review'
+  const [dialog, setDialog] = useState(null) // { kind, app, file? }
+  const [dialogBusy, setDialogBusy] = useState(false)
+  const [busyKey, setBusyKey] = useState(null) // `<app id>:<action>` of the request in flight
+  const [actionError, setActionError] = useState(null)
+  // Set when this modal hands an app to the viewer (which closes the directory): the directory
+  // comes back on the tab the person was working in, not on Browse.
+  const resumeModeRef = useRef(null)
+  // The url each bundle had when this person last opened it from here. Approving sends it, so the
+  // server can refuse when the uploader has swapped the files since (server/routes/library.js).
+  const [openedUrls, setOpenedUrls] = useState({})
 
-// Centered modal listing public apps and an upload form to publish a new one. An app is either a
-// LINK (opens an external URL in a new tab) or an uploaded BUNDLE (a self-contained .html/.zip that
-// LAN Party hosts + runs sandboxed inside the in-app viewer).
-export default function AppDirectoryModal({ open, apps = [], onClose, onUpload, onRemove, onOpenApp, currentUser = '', resolveSrc = (u) => u }) {
-  const [mode, setMode] = useState('browse') // 'browse' | 'upload'
-  const [source, setSource] = useState('bundle') // 'bundle' | 'link'
-  const [form, setForm] = useState({ name: '', description: '', url: '' })
-  const [iconFile, setIconFile] = useState(null)
-  const [iconPreview, setIconPreview] = useState(null)
-  const [bundleFile, setBundleFile] = useState(null)
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState(null)
-  const iconInputRef = useRef(null)
-  const bundleInputRef = useRef(null)
-
-  // Reset to browse view each time the modal opens.
+  // Reset to browse view each time the modal opens — except when coming back from the viewer.
   useEffect(() => {
-    if (open) { setMode('browse'); setSource('bundle'); setForm({ name: '', description: '', url: '' }); setIconFile(null); setBundleFile(null); setError(null) }
+    if (!open) return
+    setMode(resumeModeRef.current || 'browse')
+    resumeModeRef.current = null
+    setDialog(null)
+    setDialogBusy(false)
+    setActionError(null)
   }, [open])
 
-  // Manage the icon preview object URL.
+  // Someone who stops being an instance owner while looking at the Review tab is not left on a
+  // tab that no longer exists.
+  useEffect(() => { if (mode === 'review' && !instanceOwner) setMode('browse') }, [mode, instanceOwner])
+
+  // A dialog about an app that has just gone from the list (deleted from another window, or by an
+  // instance owner) has nothing left to act on.
+  const dialogAppListed = !dialog || apps.some((a) => a.id === dialog.app.id)
   useEffect(() => {
-    if (!iconFile) { setIconPreview(null); return }
-    const u = URL.createObjectURL(iconFile)
-    setIconPreview(u)
-    return () => URL.revokeObjectURL(u)
-  }, [iconFile])
+    if (dialogAppListed || dialogBusy || !dialog) return
+    // Said on the tab, because the dialog is about to go: without it an upload dialog (or the
+    // error it had just been given) simply vanished along with the app.
+    if (dialog.kind !== 'delete') setActionError(`“${dialog.app.name}” is no longer in the directory — it was deleted while this was open, so nothing was changed.`)
+    setDialog(null)
+  }, [dialogAppListed, dialogBusy, dialog])
 
   useEffect(() => {
     if (!open) return undefined
-    const onKey = (e) => { if (e.key === 'Escape') onClose?.() }
+    // Escape backs out one layer at a time, and never out from under a request in flight.
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return
+      if (dialog) { if (!dialogBusy) setDialog(null) } else onClose?.()
+    }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [open, onClose])
+  }, [open, onClose, dialog, dialogBusy])
 
-  const pickBundle = (f) => {
-    if (!f) return
-    const okExt = /\.(html?|zip)$/i.test(f.name)
-    if (!okExt) { setError('Choose a .html file or a .zip bundle.'); return }
-    if (f.size > MAX_BUNDLE_BYTES) { setError('Bundle is larger than 15 MB.'); return }
-    setError(null)
-    setBundleFile(f)
-    // Default the name to the file's base name if the user hasn't typed one yet.
-    setForm((prev) => (prev.name.trim() ? prev : { ...prev, name: f.name.replace(/\.[^.]+$/, '').slice(0, 80) }))
+  const openApp = (app) => {
+    resumeModeRef.current = mode
+    if (app.embeddable && app.url) setOpenedUrls((prev) => ({ ...prev, [app.id]: app.url }))
+    onOpenApp?.(app)
   }
+  // Someone else's bundle that was opened from here and has different files now: what was looked
+  // at is not what an approval would publish. (Their own app they replaced themselves.)
+  const replacedSinceOpened = (app) => !!app.embeddable && app.createdBy !== currentUser && !!openedUrls[app.id] && openedUrls[app.id] !== app.url
 
-  const canSubmit = form.name.trim() && (source === 'link' || bundleFile)
-
-  const submit = async () => {
-    if (!form.name.trim()) { setError('App name is required.'); return }
-    if (source === 'bundle' && !bundleFile) { setError('Choose a .html file or a .zip bundle.'); return }
-    setSubmitting(true)
-    setError(null)
+  // The one-click status changes (submit, withdraw, approve). The row's buttons are disabled while
+  // one is in flight; a refusal is shown, and the list is fetched again because a refusal usually
+  // means it was out of date (someone else got there first).
+  const runAction = async (app, action) => {
+    if (busyKey) return
+    setBusyKey(`${app.id}:${action}`)
+    setActionError(null)
     try {
-      await onUpload({ source, ...form, iconFile, bundleFile })
-      setMode('browse')
-      setSource('bundle')
-      setForm({ name: '', description: '', url: '' })
-      setIconFile(null)
-      setBundleFile(null)
+      // An approval names the files it is for: the ones this person opened, else the ones listed.
+      const json = action === 'approve' ? { url: replacedSinceOpened(app) ? openedUrls[app.id] : app.url } : {}
+      await request(`/apps/${app.id}/${action}`, { method: 'POST', json })
     } catch (err) {
-      setError(err.message || 'Upload failed')
+      setActionError(`${app.name}: ${err?.message || 'that did not work'}`)
+      onRefresh?.()
     } finally {
-      setSubmitting(false)
+      setBusyKey(null)
     }
   }
+  const openDialog = (kind, app, file) => { setActionError(null); setDialog({ kind, app, file }) }
+
+  const published = apps.filter((a) => statusOf(a) === 'published')
+  const mine = currentUser ? apps.filter((a) => a.createdBy === currentUser) : []
+  const pendingCount = instanceOwner ? apps.filter((a) => statusOf(a) === 'pending').length : 0
+  const tab = (id, label, extra = null) => (
+    <button type="button" role="tab" aria-selected={mode === id} className={`app-dir-tab${mode === id ? ' active' : ''}`} onClick={() => { setMode(id); setActionError(null) }}>{label}{extra}</button>
+  )
 
   return (
     <>
-      <div className={`auth-overlay ${open ? 'open' : ''}`} onClick={onClose} />
+      <div className={`auth-overlay ${open ? 'open' : ''}`} onClick={() => { if (!dialogBusy) onClose?.() }} />
       <div className={`auth-modal app-directory-modal ${open ? 'open' : ''}`} role="dialog" aria-modal="true" aria-hidden={!open} onClick={(e) => e.stopPropagation()}>
         <div className="app-dir-header">
           <h2>App Directory</h2>
-          <button type="button" className="members-close app-dir-close" onClick={onClose} aria-label="Close">✕</button>
+          <button type="button" className="members-close app-dir-close" onClick={onClose} disabled={dialogBusy} aria-label="Close">✕</button>
         </div>
         <div className="app-dir-tabs" role="tablist">
-          <button type="button" role="tab" aria-selected={mode === 'browse'} className={`app-dir-tab${mode === 'browse' ? ' active' : ''}`} onClick={() => setMode('browse')}>Browse Apps</button>
-          <button type="button" role="tab" aria-selected={mode === 'upload'} className={`app-dir-tab${mode === 'upload' ? ' active' : ''}`} onClick={() => setMode('upload')}>Upload App</button>
+          {tab('browse', 'Browse')}
+          {tab('developer', 'Developer')}
+          {instanceOwner && tab('review', 'Review', pendingCount > 0 && <span className="app-dir-tab-badge" title={`${pendingCount} waiting for review`}>{pendingCount > 99 ? '99+' : pendingCount}</span>)}
         </div>
 
         <div className="app-dir-body">
-          {mode === 'browse' ? (
-            apps.length === 0 ? (
-              <div className="app-dir-empty">No public apps yet. Be the first to upload one!</div>
+          {actionError && mode !== 'browse' && <div className="composer-error" role="alert">{actionError}</div>}
+          {mode === 'browse' && (
+            published.length === 0 ? (
+              <div className="app-dir-empty">No published apps yet. Upload one in the Developer tab.</div>
             ) : (
               <div className="app-dir-grid">
-                {apps.map((app) => (
-                  <div className="app-card" key={app.id}>
-                    <div className="app-card-icon">
-                      {app.iconUrl ? <img src={resolveSrc(app.iconUrl)} alt="" /> : <span>{(app.name || '?').slice(0, 1).toUpperCase()}</span>}
-                    </div>
-                    <div className="app-card-meta">
-                      <div className="app-card-name">
-                        {app.name}
-                        {app.embeddable && <span className="app-card-badge" title="Runs inside LAN Party">embedded</span>}
+                {published.map((app) => {
+                  const link = safeLinkUrl(app.url)
+                  return (
+                    <div className="app-card" key={app.id}>
+                      <div className="app-card-icon">
+                        {app.iconUrl ? <img src={resolveSrc(app.iconUrl)} alt="" /> : <span>{(app.name || '?').slice(0, 1).toUpperCase()}</span>}
                       </div>
-                      {app.description && <div className="app-card-desc">{app.description}</div>}
-                      <div className="app-card-foot">
-                        <span className="app-card-by">by {app.createdBy || 'someone'}</span>
-                        {app.embeddable ? (
-                          <button type="button" className="app-card-try" onClick={() => onOpenApp?.(app)}>Open →</button>
-                        ) : (
-                          app.url && <a className="app-card-try" href={app.url} target="_blank" rel="noreferrer">Try it →</a>
-                        )}
-                        {currentUser && app.createdBy === currentUser && (
-                          <button type="button" className="app-card-remove" onClick={() => onRemove?.(app.id)} title="Remove your app">Remove</button>
-                        )}
+                      <div className="app-card-meta">
+                        <div className="app-card-name">
+                          {app.name}
+                          {app.embeddable && <span className="app-card-badge" title="Runs inside LAN Party">embedded</span>}
+                        </div>
+                        {app.description && <div className="app-card-desc">{app.description}</div>}
+                        <div className="app-card-foot">
+                          <span className="app-card-by">by {app.createdBy || 'someone'}</span>
+                          {app.embeddable ? (
+                            <button type="button" className="app-card-try" onClick={() => openApp(app)}>Open →</button>
+                          ) : (
+                            link
+                              ? <a className="app-card-try" href={link} target="_blank" rel="noreferrer noopener">Try it →</a>
+                              // Not a web address, so never a link: shown as the text it is.
+                              : app.url && <span className="app-card-address" title="Not a web address, so it cannot be opened from here">{app.url}</span>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )
-          ) : (
-            <div className="app-dir-upload">
-              <div className="app-source-toggle" role="tablist" aria-label="App type">
-                <button type="button" role="tab" aria-selected={source === 'bundle'} className={`app-source-btn${source === 'bundle' ? ' active' : ''}`} onClick={() => { setSource('bundle'); setError(null) }}>Upload a mini-app</button>
-                <button type="button" role="tab" aria-selected={source === 'link'} className={`app-source-btn${source === 'link' ? ' active' : ''}`} onClick={() => { setSource('link'); setError(null) }}>Link (external URL)</button>
-              </div>
-
-              <button type="button" className="app-upload-icon-btn" onClick={() => iconInputRef.current?.click()}>
-                {iconPreview ? <img src={iconPreview} alt="App icon preview" /> : <span>+ Icon</span>}
-              </button>
-              <input ref={iconInputRef} type="file" accept="image/*" className="file-input" onChange={(e) => { const f = e.target.files?.[0]; if (f) setIconFile(f); if (e.target) e.target.value = '' }} />
-
-              <label className="app-field-label">App name</label>
-              <input className="profile-text-input" value={form.name} maxLength={80} placeholder="My cool app" onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} />
-              <label className="app-field-label">Description</label>
-              <textarea className="profile-textarea" rows={3} maxLength={500} placeholder="What does it do?" value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} />
-
-              {source === 'link' ? (
-                <>
-                  <label className="app-field-label">Link (URL)</label>
-                  <input className="profile-text-input" value={form.url} placeholder="https://…" onChange={(e) => setForm((f) => ({ ...f, url: e.target.value }))} />
-                </>
-              ) : (
-                <>
-                  <label className="app-field-label">App bundle</label>
-                  <button type="button" className="app-bundle-pick" onClick={() => bundleInputRef.current?.click()}>
-                    {bundleFile ? `📦 ${bundleFile.name}` : 'Choose a .html file or .zip bundle…'}
-                  </button>
-                  <input ref={bundleInputRef} type="file" accept=".html,.htm,.zip,text/html,application/zip" className="file-input" onChange={(e) => { pickBundle(e.target.files?.[0]); if (e.target) e.target.value = '' }} />
-                  <div className="app-bundle-hint">A single <code>.html</code> file, or a <code>.zip</code> containing <code>index.html</code> plus its assets. It runs sandboxed inside LAN Party — no access to your account. Max 15 MB.</div>
-                </>
-              )}
-
-              {error && <div className="composer-error">{error}</div>}
-              <div className="app-dir-actions">
-                <button type="button" className="connect-btn" onClick={() => setMode('browse')}>Cancel</button>
-                <button type="button" className="connect-btn" onClick={submit} disabled={submitting || !canSubmit}>{submitting ? 'Publishing…' : 'Publish App'}</button>
-              </div>
-            </div>
+          )}
+          {/* Mounted only while it is the tab shown: leaving the Developer tab (or closing the
+              directory, which it is told about through `open`) is what stops a running "Check app". */}
+          {mode === 'developer' && (
+            <AppDeveloperTab
+              open={open}
+              apps={mine}
+              instanceOwner={instanceOwner}
+              me={me}
+              busyKey={busyKey}
+              resolveSrc={resolveSrc}
+              request={request}
+              uploadIcon={uploadIcon}
+              onOpenApp={openApp}
+              onAction={runAction}
+              onDialog={openDialog}
+            />
+          )}
+          {mode === 'review' && instanceOwner && (
+            <AppReviewTab apps={apps} busyKey={busyKey} resolveSrc={resolveSrc} replacedSinceOpened={replacedSinceOpened} onOpenApp={openApp} onAction={runAction} onDialog={openDialog} />
           )}
         </div>
+
+        {open && dialog && (
+          <AppDirectoryDialog
+            key={`${dialog.kind}:${dialog.app.id}`}
+            dialog={dialog}
+            instanceOwner={instanceOwner}
+            currentUser={currentUser}
+            resolveSrc={resolveSrc}
+            request={request}
+            uploadIcon={uploadIcon}
+            onClose={() => { setDialog(null); setDialogBusy(false) }}
+            onFailed={() => onRefresh?.()}
+            onBusyChange={setDialogBusy}
+          />
+        )}
       </div>
     </>
   )
