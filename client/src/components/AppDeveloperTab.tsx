@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { BridgePerson } from '../appBridge'
 import { APP_CHECK_MS, startAppCheck, type AppCheckResult, type AppCheckRun } from '../appCheck'
 import {
-  AppIcon, OpenAppControl, RowButton, StatusChip, bundleFileProblem, formatWhen, safeLinkUrl, statusOf,
+  AppIcon, OpenAppControl, RowButton, StatusChip, bundleFileProblem, formatWhen, hostedUrlProblem, isBundleApp, runsInside, safeLinkUrl, statusOf,
   type AppDialogKind, type AppsRequest, type DirectoryApp,
 } from './AppDirectoryParts'
 
@@ -65,6 +65,8 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
   const [showUpload, setShowUpload] = useState(false)
   const [source, setSource] = useState<'bundle' | 'link'>('bundle')
   const [form, setForm] = useState({ name: '', description: '', url: '' })
+  // "Run inside LAN Party": the link is framed (a hosted app) instead of opening in a new tab.
+  const [embed, setEmbed] = useState(false)
   const [iconFile, setIconFile] = useState<File | null>(null)
   const [iconPreview, setIconPreview] = useState<string | null>(null)
   const [bundleFile, setBundleFile] = useState<File | null>(null)
@@ -74,7 +76,7 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
   const iconInputRef = useRef<HTMLInputElement | null>(null)
   const bundleInputRef = useRef<HTMLInputElement | null>(null)
 
-  const resetForm = () => { setSource('bundle'); setForm({ name: '', description: '', url: '' }); setIconFile(null); setBundleFile(null); setError(null) }
+  const resetForm = () => { setSource('bundle'); setForm({ name: '', description: '', url: '' }); setEmbed(false); setIconFile(null); setBundleFile(null); setError(null) }
   // A half-filled form does not survive the directory being closed.
   useEffect(() => { if (!open) { setShowUpload(false); setUploaded(null); resetForm() } }, [open])
 
@@ -96,14 +98,17 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
     setForm((prev) => (prev.name.trim() ? prev : { ...prev, name: f.name.replace(/\.[^.]+$/, '').slice(0, 80) }))
   }
 
-  // A link's address cannot be edited afterwards, and one that is not a web address is never
-  // clickable anywhere, so it is checked here, before there is a draft to delete.
+  // An address that is not a web address is never clickable anywhere, so it is checked here,
+  // before there is a draft to fix. One that is to run inside LAN Party is held to more (https, and
+  // not LAN Party's own address); the server asks the same and has the last word.
   const linkOk = !!safeLinkUrl(form.url)
-  const canSubmit = !!form.name.trim() && (source === 'link' ? linkOk : !!bundleFile)
+  const embedProblem = source === 'link' && embed && linkOk ? hostedUrlProblem(form.url, [resolveSrc('/')]) : ''
+  const canSubmit = !!form.name.trim() && (source === 'link' ? linkOk && !embedProblem : !!bundleFile)
   const submit = async () => {
     if (!form.name.trim()) { setError('App name is required.'); return }
     if (source === 'bundle' && !bundleFile) { setError('Choose a .html file or a .zip bundle.'); return }
     if (source === 'link' && !linkOk) { setError('Enter the full web address, starting with http:// or https://.'); return }
+    if (embedProblem) { setError(embedProblem); return }
     setSubmitting(true)
     setError(null)
     try {
@@ -117,7 +122,7 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
         fd.append('bundle', bundleFile)
         data = await request('/apps/bundle', { method: 'POST', form: fd })
       } else {
-        data = await request('/apps', { method: 'POST', json: { name: form.name, description: form.description, url: form.url.trim(), iconUrl } })
+        data = await request('/apps', { method: 'POST', json: { name: form.name, description: form.description, url: form.url.trim(), iconUrl, embed } })
       }
       // What the server made of it, not what this form expected: an instance owner's upload is
       // published at once, everyone else's starts as a draft.
@@ -156,7 +161,10 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
   }, [open])
   const checkApp = (app: DirectoryApp) => {
     const url = app.url || ''
-    if (!app.embeddable || !url) return
+    // Bundles only. The check runs the app in a frame with no origin and no storage, which is how a
+    // bundle really runs and not at all how a hosted site does: its answers about one would be
+    // wrong in both directions, so it is not offered for one.
+    if (!isBundleApp(app) || !url) return
     // Only reachable with a check still running when the bundle was replaced under it: that one
     // is about files that no longer exist.
     runsRef.current.get(app.id)?.cancel()
@@ -235,7 +243,8 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
     if (status === 'published') return 'Everyone can see it in the directory and start it in a voice room.'
     if (status === 'pending') return `Waiting for an instance owner to review it${app.submittedAt ? ` (submitted ${formatWhen(app.submittedAt)})` : ''}. Until then only you can see it.`
     if (status === 'rejected') return 'The reviewer asked for changes. Only you can see it, and it cannot be started in a room while it is in this state.'
-    return app.embeddable
+    // A bundle or a hosted app: either can be tried with real people before anyone has approved it.
+    return runsInside(app)
       ? 'Only you can see it. You can open it, and start it in a voice room you are in — the others see it marked as not approved.'
       : 'Only you can see it.'
   }
@@ -247,6 +256,9 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
           An app is a web page you upload: one <code>.html</code> file, or a <code>.zip</code> with an <code>index.html</code>. It runs in a sandbox, on its own or as a Thing To Do in a voice room.
           Anyone can upload and use their own app; it shows up for everyone else once an instance owner has approved it.
         </p>
+        <p>
+          A site you host yourself can run here too: add it as a <b>Link</b> and turn on <b>Run inside LAN Party</b>. It is framed from its own address, with its own storage and backend, and uses a copy of the same SDK.
+        </p>
         <p>To share state with the people who joined, load the SDK this server hosts and connect. Paste this into your page’s <code>&lt;body&gt;</code> to start:</p>
         <div className="app-dev-snippet">
           <pre ref={snippetRef}><code>{STARTER}</code></pre>
@@ -255,6 +267,7 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
         {copied === 'failed' && <div className="app-dev-hint" role="status">Could not reach the clipboard. The snippet is selected: press Ctrl+C (⌘C on a Mac).</div>}
         <div className="app-dev-hint">
           <code>lp.me</code> is who is looking, <code>lp.participants</code> who has joined, <code>lp.state</code> / <code>lp.setState(patch)</code> the shared object, <code>lp.emit(data)</code> a one-off message; listen with <code>lp.on('state' | 'participants' | 'message', fn)</code>.
+          <code>lp.room</code> is <code>{'{ id }'}</code> in a voice room — an opaque id for that channel, made for your app alone — and <code>null</code> when the app is open on its own.
           An app only ever sees names and avatars.
         </div>
       </div>
@@ -291,9 +304,20 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
               <label className="app-field-label" htmlFor="app-upload-url">Link (URL)</label>
               <input id="app-upload-url" className="profile-text-input" type="url" inputMode="url" value={form.url} placeholder="https://…" onChange={(e) => setForm((f) => ({ ...f, url: e.target.value }))} />
               <div className="app-bundle-hint">
-                The full address, starting with <code>http://</code> or <code>https://</code>. It cannot be changed after uploading.
+                The full address, starting with <code>http://</code> or <code>https://</code>.
                 {form.url.trim() && !linkOk && <span className="app-row-warn"> This is not a web address yet.</span>}
               </div>
+              <label className="app-embed-toggle">
+                <input type="checkbox" checked={embed} onChange={(e) => setEmbed(e.target.checked)} />
+                <span>Run inside LAN Party</span>
+              </label>
+              <div className="app-bundle-hint">
+                {embed
+                  ? <>The site is shown in a frame — on its own, or as a Thing To Do in a voice room — instead of opening in a new tab. It needs an <code>https://</code> address that is not this LAN Party’s own, and it must allow being framed by <code>{window.location.origin}</code> (no <code>X-Frame-Options</code> or <code>frame-ancestors</code> that shuts it out). To know who is looking and which room it is in, it can use the SDK: copy <code>/sdk/lanparty.js</code> into the site and call <code>{`LANParty.connect({ hostOrigins: ['${window.location.origin}'] })`}</code>.</>
+                  : 'Off: the link opens in a new browser tab, and the site learns nothing from LAN Party.'}
+                {embedProblem && <span className="app-row-warn"> {embedProblem}</span>}
+              </div>
+              <div className="app-bundle-hint">Both can be changed later under Edit details. Changing either on a published app sends it back to draft, to be reviewed again.</div>
             </>
           ) : (
             <>
@@ -328,6 +352,7 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
             const status = statusOf(app)
             const busy = !!busyKey && busyKey.startsWith(`${app.id}:`)
             const check = checks[app.id]
+            const bundle = isBundleApp(app)
             return (
               <div className="app-row" key={app.id}>
                 <AppIcon app={app} resolveSrc={resolveSrc} />
@@ -335,14 +360,14 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
                   <div className="app-row-head">
                     <span className="app-row-name">{app.name}</span>
                     <StatusChip status={status} />
-                    <span className="app-row-kind">{app.embeddable ? 'bundle' : 'link'}</span>
+                    <span className="app-row-kind">{bundle ? 'bundle' : app.hosted ? 'link · runs inside LAN Party' : 'link'}</span>
                   </div>
                   {app.description && <div className="app-row-desc">{app.description}</div>}
-                  {!app.embeddable && (
+                  {!bundle && (
                     // Where the link goes, in full and as text — it is what a reviewer will be approving.
                     <div className="app-row-kindline">
-                      Opens: <span className="app-row-url">{app.url || '(no address given)'}</span>
-                      {!safeLinkUrl(app.url) && <span className="app-row-warn"> Not a web address, so nobody can open it. The address cannot be edited: delete this app and add it again with one that starts with https://.</span>}
+                      {app.hosted ? 'Runs inside LAN Party, framed from: ' : 'Opens in a new tab: '}<span className="app-row-url">{app.url || '(no address given)'}</span>
+                      {!safeLinkUrl(app.url) && <span className="app-row-warn"> Not a web address, so nobody can open it. Choose Edit details and give it one that starts with https://.</span>}
                     </div>
                   )}
                   <div className="app-row-status">{renderStatusLine(app)}</div>
@@ -355,9 +380,9 @@ export default function AppDeveloperTab({ open, apps, instanceOwner, me, busyKey
                   {fileProblem?.id === app.id && <div className="composer-error" role="alert">{fileProblem.text}</div>}
                   <div className="app-row-actions">
                     <OpenAppControl app={app} onOpenApp={onOpenApp} />
-                    {app.embeddable && <RowButton onClick={() => checkApp(app)} disabled={!!check?.running && check.url === app.url} title="Load it out of sight for a few seconds and report what it did">Check app</RowButton>}
+                    {bundle && <RowButton onClick={() => checkApp(app)} disabled={!!check?.running && check.url === app.url} title="Load it out of sight for a few seconds and report what it did">Check app</RowButton>}
                     <RowButton onClick={() => onDialog('edit', app)} disabled={busy}>Edit details</RowButton>
-                    {app.embeddable && <RowButton onClick={() => pickReplacement(app)} disabled={busy}>Replace bundle</RowButton>}
+                    {bundle && <RowButton onClick={() => pickReplacement(app)} disabled={busy}>Replace bundle</RowButton>}
                     {/* Whoever runs the instance has nobody to submit to: they publish their own. */}
                     {status !== 'published' && instanceOwner && <RowButton tone="primary" onClick={() => onAction(app, 'approve')} disabled={busy}>Publish</RowButton>}
                     {(status === 'draft' || status === 'rejected') && !instanceOwner && <RowButton tone="primary" onClick={() => onAction(app, 'submit')} disabled={busy}>{status === 'rejected' ? 'Submit again' : 'Submit for review'}</RowButton>}

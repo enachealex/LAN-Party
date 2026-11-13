@@ -3,12 +3,14 @@
 // clients only ever see proxied results.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const { deriveKey } = require('../services/hostedApps');
 
 const SERVER_DIR = path.join(__dirname, '..'); // *.key files live in server/, not server/routes/
 
-/** @param {{ app: any, db: any, authMiddleware: any, io: any, JWT_SECRET: string }} deps */
-function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET }) {
+/** @param {{ app: any, db: any, authMiddleware: any, io: any, JWT_SECRET: string, ownOrigins?: string[] }} deps */
+function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins = [] }) {
   // --- Tenor proxy (Google Tenor API v2) ---
   // The Tenor API key comes from the TENOR_API_KEY env var, or a `server/tenor.key` file.
   // The key stays server-side; clients only ever see the normalized, proxied results.
@@ -249,14 +251,88 @@ function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET }) {
     return `${req.protocol}://${req.get('host')}/callback`;
   }
 
+  // Where the code is exchanged for tokens. SPOTIFY_TOKEN_URL is a test seam (the tests point it at
+  // a stand-in on loopback); it is never set in a real deployment, where the client secret must only
+  // ever go to Spotify.
+  const spotifyTokenUrl = () => process.env.SPOTIFY_TOKEN_URL || 'https://accounts.spotify.com/api/token';
+
+  // --- The OAuth state, and what binds the flow to the browser that started it ---
+  // The callback is reached by a redirect from Spotify, with no LAN Party session on it, so every
+  // fact it acts on has to come in the state. Unsigned, the state was anyone's to write: a link that
+  // starts the flow with someone else's username in it (or the attacker's own page as the place to
+  // post the result) and is opened by a person who has authorised the app before goes straight
+  // through Spotify's consent, and their tokens went wherever the state said.
+  //
+  // So the state is signed (HMAC under a key derived from JWT_SECRET with a label of its own, the
+  // same way room keys are made: no new secret to keep), it expires, and it carries a random nonce
+  // that must match a cookie set on the authenticated request that asked for the login url. A state
+  // minted for one person's account is then only redeemable in that person's own browser: someone
+  // else who is sent the link has no such cookie.
+  const SPOTIFY_STATE_TTL_MS = 10 * 60 * 1000;
+  const SPOTIFY_COOKIE = 'lp_spotify_oauth';
+  const SPOTIFY_COOKIE_PATH = '/callback';
+  const spotifyStateKey = deriveKey(JWT_SECRET, 'lanparty:spotify-oauth-state:v1');
+  const signState = (body) => crypto.createHmac('sha256', spotifyStateKey).update(body).digest('base64url');
+  /** Byte-for-byte comparison that takes the same time wherever the first difference is. */
+  const sameText = (a, b) => {
+    const x = Buffer.from(String(a));
+    const y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+  };
+  function mintSpotifyState(username, clientOrigin) {
+    const nonce = crypto.randomBytes(18).toString('base64url');
+    const body = Buffer.from(JSON.stringify({ u: username, o: clientOrigin, n: nonce, exp: Date.now() + SPOTIFY_STATE_TTL_MS })).toString('base64url');
+    return { state: `${body}.${signState(body)}`, nonce };
+  }
+  /** The state's contents if it is ours, untouched and in date; otherwise null. */
+  function readSpotifyState(raw) {
+    const parts = String(raw || '').split('.');
+    if (parts.length !== 2 || !parts[0] || !sameText(parts[1], signState(parts[0]))) return null;
+    let parsed;
+    try { parsed = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); } catch { return null; }
+    if (!parsed || typeof parsed.u !== 'string' || !parsed.u || typeof parsed.o !== 'string' || typeof parsed.n !== 'string' || !parsed.n) return null;
+    if (typeof parsed.exp !== 'number' || !(parsed.exp > Date.now())) return null;
+    return { username: parsed.u, clientOrigin: parsed.o, nonce: parsed.n };
+  }
+  /** One cookie's value from the request, or '' (there is no cookie parser in this server). */
+  function cookieFrom(req, name) {
+    for (const part of String(req.headers.cookie || '').split(';')) {
+      const at = part.indexOf('=');
+      if (at !== -1 && part.slice(0, at).trim() === name) return part.slice(at + 1).trim();
+    }
+    return '';
+  }
+  // HttpOnly: no script needs it. Lax: sent on Spotify's top-level redirect back here, and on
+  // nothing a third-party page can make the browser send in the background. Path: only the
+  // callback ever sees it. Secure whenever the request was https (req.secure honours the proxy's
+  // X-Forwarded-Proto, as 'trust proxy' is set).
+  const spotifyCookieOptions = (req) => ({ httpOnly: true, sameSite: 'lax', path: SPOTIFY_COOKIE_PATH, secure: !!req.secure });
+  /**
+   * Whether the popup may hand its result to an opener on `origin`: only LAN Party's own pages, as
+   * this request reached it or as CLIENT_ORIGIN lists them. Anything else gets no message at all
+   * (the tokens still arrive over the user's socket), and never '*'.
+   */
+  function isOwnOrigin(req, origin) {
+    let parsed;
+    try { parsed = new URL(origin); } catch { return false; }
+    if (parsed.origin !== origin || !/^https?:$/.test(parsed.protocol)) return false;
+    const own = new Set();
+    try { own.add(new URL(`${req.protocol}://${req.get('host')}`).origin); } catch { /* no usable Host */ }
+    for (const entry of ownOrigins) { try { own.add(new URL(String(entry).trim()).origin); } catch { /* not an origin */ } }
+    return own.has(origin);
+  }
+
   app.get('/music/spotify/status', authMiddleware, (req, res) => res.json({ configured: !!getSpotifyCreds() }));
 
   app.get('/music/spotify/login-url', authMiddleware, (req, res) => {
     const creds = getSpotifyCreds();
     if (!creds) return res.status(503).json({ error: 'Spotify is not configured' });
-    // state carries who asked + which origin the popup should postMessage back to.
+    // state carries who asked + which origin the popup should postMessage back to, signed; the
+    // cookie carries its nonce, in the browser that asked.
     const clientOrigin = String(req.query.client_origin || '').slice(0, 200);
-    const state = Buffer.from(JSON.stringify({ u: req.user.username, o: clientOrigin })).toString('base64url');
+    const { state, nonce } = mintSpotifyState(req.user.username, clientOrigin);
+    res.setHeader('Cache-Control', 'no-store');
+    res.cookie(SPOTIFY_COOKIE, nonce, { ...spotifyCookieOptions(req), maxAge: SPOTIFY_STATE_TTL_MS });
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: creds.client_id,
@@ -267,28 +343,34 @@ function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET }) {
     return res.json({ url: `https://accounts.spotify.com/authorize?${params}`, redirectUri: spotifyRedirectUri(req) });
   });
 
-  // OAuth callback — hit by Spotify's redirect (no app auth possible here; identity comes from state).
+  // OAuth callback — hit by Spotify's redirect (no app auth possible here; identity comes from the
+  // signed state, and the browser is checked against the nonce cookie set when it was minted).
   app.get('/callback', async (req, res) => {
     const creds = getSpotifyCreds();
     const { code, state, error } = req.query;
-    let username = '', clientOrigin = '';
-    try {
-      const parsed = JSON.parse(Buffer.from(String(state || ''), 'base64url').toString('utf8'));
-      username = String(parsed.u || ''); clientOrigin = String(parsed.o || '');
-    } catch { /* bad state — fall through to error page */ }
+    const verified = readSpotifyState(state);
+    const cookieNonce = cookieFrom(req, SPOTIFY_COOKIE);
+    // One use: whatever happens next, this browser's nonce is spent.
+    res.clearCookie(SPOTIFY_COOKIE, spotifyCookieOptions(req));
+    res.setHeader('Cache-Control', 'no-store');
     // This page is built from OAuth-flow inputs, so nothing untrusted is interpolated raw: the
     // status line is a fixed string, and the token payload is embedded through a script-safe
-    // JSON encoder. The postMessage target is only used if `clientOrigin` is a valid http(s) origin.
+    // JSON encoder.
     const page = (body) => res.send(`<!DOCTYPE html><html><head><title>Spotify</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#121212;color:#fff}</style></head><body>${body}</body></html>`);
     // JSON safe to embed inside a <script>: neutralize </script>, HTML-comment, and line-sep sequences.
     const jsonForScript = (v) => JSON.stringify(v)
       .replace(/[<>&\u2028\u2029]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
-    let safeOrigin = '*';
-    try { safeOrigin = new URL(clientOrigin).origin === clientOrigin && /^https?:$/.test(new URL(clientOrigin).protocol) ? clientOrigin : '*'; } catch { safeOrigin = '*'; }
     if (error || !code || !creds) return page('<p>Spotify connection failed. You can close this window and try again.</p>');
+    // Before the code is exchanged, so a forged, expired or borrowed state costs Spotify nothing
+    // and gets nobody's tokens.
+    if (!verified || !cookieNonce || !sameText(cookieNonce, verified.nonce)) {
+      return page('<p>Spotify connection failed. You can close this window and try again.</p>');
+    }
+    const { username, clientOrigin } = verified;
+    const postTo = isOwnOrigin(req, clientOrigin) ? clientOrigin : '';
     try {
       const basic = Buffer.from(`${creds.client_id}:${creds.client_secret}`).toString('base64');
-      const r = await fetch('https://accounts.spotify.com/api/token', {
+      const r = await fetch(spotifyTokenUrl(), {
         method: 'POST',
         headers: { Authorization: `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ grant_type: 'authorization_code', code: String(code), redirect_uri: spotifyRedirectUri(req) }),
@@ -296,10 +378,12 @@ function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET }) {
       const data = await r.json();
       if (!r.ok) throw new Error(data.error_description || 'token exchange failed');
       const payload = { type: 'spotify-auth', access_token: data.access_token, refresh_token: data.refresh_token, expires_in: data.expires_in };
-      // Primary delivery is the user's socket room (below); postMessage is a best-effort popup nicety.
-      if (username) io.to(`user:${username}`).emit('spotify:auth', payload);
+      // Primary delivery is the user's socket room, the user the signed state names; postMessage is
+      // a best-effort popup nicety, and only to one of LAN Party's own origins.
+      io.to(`user:${username}`).emit('spotify:auth', payload);
+      const handOver = postTo ? `window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonForScript(postTo)});` : '';
       return page(`<p>Connected to Spotify — closing…</p><script>
-try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonForScript(safeOrigin)});}finally{window.close();}
+try{${handOver}}finally{window.close();}
 </script>`);
     } catch (err) {
       console.error('Spotify callback error:', err.message);
@@ -314,7 +398,7 @@ try{window.opener&&window.opener.postMessage(${jsonForScript(payload)},${jsonFor
     if (!refreshToken) return res.status(400).json({ error: 'refresh_token required' });
     try {
       const basic = Buffer.from(`${creds.client_id}:${creds.client_secret}`).toString('base64');
-      const r = await fetch('https://accounts.spotify.com/api/token', {
+      const r = await fetch(spotifyTokenUrl(), {
         method: 'POST',
         headers: { Authorization: `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: String(refreshToken) }),

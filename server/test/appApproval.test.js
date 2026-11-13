@@ -137,8 +137,8 @@ describe('migration 0011_app_publish_approval', () => {
   };
 
   test('the migration is the next one after 0010', () => {
-    assert.equal(MIGRATIONS[MIGRATIONS.length - 1].name, '0011_app_publish_approval');
-    assert.equal(before0011.length, MIGRATIONS.length - 1);
+    assert.equal(MIGRATIONS[before0011.length].name, '0011_app_publish_approval');
+    assert.equal(before0011.length, 10);
   });
 
   test('apps that already exist stay published, with their data untouched', async () => {
@@ -211,12 +211,16 @@ describe('app approval (server)', () => {
     return res.data.app;
   };
   const act = (who, id, action, body) => call('POST', `/apps/${id}/${action}`, body, tokens[who]);
+  // What a reviewer's client sends to approve a plain link: the address it showed, and that it does
+  // not run inside LAN Party. (Hosted apps are in hostedApps.test.js.)
+  const linkReviewed = (app) => ({ url: app.url, embed: false });
   // Take one of dev's apps from draft to `status` along the real routes.
-  // (Approving a bundle has to name the files reviewed; the url is ignored for a link.)
+  // (Approving names what was reviewed: a bundle's files by its url, a link's address and `embed`.
+  // A bundle has no `embed` to name, and one that is sent is not looked at.)
   const moveTo = async ({ id, url }, status) => {
     const ok = async (who, action, body) => { const r = await act(who, id, action, body); assert.equal(r.status, 200, `${action} -> ${JSON.stringify(r.data)}`); };
     if (status === 'pending') await ok('dev', 'submit');
-    if (status === 'published') await ok('owner', 'approve', { url });
+    if (status === 'published') await ok('owner', 'approve', { url, embed: false });
     if (status === 'rejected') { await ok('dev', 'submit'); await ok('owner', 'reject', { note: 'needs work' }); }
   };
   const devApp = async (status, kind = 'link') => {
@@ -446,7 +450,8 @@ describe('app approval (server)', () => {
       for (const status of STATUSES) {
         for (const who of ['dev', 'owner', 'ben']) {
           const app = await devApp(status);
-          const res = await act(who, app.id, action);
+          // An approval names what was reviewed; nothing else does, or needs to.
+          const res = await act(who, app.id, action, action === 'approve' ? linkReviewed(app) : undefined);
           const visible = status === 'published' || who !== 'ben';
           const expected = !visible ? 404 : !rule.by.includes(who) ? 403 : !rule.from.includes(status) ? 409 : 200;
           const label = `${action} of a ${status} app by ${who}`;
@@ -478,12 +483,12 @@ describe('app approval (server)', () => {
     assert.equal((await act('owner', app.id, 'unpublish')).data.app.status, 'draft');
     assert.equal((await act('owner', app.id, 'submit')).data.app.status, 'pending');
     assert.equal((await act('owner', app.id, 'withdraw')).data.app.status, 'draft');
-    assert.equal((await act('owner', app.id, 'approve')).data.app.status, 'published');
+    assert.equal((await act('owner', app.id, 'approve', linkReviewed(app))).data.app.status, 'published');
   });
 
   test('the same transition asked twice works once', async () => {
     const app = await devApp('pending');
-    const [a, b] = await Promise.all([act('owner', app.id, 'approve'), act('owner', app.id, 'approve')]);
+    const [a, b] = await Promise.all([act('owner', app.id, 'approve', linkReviewed(app)), act('owner', app.id, 'approve', linkReviewed(app))]);
     assert.deepEqual([a.status, b.status].sort(), [200, 409]);
     assert.equal(await statusOf(app.id), 'published');
   });
@@ -525,9 +530,15 @@ describe('app approval (server)', () => {
     assert.equal(ok.data.app.status, 'published');
     assert.equal(ok.data.app.url, current);
 
-    // A link's address cannot change after upload, so approving one names nothing.
+    // A plain link names its address and `embed: false`, like the other kinds name theirs. (What
+    // happens when its address is edited, or it is set to run inside LAN Party, is in
+    // hostedApps.test.js.)
     const link = await devApp('pending');
-    assert.equal((await act('owner', link.id, 'approve')).status, 200);
+    for (const body of [undefined, {}, { embed: false }, { url: 7, embed: false }, { url: link.url }]) {
+      assert.equal((await act('owner', link.id, 'approve', body)).status, 400, JSON.stringify(body));
+    }
+    assert.equal(await statusOf(link.id), 'pending');
+    assert.equal((await act('owner', link.id, 'approve', linkReviewed(link))).status, 200);
     // An instance owner publishing their own bundle is held to the same rule.
     const own = await uploadBundle('owner');
     await act('owner', own.id, 'unpublish');
@@ -552,7 +563,7 @@ describe('app approval (server)', () => {
     // Resubmitting keeps it in view (it is what was asked for); approval clears it.
     assert.equal((await act('dev', app.id, 'submit')).data.app.reviewNote, note);
     assert.equal((await seenBy('owner', app.id)).reviewNote, note);
-    assert.equal((await act('owner', app.id, 'approve')).data.app.reviewNote, '');
+    assert.equal((await act('owner', app.id, 'approve', linkReviewed(app))).data.app.reviewNote, '');
     assert.equal((await seenBy('dev', app.id)).reviewNote, '');
 
     // No note, an empty one and null are all "no note"; a new rejection replaces the old note.
@@ -891,7 +902,7 @@ describe('app approval (server)', () => {
     await act('dev', app.id, 'submit');
     await settle({ owner: [note('app:submitted', 'pending')] });
 
-    await act('owner', app.id, 'approve');
+    await act('owner', app.id, 'approve', linkReviewed(app));
     await settle({ owner: [note('app:review-queue', 'published')], dev: [note('app:reviewed', 'published')] });
 
     // Unpublished by its uploader: their own doing, so only the owners' lists hear of it.
@@ -899,7 +910,7 @@ describe('app approval (server)', () => {
     await settle({ owner: [note('app:review-queue', 'draft')] });
 
     // Published straight from draft, then unpublished by the instance owner: the uploader is told.
-    await act('owner', app.id, 'approve');
+    await act('owner', app.id, 'approve', linkReviewed(app));
     await settle({ owner: [note('app:review-queue', 'published')], dev: [note('app:reviewed', 'published')] });
     await act('owner', app.id, 'unpublish');
     await settle({ owner: [note('app:review-queue', 'draft')], dev: [note('app:reviewed', 'draft')] });
@@ -918,7 +929,7 @@ describe('app approval (server)', () => {
     // An instance owner's own apps: their lists update, but they are not "told" about themselves.
     const own = await addLink('owner');
     await act('owner', own.id, 'unpublish');
-    await act('owner', own.id, 'approve');
+    await act('owner', own.id, 'approve', linkReviewed(own));
     await settle({ owner: [
       { event: 'app:review-queue', payload: { id: own.id, name: own.name, status: 'draft' } },
       { event: 'app:review-queue', payload: { id: own.id, name: own.name, status: 'published' } },
@@ -952,7 +963,7 @@ describe('app approval (server)', () => {
     const all = await call('GET', '/apps', undefined, boss.data.token);
     assert.equal(all.data.instanceOwner, true);
     assert.equal(all.data.apps.find((a) => a.id === app.id).reviewedBy, 'owner2');
-    assert.equal((await call('POST', `/apps/${draft.id}/approve`, undefined, boss.data.token)).status, 200);
+    assert.equal((await call('POST', `/apps/${draft.id}/approve`, { url: draft.url, embed: false }, boss.data.token)).status, 200);
     // Back again, so the rest of the file (and its tokens) keep working whatever order tests run in.
     tokens.dev = (await call('POST', '/user/username', { username: 'dev' }, renamed.data.token)).data.token;
     tokens.owner = (await call('POST', '/user/username', { username: 'owner' }, boss.data.token)).data.token;
@@ -998,7 +1009,7 @@ describe('app approval with INSTANCE_OWNERS set', () => {
     assert.equal(byBoss.data.app.status, 'published');
 
     assert.equal((await call('POST', `/apps/${byFirst.data.app.id}/approve`, undefined, tokens.first)).status, 403);
-    assert.equal((await call('POST', `/apps/${byFirst.data.app.id}/approve`, undefined, tokens['second-boss'])).status, 200);
+    assert.equal((await call('POST', `/apps/${byFirst.data.app.id}/approve`, { url: 'https://example.com/', embed: false }, tokens['second-boss'])).status, 200);
   });
 
   test('a listed name cannot be taken: not registered, not renamed into, in any spelling of its case', async () => {

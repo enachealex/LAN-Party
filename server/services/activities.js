@@ -6,6 +6,7 @@
 // name a socket belongs to (clients).
 
 const crypto = require('crypto');
+const { isHostedApp } = require('./hostedApps');
 
 /** @param {{ io: any, clients: Record<string, any> }} deps */
 function createActivities({ io, clients }) {
@@ -61,7 +62,8 @@ function createActivities({ io, clients }) {
   });
 
   // --- Uploaded apps as activities (the app bridge) ---
-  // Any bundle from the app directory can be the room's activity. The server knows nothing about
+  // Any bundle from the app directory can be the room's activity, and so can a hosted app (a link
+  // app set to run inside LAN Party; services/hostedApps.js). The server knows nothing about
   // what the app does: it keeps one JSON object per room (`shared`) that the app's SDK patches, and
   // relays transient messages. Everything arriving here was written by uploaded, untrusted code, so
   // every event is validated in full and rejected whole — a half-applied patch would leave the room
@@ -143,11 +145,18 @@ function createActivities({ io, clients }) {
     return true;
   }
 
-  function appActivityInit(row) {
+  // `roomKey` is the app's opaque id for this voice channel (createAppRoomKeys); the socket layer
+  // works it out, because it is the one that knows the room.
+  function appActivityInit(row, roomKey = null) {
+    const hosted = isHostedApp(row);
     return {
       appId: row.id,
       name: row.name,
-      url: `/app-bundles/${row.bundle_dir}/`,
+      // A hosted app's own address, exactly as stored. The client adds `lanparty=1` when it frames
+      // it; nothing about the room or the people in it is ever put in a url.
+      url: hosted ? row.url : `/app-bundles/${row.bundle_dir}/`,
+      // Which frame the client builds: a hosted app runs on its real origin, a bundle in an opaque one.
+      hosted,
       iconUrl: row.icon_url || '',
       createdBy: row.created_by,
       // False while the app is a draft or waiting for review: the instance owner has not looked at
@@ -156,6 +165,9 @@ function createActivities({ io, clients }) {
       // Names this run of the app. Its events carry it back, so one that was meant for an earlier
       // activity in the room (still on the wire when that was replaced) can be told apart and dropped.
       run: crypto.randomBytes(8).toString('hex'),
+      // For the people who joined only (activityViewFor): it is what the app's own server files
+      // this channel's data under, so holding it is as good as being in the channel.
+      roomKey: typeof roomKey === 'string' ? roomKey : null,
       shared: {},
       rev: 0,
       lastBy: null,
@@ -399,10 +411,12 @@ function createActivities({ io, clients }) {
   // An app's shared state only goes to the people who joined it. Everyone else gets what the "Join"
   // card needs (name, icon, who started it, who is in) with `shared` emptied: they are not running
   // the app, so there is no reason for up to 64 KB of some uploader's data to land in their client.
+  // The room key is withheld the same way, and for a better reason: it opens the channel's room on
+  // the app's own server, and someone who has not joined has not chosen to be in it.
   function activityViewFor(act, socketId) {
     if (act && act.type === APP_ACTIVITY) {
       if (appJoinedMap(act).has(socketId)) return act;
-      return { ...act, state: { ...act.state, shared: {} } };
+      return { ...act, state: { ...act.state, shared: {}, roomKey: null } };
     }
     if (!act || act.type !== 'sketch') return act;
     const s = act.state;

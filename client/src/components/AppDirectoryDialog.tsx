@@ -2,7 +2,7 @@
 // prompt's look. Not window.confirm or window.prompt: the desktop shell does not support native
 // prompts, and the shared prompt modal sits underneath this one.
 import { useEffect, useRef, useState } from 'react'
-import { AppIcon, REVIEW_NOTE_MAX, type AppDialogKind, type AppsRequest, type DirectoryApp } from './AppDirectoryParts'
+import { AppIcon, REVIEW_NOTE_MAX, hostedUrlProblem, isBundleApp, safeLinkUrl, type AppDialogKind, type AppsRequest, type DirectoryApp } from './AppDirectoryParts'
 
 export interface AppDialogState { kind: AppDialogKind; app: DirectoryApp; file?: File }
 
@@ -29,6 +29,13 @@ export default function AppDirectoryDialog({ dialog, instanceOwner, currentUser,
   const [note, setNote] = useState('')
   const [name, setName] = useState(app.name || '')
   const [description, setDescription] = useState(app.description || '')
+  // A link app's address, and whether it runs inside LAN Party. Unlike the fields above these are
+  // what a reviewer approved, so changing either is not a details edit (see the note in the form).
+  const isLink = !isBundleApp(app)
+  const [url, setUrl] = useState(app.url || '')
+  const [embed, setEmbed] = useState(app.hosted === true)
+  const urlChanged = isLink && url.trim() !== (app.url || '')
+  const embedChanged = isLink && embed !== (app.hosted === true)
   // undefined = leave the icon alone, null = remove it, a File = replace it.
   const [iconChange, setIconChange] = useState<File | null | undefined>(undefined)
   const [iconPreview, setIconPreview] = useState<string | null>(null)
@@ -61,9 +68,19 @@ export default function AppDirectoryDialog({ dialog, instanceOwner, currentUser,
       } else {
         if (!name.trim()) throw new Error('App name is required.')
         // Only what changed is sent; the server refuses an edit that changes nothing.
-        const changes: Record<string, string> = {}
+        const changes: Record<string, string | boolean> = {}
         if (name.trim() !== (app.name || '')) changes.name = name.trim()
         if (description.trim() !== (app.description || '')) changes.description = description.trim()
+        if (urlChanged || embedChanged) {
+          // Asked here first so a typo is caught before anything is sent; the server asks again.
+          // Only when one of the two is being changed: an old link whose address was never a web
+          // address can still be renamed without being made to fix it first.
+          if (!safeLinkUrl(url)) throw new Error('Enter the full web address, starting with http:// or https://.')
+          const problem = embed ? hostedUrlProblem(url, [resolveSrc('/')]) : ''
+          if (problem) throw new Error(problem)
+          if (urlChanged) changes.url = url.trim()
+          if (embedChanged) changes.embed = embed
+        }
         if (iconChange === null && app.iconUrl) changes.iconUrl = ''
         else if (iconChange instanceof File) changes.iconUrl = await uploadIcon(iconChange)
         if (Object.keys(changes).length > 0) await request(base, { method: 'PATCH', json: changes })
@@ -93,7 +110,7 @@ export default function AppDirectoryDialog({ dialog, instanceOwner, currentUser,
 
         {kind === 'delete' && (
           <p className="app-dir-dialog-text">
-            {mine ? 'The app' : `${app.createdBy || 'Someone'}’s app`} is removed from the directory{app.embeddable ? ' and its files are deleted' : ''}. If it is running in a voice room, it ends there. This cannot be undone.
+            {mine ? 'The app' : `${app.createdBy || 'Someone'}’s app`} is removed from the directory{isBundleApp(app) ? ' and its files are deleted' : ''}. If it is running in a voice room, it ends there. This cannot be undone.
           </p>
         )}
         {kind === 'unpublish' && (
@@ -136,6 +153,30 @@ export default function AppDirectoryDialog({ dialog, instanceOwner, currentUser,
             <label className="prompt-label app-dir-dialog-gap" htmlFor="app-edit-desc">Description</label>
             <textarea id="app-edit-desc" className="prompt-input app-dir-dialog-area" rows={3} maxLength={500} value={description} onChange={(e) => setDescription(e.target.value)} />
             <p className="app-dir-dialog-text app-dir-dialog-fine">Changing these does not change the app’s status.</p>
+            {isLink && (
+              <>
+                <label className="prompt-label app-dir-dialog-gap" htmlFor="app-edit-url">Address</label>
+                <input id="app-edit-url" className="prompt-input" type="url" inputMode="url" maxLength={2000} placeholder="https://…" value={url} onChange={(e) => setUrl(e.target.value)} />
+                <label className="app-embed-toggle app-dir-dialog-gap">
+                  <input type="checkbox" checked={embed} onChange={(e) => setEmbed(e.target.checked)} disabled={busy} />
+                  <span>Run inside LAN Party</span>
+                </label>
+                <p className="app-dir-dialog-text app-dir-dialog-fine">
+                  {embed
+                    ? 'The site is shown in a frame, on its own or as a Thing To Do in a voice room. It needs an https:// address that is not this LAN Party’s own, must allow being framed by this LAN Party, and can use the SDK to learn who is looking and which room it is in.'
+                    : 'Off: the link opens in a new browser tab.'}
+                </p>
+                {/* Said before Save, and only when it is about to happen: this is what was reviewed. */}
+                <p className={`app-dir-dialog-text app-dir-dialog-fine${urlChanged || embedChanged ? ' app-dir-dialog-warn' : ''}`}>
+                  Changing the address, or whether it runs inside LAN Party, changes what was reviewed. Any voice room running the app is ended, and{' '}
+                  {instanceOwner
+                    ? 'because you run this instance the app keeps its current status.'
+                    : app.status === 'draft'
+                      ? 'the app stays a draft.'
+                      : 'the app goes back to Draft — submit it for review again when it is ready.'}
+                </p>
+              </>
+            )}
           </>
         )}
 

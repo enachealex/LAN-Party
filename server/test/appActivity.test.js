@@ -36,8 +36,8 @@ describe('app activity reducer', () => {
     assert.ok(!a.ACTIVITY_TYPES.includes('app'), 'an app cannot be started through activityInit(type)');
     const { run, ...rest } = a.appActivityInit(row);
     assert.deepEqual(rest, {
-      appId: 7, name: 'Buzzer', url: '/app-bundles/abc-123/', iconUrl: '', createdBy: 'uploader', approved: false,
-      shared: {}, rev: 0, lastBy: null, joined: [],
+      appId: 7, name: 'Buzzer', url: '/app-bundles/abc-123/', hosted: false, iconUrl: '', createdBy: 'uploader', approved: false,
+      roomKey: null, shared: {}, rev: 0, lastBy: null, joined: [],
     });
     // Approved only when the row says published, and for no other status (or none at all).
     assert.equal(a.appActivityInit({ ...row, status: 'published' }).approved, true);
@@ -206,6 +206,12 @@ describe('app activity reducer', () => {
     assert.equal(a.activityViewFor(act, 's1'), act);
     const outside = a.activityViewFor(act, 'someone-else');
     assert.deepEqual(outside.state.shared, {});
+    // The room key goes the same way: it is for the people running the app, nobody else.
+    const keyed = { type: a.APP_ACTIVITY, state: a.appActivityInit(row, 'f'.repeat(32)), by: 'ann' };
+    a.applyAppEvent(keyed, { kind: 'join' }, 'ann', 's1');
+    assert.equal(a.activityViewFor(keyed, 's1').state.roomKey, 'f'.repeat(32));
+    assert.equal(a.activityViewFor(keyed, 'someone-else').state.roomKey, null);
+    assert.equal(keyed.state.roomKey, 'f'.repeat(32), 'withheld from the copy, not wiped from the room');
     assert.equal(outside.state.name, 'Buzzer', 'they still get what the Join card shows');
     assert.deepEqual(outside.state.joined, ['ann']);
     assert.deepEqual(act.state.shared, { secretRound: 3 }, 'the redacted view is a copy');
@@ -364,7 +370,7 @@ describe('app activity (sockets)', () => {
     const starts = [
       { type: 'app' },                                   // no appId
       { type: 'app', appId: 999_999 },                   // nothing with that id
-      { type: 'app', appId: linkApp.id },                // a link, not a hosted bundle
+      { type: 'app', appId: linkApp.id },                // a plain link: it opens in a tab, it does not run in a room
       { type: 'app', appId: String(bundleApp.id) },      // ids are numbers
       { type: 'app', appId: { id: bundleApp.id } },
       { type: 'app', appId: null },
@@ -387,11 +393,13 @@ describe('app activity (sockets)', () => {
     });
     const act = await started;
     assert.equal(act.by, 'ann');
-    const { run, ...rest } = act.state;
+    const { run, roomKey, ...rest } = act.state;
     assert.match(run, /^[0-9a-f]{16}$/);
+    // The starter is joined, so she is given the app's id for this channel (hostedApps.test.js).
+    assert.match(roomKey, /^[0-9a-f]{32}$/);
     assert.deepEqual(rest, {
       // ann registered first, so she is the instance owner and her uploads are published at once.
-      appId: bundleApp.id, name: 'Bridge App', url: bundleApp.url, iconUrl: '', createdBy: 'ann', approved: true,
+      appId: bundleApp.id, name: 'Bridge App', url: bundleApp.url, hosted: false, iconUrl: '', createdBy: 'ann', approved: true,
       shared: {}, rev: 0, lastBy: null, joined: ['ann'],
     });
     assert.match(act.state.url, /^\/app-bundles\/[^/]+\/$/);
@@ -735,10 +743,17 @@ describe('SDK shim (server/sdk/lanparty.js)', () => {
       console: { warn: (...args) => warnings.push(args.join(' ')), error() {} },
     };
     window.parent = framed ? parent : window;
+    // The real URL parser, as a page has: hostOrigins entries are normalised with it.
+    window.URL = URL;
     vm.runInNewContext(source, { window, setTimeout, clearTimeout, setInterval, clearInterval }, { filename: 'lanparty.js' });
-    const deliver = (data, from = parent) => { for (const fn of [...listeners]) fn({ source: from, data }); };
+    // `origin` is left off unless a test names one, as it always was: without hostOrigins the shim
+    // must not so much as look at it.
+    const deliver = (data, from = parent, origin = undefined) => {
+      const event = origin === undefined ? { source: from, data } : { source: from, data, origin };
+      for (const fn of [...listeners]) fn(event);
+    };
     const ofType = (type) => sent.filter((m) => m.type === type);
-    return { LANParty: window.LANParty, parent, sent, targets, deliver, ofType, warnings, listeners };
+    return { LANParty: window.LANParty, window, parent, sent, targets, deliver, ofType, warnings, listeners };
   }
   const ann = { username: 'ann', displayName: 'Ann', avatarUrl: '/avatars/a.png' };
   const ben = { username: 'ben', displayName: 'Ben', avatarUrl: '' };
@@ -1000,5 +1015,284 @@ describe('SDK shim (server/sdk/lanparty.js)', () => {
     assert.equal(env.listeners.size, 0);
     assert.equal(lp.setState({ a: 1 }), true);
     assert.deepEqual(plain(lp.state), { a: 1 });
+    assert.equal(lp.room, null, 'no host, no room');
+  });
+
+  // --- lp.room: the app's opaque id for the voice channel it is running in ---
+  const ROOM = 'a3f1'.repeat(8);
+
+  test('lp.room is what the welcome says: an id in a voice room, null without one', async () => {
+    const inRoom = await connected({ room: { id: ROOM, serverId: 'demo', channelId: 'voice1', extra: true } });
+    assert.deepEqual(plain(inRoom.lp.room), { id: ROOM }, 'the id and nothing else that came with it');
+    // A copy, like everything else lp hands out.
+    inRoom.lp.room.id = 'somewhere-else';
+    assert.equal(inRoom.lp.room.id, ROOM);
+    assert.notEqual(inRoom.lp.room, inRoom.lp.room);
+    // A later welcome (the host re-attached) carries the room as it is now.
+    inRoom.deliver(welcome({ room: null }));
+    assert.equal(inRoom.lp.room, null);
+    inRoom.deliver(welcome({ room: { id: ROOM } }));
+    assert.deepEqual(plain(inRoom.lp.room), { id: ROOM });
+    inRoom.deliver({ lanparty: 1, type: 'closed' });
+
+    // The solo viewer says null; a host from before rooms existed says nothing at all.
+    for (const extra of [{ room: null }, {}]) {
+      const solo = await connected(extra);
+      assert.equal(solo.lp.room, null);
+      solo.deliver({ lanparty: 1, type: 'closed' });
+    }
+    // Anything that is not { id: non-empty string } is no room, rather than something to trip over.
+    for (const room of ['abc', 7, [], {}, { id: 7 }, { id: '' }, { id: null }, { id: 'x'.repeat(129) }, { id: { toString: () => ROOM } }]) {
+      const odd = await connected({ room });
+      assert.equal(odd.lp.room, null, JSON.stringify(room));
+      odd.deliver({ lanparty: 1, type: 'closed' });
+    }
+  });
+
+  test('standalone has no room, even if a welcome turns up late', async () => {
+    const env = load();
+    const lp = await env.LANParty.connect({ timeoutMs: 40 });
+    assert.equal(lp.standalone, true);
+    assert.equal(lp.room, null);
+    env.deliver(welcome({ room: { id: ROOM } }));
+    assert.equal(lp.room, null);
+  });
+
+  // --- hostOrigins: for an app with an origin of its own, which must not trust whoever frames it ---
+  const HOST = 'https://lanparty.example.test';
+  const OTHER = 'http://localhost:3000';
+  const EVIL = 'https://evil.example';
+
+  test('hostOrigins: hello is posted to each listed origin by name, never to "*"', async () => {
+    const env = load();
+    const pending = env.LANParty.connect({ hostOrigins: [HOST, OTHER], timeoutMs: 2000 });
+    assert.deepEqual(env.sent, [{ type: 'hello', sdk: 1, lanparty: 1 }, { type: 'hello', sdk: 1, lanparty: 1 }]);
+    assert.deepEqual(env.targets, [HOST, OTHER], 'one per listed origin');
+    await sleep(300); // the repeats go the same way
+    assert.ok(env.targets.length >= 4);
+    assert.ok(env.targets.every((t) => t === HOST || t === OTHER));
+    assert.ok(!env.targets.includes('*'));
+    env.deliver(welcome(), env.parent, HOST);
+    const lp = await pending;
+    assert.equal(lp.standalone, false);
+    assert.equal(lp.me.username, 'ann');
+
+    // From the welcome on there is one host, and only it is addressed.
+    const before = env.targets.length;
+    lp.setState({ score: 1 });
+    lp.replaceState({ only: 1 });
+    lp.emit('hi');
+    assert.deepEqual(env.targets.slice(before), [HOST, HOST, HOST]);
+    assert.ok(!env.targets.includes('*'));
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+  });
+
+  test('hostOrigins: the parent window on an origin that is not listed is not the host', async () => {
+    const env = load();
+    let resolved = false;
+    const pending = env.LANParty.connect({ hostOrigins: [HOST], timeoutMs: 2000 }).then((lp) => { resolved = true; return lp; });
+    // A page that frames the app IS its parent window, so event.source alone cannot tell it from
+    // LAN Party. It answers the hello with an identity and a room of its choosing.
+    const forged = welcome({ me: { username: 'admin', displayName: 'Admin', avatarUrl: '' }, room: { id: 'f'.repeat(32) } });
+    env.deliver(forged, env.parent, EVIL);
+    env.deliver(forged, env.parent, 'null');                       // a sandboxed or data: page
+    env.deliver(forged, env.parent, HOST + '.evil.example');       // a name that merely starts the same
+    env.deliver(forged, env.parent, 'http://lanparty.example.test'); // right host, wrong scheme
+    env.deliver(forged, env.parent, HOST + ':8443');
+    env.deliver(forged, env.parent);                               // no origin at all
+    env.deliver(forged, { postMessage() {} }, HOST);               // right origin, but not the parent
+    await sleep(50);
+    assert.equal(resolved, false, 'none of those connected the app');
+
+    env.deliver(welcome({ room: { id: ROOM } }), env.parent, HOST);
+    const lp = await pending;
+    assert.equal(lp.me.username, 'ann');
+    assert.deepEqual(plain(lp.room), { id: ROOM });
+
+    // The same holds for everything after the welcome.
+    const heard = [];
+    for (const type of ['state', 'participants', 'message', 'closed']) lp.on(type, () => heard.push(type));
+    for (const origin of [EVIL, 'null', undefined]) {
+      env.deliver({ lanparty: 1, type: 'state', shared: { round: 999 }, rev: 100 }, env.parent, origin);
+      env.deliver({ lanparty: 1, type: 'participants', participants: [] }, env.parent, origin);
+      env.deliver({ lanparty: 1, type: 'message', from: 'ben', data: 'fake' }, env.parent, origin);
+      env.deliver(welcome({ me: { username: 'admin' }, room: { id: 'f'.repeat(32) } }), env.parent, origin);
+      env.deliver({ lanparty: 1, type: 'closed' }, env.parent, origin);
+    }
+    assert.deepEqual(heard, []);
+    assert.deepEqual(plain(lp.state), { round: 2 });
+    assert.equal(lp.me.username, 'ann');
+    assert.deepEqual(plain(lp.room), { id: ROOM });
+    assert.equal(lp.closed, false);
+    // The real host is still heard.
+    env.deliver({ lanparty: 1, type: 'state', shared: { round: 3 }, rev: 6 }, env.parent, HOST);
+    assert.deepEqual(heard, ['state']);
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+    assert.equal(lp.closed, true);
+  });
+
+  test('hostOrigins: once welcomed by one listed origin, another listed origin is not the host either', async () => {
+    const env = load();
+    const pending = env.LANParty.connect({ hostOrigins: [HOST, OTHER], timeoutMs: 2000 });
+    env.deliver(welcome(), env.parent, OTHER);
+    const lp = await pending;
+    env.deliver({ lanparty: 1, type: 'state', shared: { round: 999 }, rev: 100 }, env.parent, HOST);
+    env.deliver(welcome({ me: { username: 'admin' } }), env.parent, HOST);
+    assert.deepEqual(plain(lp.state), { round: 2 });
+    assert.equal(lp.me.username, 'ann');
+    lp.setState({ a: 1 });
+    assert.equal(env.targets.at(-1), OTHER);
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, OTHER);
+  });
+
+  test('hostOrigins: entries are matched the way the browser spells an origin', async () => {
+    const env = load();
+    const pending = env.LANParty.connect({ hostOrigins: ['  HTTPS://LanParty.Example.TEST:443/ ', HOST, 'http://LOCALHOST:3000'], timeoutMs: 2000 });
+    assert.deepEqual(env.targets, [HOST, OTHER], 'case, a trailing slash and a default port are tidied; repeats dropped');
+    env.deliver(welcome(), env.parent, HOST);
+    assert.equal((await pending).standalone, false);
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+  });
+
+  test('hostOrigins: a trailing slash or a path is dropped, so the entry is the origin event.origin will be', async () => {
+    const env = load();
+    const pending = env.LANParty.connect({ hostOrigins: [HOST + '/', HOST + '/app/room?x=1#top', 'https://LanParty.Example.TEST:443/app/'], timeoutMs: 2000 });
+    assert.deepEqual(env.targets, [HOST], 'one origin, however it was written');
+    env.deliver(welcome(), env.parent, HOST);
+    assert.equal((await pending).standalone, false);
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+  });
+
+  test('hostOrigins: an international name is matched in its punycode form, as the browser reports it', async () => {
+    const env = load();
+    const PUNY = 'https://xn--bcher-kva.example';
+    const pending = env.LANParty.connect({ hostOrigins: ['https://bücher.example/'], timeoutMs: 2000 });
+    assert.deepEqual(env.targets, [PUNY]);
+    // event.origin is always the ASCII form; the Unicode spelling is never what arrives.
+    env.deliver(welcome({ me: { username: 'admin' } }), env.parent, 'https://bücher.example');
+    env.deliver(welcome(), env.parent, PUNY);
+    const lp = await pending;
+    assert.equal(lp.me.username, 'ann');
+    lp.setState({ a: 1 });
+    assert.equal(env.targets.at(-1), PUNY);
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, PUNY);
+  });
+
+  test('hostOrigins: invalid entries are skipped with a warning, and a valid one after them still connects', async () => {
+    const env = load();
+    const pending = env.LANParty.connect({ hostOrigins: ['*', 'not a url', 42, 'https://user:pw@evil.example', HOST], timeoutMs: 2000 });
+    assert.deepEqual(env.targets, [HOST]);
+    assert.equal(env.warnings.filter((w) => /hostOrigins entry/.test(w)).length, 4, 'each dropped entry is named');
+    env.deliver(welcome(), env.parent, HOST);
+    assert.equal((await pending).me.username, 'ann');
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+  });
+
+  test('hostOrigins: a target the browser refuses to post to does not stop the ones after it', async () => {
+    const env = load();
+    // What a browser does with a target origin it cannot use: postMessage throws.
+    const real = env.parent.postMessage;
+    env.parent.postMessage = (message, target) => {
+      if (target === OTHER) throw new SyntaxError("Failed to execute 'postMessage': Invalid target origin");
+      real(message, target);
+    };
+    const pending = env.LANParty.connect({ hostOrigins: [OTHER, HOST], timeoutMs: 2000 });
+    assert.deepEqual(env.targets, [HOST], 'the second entry was still knocked on');
+    await sleep(300); // and on every repeat, with one warning in all for the refused one
+    assert.ok(env.targets.length >= 2 && env.targets.every((t) => t === HOST));
+    assert.equal(env.warnings.filter((w) => /could not post/.test(w)).length, 1);
+    env.deliver(welcome(), env.parent, HOST);
+    const lp = await pending;
+    assert.equal(lp.standalone, false);
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+  });
+
+  test('hostOrigins: at most 20 origins are used, and the rest are named in a warning', async () => {
+    const env = load();
+    const many = Array.from({ length: 25 }, (_, i) => `https://lp${i}.example.test`);
+    const pending = env.LANParty.connect({ hostOrigins: many, timeoutMs: 2000 });
+    assert.deepEqual(env.targets, many.slice(0, 20));
+    assert.ok(env.warnings.some((w) => /limited to 20/.test(w) && w.includes(many[20])));
+    env.deliver(welcome(), env.parent, many[24]);
+    env.deliver(welcome(), env.parent, many[19]);
+    assert.equal((await pending).me.username, 'ann');
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, many[19]);
+  });
+
+  test('connect() never rejects: a host that cannot be posted to at all, or options that cannot be read, end standalone', async () => {
+    const throwing = () => { throw new Error('postMessage is broken'); };
+    for (const options of [{ hostOrigins: [HOST], timeoutMs: 80 }, { timeoutMs: 80 }]) {
+      const env = load();
+      env.parent.postMessage = throwing;
+      const lp = await env.LANParty.connect(options);
+      assert.equal(lp.standalone, true, JSON.stringify(options));
+      assert.equal(env.listeners.size, 0, 'the message listener is not left behind');
+      assert.ok(env.warnings.some((w) => /could not post/.test(w)));
+      assert.equal(lp.setState({ a: 1 }), true, 'and the session works');
+    }
+    // Options whose getters throw: no host is trusted, and the promise still resolves.
+    const env = load();
+    const options = { get hostOrigins() { throw new Error('nope'); } };
+    const lp = await env.LANParty.connect(options);
+    assert.equal(lp.standalone, true);
+    assert.deepEqual(env.sent, []);
+    assert.equal(env.listeners.size, 0);
+    // And when adding the listener itself fails (the SDK looks it up when connect() is called).
+    const broken = load();
+    broken.window.addEventListener = () => { throw new Error('no listeners here'); };
+    const lp2 = await broken.LANParty.connect({ hostOrigins: [HOST], timeoutMs: 2000 });
+    assert.equal(lp2.standalone, true);
+    assert.deepEqual(broken.sent, [], 'nothing posted once setting up failed');
+  });
+
+  test('hostOrigins that name no usable origin accept no host at all, rather than every host', async () => {
+    for (const hostOrigins of [[], ['*'], '*', null, 'nonsense', [5, {}, null], ['https://user@lanparty.example.test'], ['javascript:alert(1)'], ['//lanparty.example.test'], ['https:lanparty.example.test'], ['https:///lanparty.example.test'], ['ftp://lanparty.example.test'], ['https://'], ['https://exa mple.test']]) {
+      const env = load();
+      const lp = await env.LANParty.connect({ hostOrigins, timeoutMs: 2000 });
+      const label = JSON.stringify(hostOrigins);
+      assert.equal(lp.standalone, true, label);
+      assert.deepEqual(env.sent, [], `${label}: nothing was posted, to "*" or anywhere`);
+      assert.equal(env.listeners.size, 0, `${label}: and nothing is listened for`);
+      assert.ok(env.warnings.some((w) => /hostOrigins/.test(w)), `${label}: the console says why`);
+      env.deliver(welcome({ me: { username: 'admin' } }), env.parent, EVIL);
+      assert.equal(lp.me.username, 'you');
+    }
+    // A bad entry next to a good one is dropped on its own.
+    const env = load();
+    const pending = env.LANParty.connect({ hostOrigins: ['*', HOST], timeoutMs: 2000 });
+    assert.deepEqual(env.targets, [HOST]);
+    env.deliver(welcome(), env.parent, EVIL);
+    env.deliver(welcome(), env.parent, HOST);
+    assert.equal((await pending).me.username, 'ann');
+    env.deliver({ lanparty: 1, type: 'closed' }, env.parent, HOST);
+  });
+
+  test('hostOrigins: with no listed host answering, the app is standalone like any other', async () => {
+    const env = load();
+    const lp = await env.LANParty.connect({ hostOrigins: [HOST], timeoutMs: 60 });
+    assert.equal(lp.standalone, true);
+    assert.equal(lp.room, null);
+    assert.equal(env.listeners.size, 0);
+    assert.ok(env.targets.length >= 1 && env.targets.every((t) => t === HOST));
+  });
+
+  // An uploaded bundle has an opaque origin and cannot know its host's, so for it nothing changes.
+  test('without hostOrigins nothing changed: "*" out, and the host\'s origin is never looked at', async () => {
+    for (const options of [undefined, {}, { timeoutMs: 2000 }, { hostOrigins: undefined }]) {
+      const env = load();
+      const pending = env.LANParty.connect(options);
+      // Whatever the origin, a welcome from the parent window connects it.
+      env.deliver(welcome({ room: { id: ROOM } }), env.parent, EVIL);
+      const lp = await pending;
+      assert.equal(lp.standalone, false);
+      assert.deepEqual(plain(lp.room), { id: ROOM });
+      env.deliver({ lanparty: 1, type: 'state', shared: { round: 4 }, rev: 6 }, env.parent, 'null');
+      assert.deepEqual(plain(lp.state), { round: 4 });
+      lp.setState({ a: 1 });
+      lp.emit('x');
+      assert.ok(env.targets.length >= 3);
+      assert.ok(env.targets.every((t) => t === '*'));
+      env.deliver({ lanparty: 1, type: 'closed' });
+    }
   });
 });

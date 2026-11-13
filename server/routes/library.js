@@ -5,9 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { extractBundle } = require('../services/appBundles');
+const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl } = require('../services/hostedApps');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [] }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -58,7 +59,18 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
 
   // --- App directory ---
   // A 'link' app keeps its external url; a 'bundle' app is LAN-Party-hosted, so its url is the
-  // internal sandboxed path. `embeddable` tells the client it can be shown in the in-app viewer.
+  // internal sandboxed path. `embeddable` tells the client it is a bundle: shown in the in-app
+  // viewer, in the opaque sandbox.
+  //
+  // A link app with "Run inside LAN Party" on (embed) is a HOSTED app: still someone else's site at
+  // its own address, but framed in the viewer and startable in a voice room like a bundle, under
+  // the same review. `hosted` tells the client which frame to build — a hosted app runs on its real
+  // origin, which is only safe because that origin is never ours (services/hostedApps.js).
+  //
+  // A hosted app is NOT `embeddable`. Clients from before hosted apps existed (a tab left open over
+  // a deploy) read `embeddable` as "frame this in the bundle sandbox", where a hosted site is a
+  // blank page. Left false, those clients show a hosted app as the plain link it also is, which
+  // works. Current clients ask `hosted` first and run either kind inside.
   //
   // "Anyone drafts, the instance owner publishes." Every app has a status:
   //   draft      only its uploader (and the instance owners) can see it
@@ -72,14 +84,20 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   // random, and nothing here hands it to anyone but the uploader and the instance owners (or the
   // people in a voice room the uploader starts it in), so an unpublished app is hidden from the
   // directory — it is not secret from someone who has been given its url.
-  const APP_COLUMNS = "id, name, description, url, icon_url, created_by, created_at, COALESCE(kind, 'link') AS kind, bundle_dir, status, review_note, reviewed_by, reviewed_at, submitted_at";
+  const APP_COLUMNS = "id, name, description, url, icon_url, created_by, created_at, COALESCE(kind, 'link') AS kind, bundle_dir, COALESCE(embed, 0) AS embed, status, review_note, reviewed_by, reviewed_at, submitted_at";
   const REVIEW_NOTE_MAX = 500;
   const bundleUrl = (dir) => `/app-bundles/${dir}/`;
+  // Where a request says LAN Party lives, plus where the configuration says it does.
+  const ownKeysFor = (req) => ownHostKeys(req.headers, ownOrigins);
+  // Whether this request reached a LAN Party running on the requester's own machine, the only case
+  // in which a plain http://localhost app address is allowed (services/hostedApps.js).
+  const whereFor = (req) => ({ loopback: servedFromLoopback(req.headers) });
 
   // The shape a given viewer gets. The review fields exist only for the people the review concerns:
   // the uploader and the instance owners. Which instance owner decided is for instance owners alone.
   function appView(row, viewer, viewerIsOwner) {
     const isBundle = row.kind === 'bundle' && !!row.bundle_dir;
+    const hosted = isHostedApp(row);
     /** @type {Record<string, any>} */
     const view = {
       id: row.id,
@@ -91,6 +109,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
       createdAt: row.created_at,
       kind: row.kind,
       embeddable: isBundle,
+      hosted,
       status: row.status,
     };
     if (viewerIsOwner || row.created_by === viewer) {
@@ -147,7 +166,8 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   // visibility rules) live.
   //   app:submitted     -> instance owners: an app is waiting for review
   //   app:review-queue  -> instance owners: something they list changed some other way
-  //                        (withdrawn, decided, unpublished, bundle replaced, deleted)
+  //                        (withdrawn, decided, unpublished, bundle replaced, address edited,
+  //                        deleted)
   //   app:reviewed      -> the uploader: an instance owner approved, rejected or unpublished it
   async function tellOwners(event, payload) {
     const owners = await instanceOwners();
@@ -159,17 +179,28 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   const initialStatus = (uploaderIsOwner) => (uploaderIsOwner ? 'published' : 'draft');
 
   // Add a link-style app (external URL). A draft until an instance owner publishes it.
+  // With `embed: true` it is a hosted app from the start, and its address has to pass the checks
+  // for one; without it the url is kept as typed, as it always was.
   app.post('/apps', authMiddleware, async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!name) return res.status(400).json({ error: 'App name is required' });
     const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 500) : '';
-    const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    let url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     const iconUrl = typeof req.body?.iconUrl === 'string' && req.body.iconUrl.startsWith('/uploads/') ? req.body.iconUrl : '';
+    // true or false and nothing else: a setting that decides whether a site is framed inside the
+    // app is not guessed from "1" or "yes".
+    const embed = req.body?.embed;
+    if (embed !== undefined && typeof embed !== 'boolean') return res.status(400).json({ error: 'Invalid embed setting' });
+    if (embed) {
+      const checked = checkHostedUrl(req.body?.url, ownKeysFor(req), whereFor(req));
+      if (!checked.ok) return res.status(400).json({ error: checked.problem });
+      url = checked.url;
+    }
     const me = req.user.username;
     const isOwner = await isInstanceOwner(me);
     const created = await db.run(
-      "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind, status) VALUES (?, ?, ?, ?, ?, ?, 'link', ?)",
-      name.slice(0, 80), description, url, iconUrl, me, Date.now(), initialStatus(isOwner)
+      "INSERT INTO apps (name, description, url, icon_url, created_by, created_at, kind, embed, status) VALUES (?, ?, ?, ?, ?, ?, 'link', ?, ?)",
+      name.slice(0, 80), description, url, iconUrl, me, Date.now(), embed ? 1 : 0, initialStatus(isOwner)
     );
     return res.json(await appResponse(created.lastID, me, isOwner));
   });
@@ -213,6 +244,14 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
 
   // Edit an app's name, description or icon — its uploader only, in any status. The status stays
   // as it is: what gets reviewed is what the app runs, and these fields change none of that.
+  //
+  // A link app's address (`url`) and whether it runs inside LAN Party (`embed`) can be edited here
+  // too, and those ARE what was reviewed: where the link goes, and whether it is framed in a voice
+  // room with the bridge or merely opened in a tab. So a change to either is treated like a bundle
+  // replace. The app goes back to 'draft', whatever it was; an instance owner editing their own has
+  // nobody else to ask and keeps its status; and any room running it is told it ended, because it
+  // is running the old address. A review in progress is not fooled either: approve has to name what
+  // it is about (see the handler).
   app.patch('/apps/:id', authMiddleware, async (req, res) => {
     const found = await loadApp(req, res);
     if (!found) return;
@@ -237,9 +276,47 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
       iconUrl = body.iconUrl;
       changed = true;
     }
+    let url = row.url;
+    let embed = !!row.embed;
+    if (body.url !== undefined || body.embed !== undefined) {
+      if (row.kind !== 'link') return res.status(400).json({ error: 'Only a link app has an address to change or can be set to run inside LAN Party' });
+      if (body.url !== undefined) {
+        if (typeof body.url !== 'string') return res.status(400).json({ error: 'Invalid app url' });
+        url = body.url.trim();
+      }
+      if (body.embed !== undefined) {
+        if (typeof body.embed !== 'boolean') return res.status(400).json({ error: 'Invalid embed setting' });
+        embed = body.embed;
+      }
+      changed = true;
+    }
     if (!changed) return res.status(400).json({ error: 'Nothing to change' });
-    await db.run('UPDATE apps SET name = ?, description = ?, icon_url = ? WHERE id = ?', name, description, iconUrl, id);
-    return res.json(await appResponse(id, me, isOwner));
+    // Asked on every edit of a hosted app, including one that only renames it: the answer depends
+    // on where LAN Party is served from, and that can have changed since the address was saved.
+    if (embed) {
+      const checked = checkHostedUrl(url, ownKeysFor(req), whereFor(req));
+      if (!checked.ok) return res.status(400).json({ error: checked.problem });
+      url = checked.url;
+    }
+    if (url === row.url && embed === !!row.embed) {
+      await db.run('UPDATE apps SET name = ?, description = ?, icon_url = ? WHERE id = ?', name, description, iconUrl, id);
+      return res.json(await appResponse(id, me, isOwner));
+    }
+    // Names the address it read, so two edits racing for the same app cannot both win. And as with
+    // a bundle replace, an instance owner's app keeps its status by this update not touching it:
+    // writing back the status read above would undo another owner's reject that landed in between.
+    const reset = isOwner ? '' : ", status = 'draft'";
+    const done = await db.run(
+      `UPDATE apps SET name = ?, description = ?, icon_url = ?, url = ?, embed = ?${reset} WHERE id = ? AND url IS ? AND COALESCE(embed, 0) = ?`,
+      name, description, iconUrl, url, embed ? 1 : 0, id, row.url, row.embed ? 1 : 0
+    );
+    if (!done.changes) return res.status(409).json({ error: 'This app was changed by someone else; reload and try again' });
+    // Rooms running it are on the address it had — also when the status did not change.
+    endAppActivities(id);
+    const answer = await appResponse(id, me, isOwner);
+    const status = answer.app ? answer.app.status : row.status;
+    if (status !== row.status || status === 'pending') await tellOwners('app:review-queue', { id, name, status });
+    return res.json(answer);
   });
 
   // Status changes. `by` says who may ask, `from` which statuses it is valid in, `to` where the app
@@ -250,7 +327,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
     submit: { by: 'uploader', from: ['draft', 'rejected'], to: 'pending', denied: 'Only the uploader can submit an app for review' },
     withdraw: { by: 'uploader', from: ['pending'], to: 'draft', denied: 'Only the uploader can withdraw an app from review' },
     // No 'pending' required: an instance owner may publish an app straight from draft or rejected.
-    // For a bundle the request must also name the files that were looked at; see the handler.
+    // For a bundle or a hosted app the request must also name what was looked at; see the handler.
     approve: { by: 'owner', from: ['pending', 'draft', 'rejected'], to: 'published', denied: 'Only an instance owner can publish an app' },
     reject: { by: 'owner', from: ['pending', 'published'], to: 'rejected', denied: 'Only an instance owner can reject an app' },
     unpublish: { by: 'either', from: ['published'], to: 'draft', denied: 'Only the uploader or an instance owner can unpublish an app' },
@@ -274,15 +351,44 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
       // Approving a bundle approves particular files, and its uploader can swap them at any moment
       // (PUT /apps/:id/bundle) — after the reviewer opened the app, even after submitting it again
       // under the same name. So the request says which files were reviewed, as the url the reviewer
-      // was shown, and anything but the bundle being served right now publishes nothing. (A link's
-      // address cannot be changed after upload, so there is nothing to pin for one.)
+      // was shown, and anything but the bundle being served right now publishes nothing.
+      //
+      // A hosted app is held to the same: its uploader can edit the address, or turn "run inside
+      // LAN Party" on for what was reviewed as a plain link (PATCH /apps/:id). So approving one has
+      // to say both things the reviewer saw — `url`, and `embed: true` — and anything but the app
+      // as it stands publishes nothing.
+      //
+      // A plain link is held to it too: `url`, the address the reviewer read, and `embed: false`.
+      // Its uploader can repoint it, or turn it into a hosted app and back, between the reviewer
+      // reading the row and clicking; an approval that names nothing would publish whatever it had
+      // become. (The client has always sent both, so this only turns away requests that leave one
+      // out.) A value that is there but does not match what the app is now is a 409, as for a bundle.
       const isBundle = row.kind === 'bundle' && !!row.bundle_dir;
-      if (action === 'approve' && isBundle && typeof req.body?.url !== 'string') {
+      const hosted = !isBundle && isHostedApp(row);
+      const named = req.body || {};
+      if (action === 'approve' && isBundle && typeof named.url !== 'string') {
         return res.status(400).json({ error: 'Say which bundle you reviewed: send the url the app had when you opened it' });
       }
+      if (action === 'approve' && !isBundle && (typeof named.url !== 'string' || named.embed === undefined)) {
+        return res.status(400).json({ error: 'Say what you reviewed: send the url the app had when you opened it, and whether it runs inside LAN Party (embed: true or false)' });
+      }
       if (!rule.from.includes(row.status)) return res.status(409).json({ error: `This app is ${row.status}; it cannot be changed that way` });
-      if (action === 'approve' && isBundle && req.body.url !== bundleUrl(row.bundle_dir)) {
+      if (action === 'approve' && isBundle && named.url !== bundleUrl(row.bundle_dir)) {
         return res.status(409).json({ error: 'The bundle was replaced since you opened it. Open the app again and review the new files before publishing.' });
+      }
+      if (action === 'approve' && !isBundle) {
+        const urlMoved = named.url !== (row.url || '');
+        const embedMoved = named.embed !== hosted;
+        if (urlMoved || embedMoved) {
+          return res.status(409).json({ error: 'The address of this app, or whether it runs inside LAN Party, was changed since you opened it. Open the app again and review it before publishing.' });
+        }
+        // Publishing is the moment a hosted app becomes everyone's to start, so the rule that
+        // carries the weight is asked again, of the request of the person deciding: the address
+        // may have been saved through a name for this server that their browser does not use.
+        if (hosted) {
+          const checked = checkHostedUrl(row.url, ownKeysFor(req), whereFor(req));
+          if (!checked.ok) return res.status(409).json({ error: checked.problem });
+        }
       }
       const now = Date.now();
       // Each update names the status it expects to replace, so two requests racing for the same app
@@ -293,8 +399,12 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
         done = await db.run('UPDATE apps SET status = ?, submitted_at = ? WHERE id = ? AND status = ?', rule.to, now, id, row.status);
       } else if (action === 'approve') {
         // ...and names the bundle as well: a replace landing between the check above and this
-        // update must not be published by it. (IS, so that a link's NULL matches itself.)
-        done = await db.run('UPDATE apps SET status = ?, review_note = NULL, reviewed_by = ?, reviewed_at = ? WHERE id = ? AND status = ? AND bundle_dir IS ?', rule.to, me, now, id, row.status, row.bundle_dir);
+        // update must not be published by it. (IS, so that a link's NULL matches itself.) The same
+        // goes for a link's address and its embed setting, which an edit can move.
+        done = await db.run(
+          'UPDATE apps SET status = ?, review_note = NULL, reviewed_by = ?, reviewed_at = ? WHERE id = ? AND status = ? AND bundle_dir IS ? AND url IS ? AND COALESCE(embed, 0) = ?',
+          rule.to, me, now, id, row.status, row.bundle_dir, row.url, row.embed ? 1 : 0
+        );
       } else if (action === 'reject') {
         done = await db.run('UPDATE apps SET status = ?, review_note = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ? AND status = ?', rule.to, note, me, now, id, row.status);
       } else {

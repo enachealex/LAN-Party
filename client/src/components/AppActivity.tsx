@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { APP_FRAME_ALLOW, APP_FRAME_SANDBOX, createAppBridge, type AppBridge, type BridgePerson, type ChangeResult } from '../appBridge'
+import {
+  APP_FRAME_ALLOW, APP_FRAME_SANDBOX, HOSTED_FRAME_ALLOW, HOSTED_FRAME_SANDBOX,
+  bridgeRoom, createAppBridge, hostedAppFrame,
+  type AppBridge, type BridgePerson, type BridgeRoom, type ChangeResult,
+} from '../appBridge'
 
-// An uploaded mini-app running as the voice room's activity.
+// An app running as the voice room's activity: an uploaded mini-app (a bundle), or a hosted app —
+// somebody's own site, set to run inside LAN Party.
 //
 // Unlike the built-in activities this one does NOT open by itself. The code was uploaded by some
 // member, so another person starting it is not a reason for it to run in this client: everyone in
@@ -13,7 +18,10 @@ import { APP_FRAME_ALLOW, APP_FRAME_SANDBOX, createAppBridge, type AppBridge, ty
 interface AppActivityState {
   appId: number
   name: string
+  /** A bundle's /app-bundles/<dir>/ path, or a hosted app's own absolute address. */
   url: string
+  /** True for a hosted app: its frame is on the site's real origin, not in the opaque sandbox. */
+  hosted?: boolean
   iconUrl: string
   createdBy: string
   /** False while the app has not been approved by an instance owner: its uploader (or an instance
@@ -21,6 +29,9 @@ interface AppActivityState {
   approved?: boolean
   /** Names this run of the app; sent back with every event so a stale one can be dropped. */
   run: string
+  /** The app's opaque id for this voice channel. The server sends it only to a socket that has
+   *  joined the app; for everyone else (and after leaving) it is null. */
+  roomKey?: string | null
   shared: Record<string, unknown>
   rev: number
   lastBy: string | null
@@ -47,7 +58,8 @@ interface AppActivityProps {
   onClose: () => void
   /** Public identity (name, avatar) of a member, for the card and for the app. */
   describePerson: (username: string) => BridgePerson
-  /** Makes a server-relative url absolute (the dev client runs on a different origin). */
+  /** Makes a server-relative url absolute (the dev client runs on a different origin). Must be
+   *  stable in what it answers: the frame's src is built from it on every render. */
   resolveSrc: (url: string) => string
   /** Subscribe to this room's activity updates and transient app messages. Must be stable. */
   subscribe: (handler: (event: AppHostEvent) => void) => () => void
@@ -112,6 +124,30 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
   // when they are strictly newer, which covers an update that landed before the subscription did.
   const latestRef = useRef<Latest>(toLatest(state as unknown as Record<string, unknown>))
   if ((state.rev || 0) > latestRef.current.rev) latestRef.current = toLatest(state as unknown as Record<string, unknown>)
+  // What the app is told this room is called. Kept the same two ways as the state: from the socket
+  // as it arrives, and from props on every render. It is read when the app says hello, and the
+  // update that carries it reaches this socket just before the server confirms the join — so it is
+  // here before the frame is.
+  const roomRef = useRef<BridgeRoom | null>(null)
+  roomRef.current = bridgeRoom(state.roomKey)
+
+  // Which frame this app gets. Worked out from the run's own url and kind, which never change
+  // while this component lives (the parent keys it by run), so every render arrives at the same
+  // strings and the iframe below is never given a new src or sandbox.
+  //   - a bundle: the server's own /app-bundles/<dir>/ path, in the opaque sandbox;
+  //   - a hosted app: its own address plus lanparty=1, on its real origin — unless that origin is
+  //     LAN Party's, in which case there is no frame at all (see hostedAppFrame).
+  const hosted = state.hosted === true
+  const hostedFrame = hosted ? hostedAppFrame(state.url, [resolveSrc('/')]) : null
+  // The url comes from the server's own database row, but it is about to become an iframe src, so
+  // it is checked for the one shape it can legitimately have.
+  const src = hostedFrame
+    ? (hostedFrame.ok ? hostedFrame.src : '')
+    : typeof state.url === 'string' && /^\/app-bundles\/[A-Za-z0-9_-]+\/$/.test(state.url) ? resolveSrc(state.url) : ''
+  // undefined for a bundle: its frame has no origin, and the bridge then goes by the window alone.
+  const frameOrigin = hostedFrame ? (hostedFrame.ok ? hostedFrame.origin : '') : undefined
+  // The real-origin sandbox only ever goes with a src that hostedAppFrame() passed.
+  const realOrigin = !!hostedFrame && hostedFrame.ok
 
   const setPhaseNow = useCallback((next: 'card' | 'joining' | 'joined') => { phaseRef.current = next; setPhase(next) }, [])
 
@@ -180,6 +216,7 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
     const a = event.activity
     if (!isRecord(a) || a.type !== 'app' || !isRecord(a.state) || a.state.run !== run) return
     latestRef.current = toLatest(a.state)
+    roomRef.current = bridgeRoom(a.state.roomKey)
     bridgeRef.current?.pushState(latestRef.current.shared, latestRef.current.rev, latestRef.current.lastBy)
   }), [subscribe, run, dropOut])
 
@@ -200,7 +237,9 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
     if (phase !== 'joined') return undefined
     const bridge = createAppBridge({
       getFrameWindow: () => frameRef.current?.contentWindow ?? null,
-      getSnapshot: () => ({ ...peopleRef.current, shared: latestRef.current.shared, rev: latestRef.current.rev }),
+      getSnapshot: () => ({ ...peopleRef.current, shared: latestRef.current.shared, rev: latestRef.current.rev, room: roomRef.current }),
+      // A hosted app is spoken to at its own origin and nowhere else, and only heard from there.
+      frameOrigin,
       transport: {
         // Fixed event kinds: the app supplies the payload and nothing else.
         change: (kind, value, done) => {
@@ -220,7 +259,7 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
       bridge.destroy()
       if (bridgeRef.current === bridge) bridgeRef.current = null
     }
-  }, [phase, send, dropOut])
+  }, [phase, send, dropOut, frameOrigin])
 
   // After every render, pass on anything the socket path has not already sent: a state that only
   // reached this component as props, and the participant list (which needs names resolved to
@@ -234,9 +273,6 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
     bridge.pushParticipants(peopleRef.current.participants)
   })
 
-  // The url comes from the server's own database row, but it is about to become an iframe src, so
-  // it is checked for the one shape it can legitimately have.
-  const src = typeof state.url === 'string' && /^\/app-bundles\/[A-Za-z0-9_-]+\/$/.test(state.url) ? resolveSrc(state.url) : ''
   const name = state.name || 'App'
   // Anything but an explicit yes from the server is treated as not approved.
   const unapproved = state.approved !== true
@@ -265,8 +301,8 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
             className="app-activity-frame"
             title={name}
             src={src}
-            sandbox={APP_FRAME_SANDBOX}
-            allow={APP_FRAME_ALLOW}
+            sandbox={realOrigin ? HOSTED_FRAME_SANDBOX : APP_FRAME_SANDBOX}
+            allow={realOrigin ? HOSTED_FRAME_ALLOW : APP_FRAME_ALLOW}
             referrerPolicy="no-referrer"
             allowFullScreen
           />
@@ -289,9 +325,11 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
               </div>
               {src
                 ? <button type="button" className="app-activity-join" onClick={join} disabled={phase !== 'card'}>{phase === 'card' ? 'Join' : 'Joining…'}</button>
-                : <div className="composer-error">This app can’t be opened.</div>}
+                : <div className="composer-error">{hostedFrame && !hostedFrame.ok && hostedFrame.problem === 'own-origin' ? 'This app’s address is LAN Party’s own, so it can’t run inside it.' : 'This app can’t be opened.'}</div>}
               {error && <div className="composer-error" role="alert">{error}</div>}
-              <div className="app-activity-note">Community-uploaded app. It runs in a sandbox and only sees your name and avatar.</div>
+              {hostedFrame
+                ? <div className="app-activity-note">Community app on its own website{hostedFrame.ok ? <> (<b>{hostedFrame.host}</b>)</> : ''}, not in LAN Party’s sandbox. LAN Party tells it your name and avatar; what you do or type inside it goes to that site.</div>
+                : <div className="app-activity-note">Community-uploaded app. It runs in a sandbox and only sees your name and avatar.</div>}
             </div>
           </div>
         )}

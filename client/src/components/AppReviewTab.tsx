@@ -2,7 +2,7 @@
 // what is already published, and the rest. Showing it grants nothing — the server checks who is
 // asking on every one of these actions.
 import {
-  AppIcon, OpenAppControl, RowButton, StatusChip, formatWhen, safeLinkUrl, statusOf,
+  AppIcon, OpenAppControl, RowButton, StatusChip, formatWhen, isBundleApp, runsInside, safeLinkUrl, statusOf,
   type AppDialogKind, type DirectoryApp,
 } from './AppDirectoryParts'
 
@@ -11,14 +11,15 @@ interface ReviewTabProps {
   apps: DirectoryApp[]
   busyKey: string | null
   resolveSrc: (url: string) => string
-  /** The uploader replaced this bundle after the reviewer opened it: its files are not the ones seen. */
-  replacedSinceOpened: (app: DirectoryApp) => boolean
+  /** The uploader changed this app after the reviewer opened it — replaced the bundle, or edited a
+   *  link's address or whether it runs inside LAN Party: it is not what was seen. */
+  changedSinceOpened: (app: DirectoryApp) => boolean
   onOpenApp: (app: DirectoryApp) => void
   onAction: (app: DirectoryApp, action: 'approve') => void
   onDialog: (kind: AppDialogKind, app: DirectoryApp) => void
 }
 
-export default function AppReviewTab({ apps, busyKey, resolveSrc, replacedSinceOpened, onOpenApp, onAction, onDialog }: ReviewTabProps) {
+export default function AppReviewTab({ apps, busyKey, resolveSrc, changedSinceOpened, onOpenApp, onAction, onDialog }: ReviewTabProps) {
   // Longest-waiting first: the queue is worked from the top.
   const pending = apps.filter((a) => statusOf(a) === 'pending').sort((a, b) => (a.submittedAt || 0) - (b.submittedAt || 0))
   const published = apps.filter((a) => statusOf(a) === 'published')
@@ -28,8 +29,13 @@ export default function AppReviewTab({ apps, busyKey, resolveSrc, replacedSinceO
     const status = statusOf(app)
     const busy = !!busyKey && busyKey.startsWith(`${app.id}:`)
     const link = safeLinkUrl(app.url)
-    // The server refuses to publish files other than the ones opened; this says so before the click.
-    const swapped = status !== 'published' && replacedSinceOpened(app)
+    const bundle = isBundleApp(app)
+    // The server refuses to publish anything other than what was opened; this says so before the
+    // click. An app that can still be opened here has to be opened again first. One that cannot (it
+    // was switched to a plain link) has nothing to open: its row is the whole of it, so the change
+    // is pointed out and the decision left to the reviewer.
+    const changed = status !== 'published' && changedSinceOpened(app)
+    const swapped = changed && runsInside(app)
     return (
       <div className="app-row" key={app.id}>
         <AppIcon app={app} resolveSrc={resolveSrc} />
@@ -44,8 +50,16 @@ export default function AppReviewTab({ apps, busyKey, resolveSrc, replacedSinceO
             {status !== 'pending' && app.reviewedBy ? ` · last decided by ${app.reviewedBy}${app.reviewedAt ? `, ${formatWhen(app.reviewedAt)}` : ''}` : ''}
           </div>
           <div className="app-row-desc app-row-desc-full">{app.description || <i>No description.</i>}</div>
-          {app.embeddable ? (
+          {bundle ? (
             <div className="app-row-kindline"><b>Uploaded bundle</b> — hosted by this server, runs in the sandbox.</div>
+          ) : app.hosted ? (
+            // What is being approved here is an address AND that it is framed. The site stays its
+            // owner's: nothing in a review can pin what it serves tomorrow, and the row says so.
+            <div className="app-row-kindline">
+              <b>Hosted app</b> — a site on its own server that runs inside LAN Party, framed from: <span className="app-row-url">{app.url || '(no address given)'}</span>
+              <br />
+              It runs as that site, not in the sandbox: it keeps its own storage and talks to its own server, it is told the name and avatar of whoever opens it, and its owner can change what it serves without it coming back here.
+            </div>
           ) : (
             // The address in full, as text: what a reviewer approves is where the link goes.
             <div className="app-row-kindline">
@@ -54,10 +68,11 @@ export default function AppReviewTab({ apps, busyKey, resolveSrc, replacedSinceO
             </div>
           )}
           {status === 'rejected' && <div className="app-row-note"><b>Note to the uploader:</b> {app.reviewNote || 'none.'}</div>}
-          {swapped && <div className="app-row-note" role="status"><b>The bundle was replaced after you opened it.</b> What you looked at is not what would be published. Open it again before you decide.</div>}
+          {swapped && <div className="app-row-note" role="status"><b>{bundle ? 'The bundle was replaced after you opened it.' : 'The address of this app was changed after you opened it.'}</b> What you looked at is not what would be published. Open it again before you decide.</div>}
+          {changed && !swapped && <div className="app-row-note" role="status"><b>This app was changed after you opened it.</b> It no longer runs inside LAN Party: it is now a plain link to the address above, which is what would be published.</div>}
           <div className="app-row-actions">
             <OpenAppControl app={app} onOpenApp={onOpenApp} label="Open to test" />
-            {status !== 'published' && <RowButton tone="primary" onClick={() => onAction(app, 'approve')} disabled={busy || swapped} title={swapped ? 'Open the new files first' : undefined}>{status === 'pending' ? 'Approve' : 'Publish'}</RowButton>}
+            {status !== 'published' && <RowButton tone="primary" onClick={() => onAction(app, 'approve')} disabled={busy || swapped} title={swapped ? 'Open it again first' : undefined}>{status === 'pending' ? 'Approve' : 'Publish'}</RowButton>}
             {status === 'published' && <RowButton onClick={() => onDialog('unpublish', app)} disabled={busy}>Unpublish</RowButton>}
             {(status === 'pending' || status === 'published') && <RowButton tone="danger" onClick={() => onDialog('reject', app)} disabled={busy}>Reject…</RowButton>}
             <RowButton tone="danger" onClick={() => onDialog('delete', app)} disabled={busy}>Delete</RowButton>

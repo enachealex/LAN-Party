@@ -15,6 +15,8 @@ const vaultline = require('./vaultline');
 const { feedbackInput, inviteInput, inviteLinkInput, pushSubscribeInput, pushUnsubscribeInput, validate } = require('./validation');
 const { migrate } = require('./db/schema');
 const { createActivities } = require('./services/activities');
+const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl, createAppRoomKeys, appFrameOrigin } = require('./services/hostedApps');
+const { userFileStatic, FRAME_ANCESTORS_SELF, frameAncestorsDirective, GIF_TYPES, SOUND_TYPES, SOUND_EXTENSIONS, ENTRANCE_TYPES, ENTRANCE_EXTENSIONS, FEEDBACK_IMAGE_TYPES, storedExtension } = require('./services/userFiles');
 const { createMessages } = require('./services/messages');
 const { createSfu } = require('./services/sfu');
 const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./services/push');
@@ -50,6 +52,9 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const CLIENT_DIST = process.env.CLIENT_DIST || path.join(__dirname, '..', 'client', 'dist');
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
 const corsOrigin = CLIENT_ORIGIN === '*' ? '*' : CLIENT_ORIGIN.split(',').map((s) => s.trim());
+// The origins this instance is configured to be served from. A hosted app may never be on one of
+// them (services/hostedApps.js); '*' names none, and then only the request itself says where we are.
+const ownOrigins = corsOrigin === '*' ? [] : corsOrigin.filter(Boolean);
 const MAX_UPLOAD_SIZE = 100 * 1024 * 1024;
 const FILE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // uploads are deleted 7 days after upload
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // sweep hourly
@@ -111,6 +116,21 @@ function isStrongPassword(pw) {
 async function main() {
   const app = express();
   app.set('trust proxy', 1); // we sit behind an HTTPS reverse proxy in production
+  // Nothing but LAN Party itself (and the client origins it is configured with) may frame a LAN
+  // Party page: a page that framed it could dress it up and get clicks it never meant to give.
+  // Every response carries it; the routes that send a CSP of their own (/app-bundles, the uploaded
+  // file mounts) repeat the directive in it, because a second CSP header there would be a second
+  // policy, not a merged one. X-Frame-Options is for browsers that predate frame-ancestors; any
+  // browser that knows frame-ancestors ignores it.
+  // Nothing frames LAN Party from another origin today: the desktop app and the Android app load
+  // it as a top-level page, and Vault Player only talks to LAN Party's API server-to-server and is
+  // itself what LAN Party embeds, never the other way round (docs/VAULT-PLAYER-INTEGRATION.md).
+  const FRAME_ANCESTORS = frameAncestorsDirective(ownOrigins);
+  app.use((req, res, next) => {
+    res.setHeader('Content-Security-Policy', FRAME_ANCESTORS);
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    next();
+  });
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const uploadDir = path.join(DATA_DIR, 'uploads');
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -157,42 +177,38 @@ async function main() {
     limits: { fileSize: MAX_UPLOAD_SIZE },
   });
 
-  // Separate storage for the persistent GIF library (not subject to upload expiry).
-  const gifUpload = multer({
+  // The libraries below keep their files for good and serve them from this origin, so the name a
+  // file is stored under is never the client's: a generated stem, and an extension from the type
+  // that was accepted (services/userFiles.js). A type outside the list is refused before anything
+  // is written. The client's filename is only ever consulted as a fallback key into that same list.
+  /**
+   * @param {string} dir
+   * @param {Readonly<Record<string, string>>} types
+   * @param {Readonly<Record<string, string>>} extensions
+   * @param {string | null} refusal the error for a type outside the list; null drops the file quietly
+   * @param {number} maxBytes
+   */
+  const libraryUpload = (dir, types, extensions, refusal, maxBytes) => multer({
     storage: multer.diskStorage({
-      destination: (_req, _file, cb) => cb(null, gifsDir),
-      filename: (_req, file, cb) => {
-        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
-      },
+      destination: (_req, _file, cb) => cb(null, dir),
+      filename: (_req, file, cb) => cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${storedExtension(file, types, extensions)}`),
     }),
-    limits: { fileSize: MAX_UPLOAD_SIZE },
+    limits: { fileSize: maxBytes },
+    fileFilter: (_req, file, cb) => {
+      if (storedExtension(file, types, extensions)) return cb(null, true);
+      return refusal ? cb(new Error(refusal)) : cb(null, false);
+    },
   });
 
+  // Separate storage for the persistent GIF library (not subject to upload expiry).
+  const gifUpload = libraryUpload(gifsDir, GIF_TYPES, {}, 'Only GIF, PNG, JPEG, WebP or AVIF images can be added to the GIF library', MAX_UPLOAD_SIZE);
+
   // Persistent storage for soundboard clips.
-  const soundUpload = multer({
-    storage: multer.diskStorage({
-      destination: (_req, _file, cb) => cb(null, soundsDir),
-      filename: (_req, file, cb) => {
-        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
-      },
-    }),
-    limits: { fileSize: MAX_UPLOAD_SIZE },
-  });
+  const soundUpload = libraryUpload(soundsDir, SOUND_TYPES, SOUND_EXTENSIONS, 'Only audio files (MP3, WAV, Ogg, Opus, WebM, AAC, M4A or FLAC) can be added to the soundboard', MAX_UPLOAD_SIZE);
 
   // Voice-chat entrance clips: a few seconds of recorded audio, so the cap is small.
   const ENTRANCE_MAX_BYTES = 2 * 1024 * 1024;
-  const entranceUpload = multer({
-    storage: multer.diskStorage({
-      destination: (_req, _file, cb) => cb(null, entrancesDir),
-      filename: (_req, file, cb) => {
-        const ext = (path.extname(file.originalname || '').match(/^\.[a-zA-Z0-9]{1,5}$/) || ['.webm'])[0];
-        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`);
-      },
-    }),
-    limits: { fileSize: ENTRANCE_MAX_BYTES },
-  });
+  const entranceUpload = libraryUpload(entrancesDir, ENTRANCE_TYPES, ENTRANCE_EXTENSIONS, 'Entrance clip must be an audio recording', ENTRANCE_MAX_BYTES);
 
   // Rail tile images. The client crops to a square and re-encodes before uploading, so what arrives
   // is a ~20KB thumbnail; the cap is generous only to leave room for a PNG fallback from an old
@@ -228,18 +244,9 @@ async function main() {
     fileFilter: (_req, file, cb) => cb(null, Object.hasOwn(AVATAR_TYPES, file.mimetype || '')),
   });
 
-  // Screenshots on feedback/bug reports — images only, capped at 15 MB, stored persistently.
-  const feedbackUpload = multer({
-    storage: multer.diskStorage({
-      destination: (_req, _file, cb) => cb(null, feedbackDir),
-      filename: (_req, file, cb) => {
-        const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
-      },
-    }),
-    limits: { fileSize: 15 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => cb(null, /^image\//.test(file.mimetype || '')),
-  });
+  // Screenshots on feedback/bug reports — raster images only, capped at 15 MB, stored persistently.
+  // Anything else is dropped without failing the report, as a non-image always was.
+  const feedbackUpload = libraryUpload(feedbackDir, FEEDBACK_IMAGE_TYPES, {}, null, 15 * 1024 * 1024);
 
   // Mini-app bundle uploads (a single .html or a .zip). In memory so the extractor can validate the
   // archive before anything touches disk; capped at 15 MB compressed.
@@ -286,12 +293,15 @@ async function main() {
     }
     res.json({ iceServers });
   });
-  app.use('/uploads', express.static(uploadDir));
+  // Everything people upload is served through userFileStatic (services/userFiles.js): nosniff, a
+  // scriptless sandbox CSP, and anything that is not media or plain text sent as a download, so no
+  // uploaded file is ever a live page on this origin.
+  app.use('/uploads', userFileStatic(uploadDir, FRAME_ANCESTORS));
   // redirect:false so a bare `GET /gifs` isn't turned into a directory redirect,
   // letting it fall through to the GIF-list API route below.
-  app.use('/gifs', express.static(gifsDir, { redirect: false }));
-  app.use('/sounds', express.static(soundsDir, { redirect: false }));
-  app.use('/entrances', express.static(entrancesDir, { redirect: false }));
+  app.use('/gifs', userFileStatic(gifsDir, FRAME_ANCESTORS, { redirect: false }));
+  app.use('/sounds', userFileStatic(soundsDir, FRAME_ANCESTORS, { redirect: false }));
+  app.use('/entrances', userFileStatic(entrancesDir, FRAME_ANCESTORS, { redirect: false }));
   // Terminal for this mount: a deleted/missing clip must 404 rather than fall through to the SPA
   // catch-all, which would hand an <audio> element the client's HTML with a 200.
   app.use('/entrances', (req, res) => res.status(404).type('txt').send('Not found'));
@@ -309,13 +319,16 @@ async function main() {
   // the worst case.
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
-  app.use('/feedback-media', express.static(feedbackDir, { redirect: false }));
+  app.use('/feedback-media', userFileStatic(feedbackDir, FRAME_ANCESTORS, { redirect: false }));
   // Uploaded mini-apps. The CSP `sandbox` directive (WITHOUT allow-same-origin) forces every bundle
   // document into an OPAQUE origin — so its JS can't read LAN Party cookies/localStorage or call the
   // API with the user's session, whether it's loaded in the embed iframe OR opened directly. This
   // header is the core isolation for running user-uploaded code on our own origin.
+  // frame-ancestors is repeated in the same header (one policy, both directives): 'self' is the
+  // origin of the bundle's url, not the opaque origin the sandbox gives the document, so LAN Party
+  // can still frame its own bundles and nobody else can.
   app.use('/app-bundles', (req, res, next) => {
-    res.setHeader('Content-Security-Policy', "sandbox allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock");
+    res.setHeader('Content-Security-Policy', `sandbox allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock; ${FRAME_ANCESTORS}`);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     next();
   }, express.static(appBundlesDir, { redirect: false, index: 'index.html', dotfiles: 'ignore' }));
@@ -454,10 +467,15 @@ async function main() {
     ACTIVITY_TYPES, activityInit, applyActivityEvent, activityViewFor, broadcastActivity,
     APP_ACTIVITY, appActivityInit, applyAppEvent, appLeave, appJoinedSockets, appEventAllowed, forgetAppSocket,
   } = createActivities({ io, clients });
+  // What an app is told in place of "which voice channel is this" (services/hostedApps.js). Keyed
+  // from JWT_SECRET under its own label: no new secret to keep, and nothing learned from a room key
+  // helps with a session token or the other way round.
+  const appRoomKey = createAppRoomKeys(JWT_SECRET);
   // An app that is deleted while a room is running it: end it there. The bundle's files are about to
   // go, and a room left pointing at them would offer everyone a "Join" that opens a 404.
   // The same goes for one that is rejected or unpublished (the room would keep running an app that
-  // is no longer everyone's to start) or has its bundle replaced (the files it points at are going).
+  // is no longer everyone's to start), has its bundle replaced (the files it points at are going),
+  // or is a hosted app whose address or "run inside" setting was edited (the room is on the old one).
   function endAppActivities(appId) {
     for (const [room, act] of Object.entries(activities)) {
       if (act.type !== APP_ACTIVITY || act.state.appId !== appId) continue;
@@ -1192,10 +1210,10 @@ async function main() {
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins });
 
   // Tenor / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
-  registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET });
+  registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins });
 
   // Presence / friends / direct messages (routes/social.js).
   registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push });
@@ -1240,16 +1258,20 @@ async function main() {
         if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Screenshot is larger than 15 MB' });
         return res.status(400).json({ error: err.message || 'Upload failed' });
       }
+      // The screenshot is written before the rest of the form is read. A report that is then turned
+      // down never links to it, so it would sit in a public folder for good: it goes again instead.
+      let kept = false;
+      const discardScreenshot = () => { if (req.file && !kept) fs.promises.unlink(req.file.path).catch(() => {}); };
       try {
         const username = req.user.username;
         const input = validate(feedbackInput, req.body);
-        if (!input.ok) return res.status(400).json({ error: input.error });
+        if (!input.ok) { discardScreenshot(); return res.status(400).json({ error: input.error }); }
         const { type, message: rawMessage } = input.data;
         const userTitle = input.data.title || '';
 
         const userRow = await db.get('SELECT email FROM users WHERE username = ?', username);
         const email = userRow && userRow.email;
-        if (!email) return res.status(400).json({ error: 'Your account has no email on file' });
+        if (!email) { discardScreenshot(); return res.status(400).json({ error: 'Your account has no email on file' }); }
 
         // Parse client diagnostics (best-effort; never trust it for anything security-sensitive).
         let diag = {};
@@ -1283,6 +1305,7 @@ async function main() {
            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
           username, email, type, title, rawMessage, JSON.stringify(diag), screenshotUrl, now
         );
+        kept = true; // the stored report links to it from here on, whatever happens upstream
         const rowId = ins.lastID;
 
         if (!vaultline.isConfigured()) {
@@ -1303,6 +1326,7 @@ async function main() {
         }
       } catch (e) {
         console.error('[feedback] error:', e);
+        discardScreenshot();
         return res.status(500).json({ error: 'Server error' });
       }
     });
@@ -1692,9 +1716,19 @@ async function main() {
         // and acting on it: a reject or unpublish landing in between would otherwise have ended the
         // app's rooms just before this one started it.
         const starterIsOwner = await isInstanceOwner(socketUser);
-        const row = await db.get("SELECT id, name, icon_url, created_by, bundle_dir, status FROM apps WHERE id = ? AND kind = 'bundle' AND bundle_dir IS NOT NULL AND bundle_dir != ''", appId);
+        const row = await db.get("SELECT id, name, url, icon_url, created_by, COALESCE(kind, 'link') AS kind, bundle_dir, embed, status FROM apps WHERE id = ?", appId);
         // Re-checked after the await: they may have left the room while the query ran.
         if (!row || !socket.rooms.has(room)) return;
+        // Two kinds of app can run in a room: an uploaded bundle, and a hosted app (a link set to
+        // run inside LAN Party). A plain link cannot; it only ever opens in a new tab.
+        // A hosted app's address was checked when it was saved. It is checked once more against
+        // where THIS socket reached the server, which may be a name that request never saw: a room
+        // must not be pointed at a frame on LAN Party's own origin, however the row came to be.
+        const isBundle = row.kind === 'bundle' && !!row.bundle_dir;
+        const handshake = socket.handshake.headers;
+        if (!isBundle && !(isHostedApp(row) && checkHostedUrl(row.url, ownHostKeys(handshake, ownOrigins), { loopback: servedFromLoopback(handshake) }).ok)) return;
+        const frameOrigin = appFrameOrigin(row);
+        if (!frameOrigin) return;
         // A published app is anyone's to start. One still on its way there (draft, or waiting for
         // review) can be started by its uploader, to try it with real people, or by an instance
         // owner, to review it; the room is told it is unapproved (state.approved) and each person
@@ -1705,7 +1739,8 @@ async function main() {
         // rule here would only look like a ban. Deleting the app is how an owner removes it.
         const ownDraft = (row.status === 'draft' || row.status === 'pending') && !!socketUser && (row.created_by === socketUser || starterIsOwner);
         if (row.status !== 'published' && !ownDraft) return;
-        const act = { type: APP_ACTIVITY, state: appActivityInit(row), by: appName() };
+        // Bound to the site the frame is on as well as to the channel (services/hostedApps.js).
+        const act = { type: APP_ACTIVITY, state: appActivityInit(row, appRoomKey(row.id, frameOrigin, serverId, channelId)), by: appName() };
         activities[room] = act;
         // Whoever starts it has already chosen to run it, so they are joined from the first update.
         applyAppEvent(act, { kind: 'join' }, appName(), socket.id);
@@ -1969,6 +2004,18 @@ async function main() {
       return next();
     });
   }
+  // Nothing matched. Answered here rather than by Express's built-in 404, which replaces the
+  // Content-Security-Policy set at the top with one of its own and so drops frame-ancestors.
+  app.use((req, res) => res.status(404).type('txt').send('Not found'));
+  // The same for an error nothing else answered (a body too large for the JSON parser, a throw in a
+  // route): the status Express would have sent, as plain text, with the headers set above intact.
+  app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    const asked = Number(err && (err.status || err.statusCode));
+    const status = asked >= 400 && asked < 600 ? asked : 500;
+    if (status >= 500) console.error(err);
+    res.status(status).type('txt').send(http.STATUS_CODES[status] || 'Error');
+  });
 
   // Log the port actually bound, not the one requested: with PORT=0 the OS picks one, and the tests
   // read this line to find the server they just started. In production PORT is set, so this prints

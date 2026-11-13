@@ -856,7 +856,13 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .app-bundle-pick{text-align:left;padding:12px 14px;border-radius:10px;border:1px dashed rgba(255,255,255,.25);background:rgba(255,255,255,.04);color:var(--text);cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .app-bundle-pick:hover{border-color:var(--accent-end);background:rgba(255,255,255,.06)}
 .app-bundle-hint{font-size:12px;color:var(--muted);line-height:1.5}
-.app-bundle-hint code{background:rgba(255,255,255,.08);border-radius:4px;padding:1px 5px;font-size:11px}
+.app-bundle-hint code{background:rgba(255,255,255,.08);border-radius:4px;padding:1px 5px;font-size:11px;overflow-wrap:anywhere}
+/* "Run inside LAN Party" on a link app: in the upload form and in the edit dialog. */
+.app-embed-toggle{display:flex;align-items:center;gap:8px;align-self:flex-start;margin-top:6px;font-size:13px;font-weight:700;color:var(--text);cursor:pointer}
+.app-embed-toggle input{width:16px;height:16px;margin:0;accent-color:var(--accent-end);cursor:pointer}
+/* A hosted app's card in Browse has two ways in: the viewer, and the site itself in a new tab. */
+.app-card-actions{display:inline-flex;align-items:center;gap:10px;flex:none}
+.app-card-newtab{font-weight:600;color:var(--muted)}
 /* App Directory: Developer and Review tabs. A row per app (icon, text, a wrapping line of actions)
    rather than the Browse grid's cards: these carry a status, a reviewer's note and up to seven
    actions, which a half-width card cannot hold. */
@@ -919,6 +925,8 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .app-dir-dialog .prompt-title{overflow-wrap:anywhere}
 .app-dir-dialog-text{margin:0 0 12px;font-size:13.5px;line-height:1.5;color:#c9d5e2;overflow-wrap:anywhere}
 .app-dir-dialog-fine{margin:10px 0 0;font-size:12px;color:#9fb0bf}
+/* The same fine print once it is about to apply: the edit being made will reset the app's review. */
+.app-dir-dialog-warn{padding:8px 10px;border-radius:8px;background:rgba(247,183,49,.1);border:1px solid rgba(247,183,49,.35);color:var(--text)}
 .app-dir-dialog-area{resize:vertical;min-height:72px;font-family:inherit;line-height:1.4}
 .app-dir-dialog-count{margin-top:4px;text-align:right;font-size:11px;color:#9fb0bf}
 .app-dir-dialog-gap{margin-top:12px}
@@ -942,6 +950,9 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .app-viewer-btn:hover{background:rgba(255,255,255,.1)}
 .app-viewer-close{width:34px;padding:7px 0;text-align:center}
 .app-viewer-frame{flex:1;width:100%;border:none;background:#fff}
+/* Shown in place of the frame for a hosted app that must not be framed (its address is ours). */
+.app-viewer-blocked{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:24px;text-align:center;color:var(--text);font-size:14px;line-height:1.5}
+.app-viewer-blocked span{max-width:460px;color:var(--muted);font-size:13px}
 /* Sound settings (Appearance tab) */
 .sound-settings-row{display:flex;align-items:center;gap:12px;margin-top:12px}
 .sound-settings-row.disabled{opacity:.45}

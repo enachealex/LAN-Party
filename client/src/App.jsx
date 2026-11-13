@@ -27,6 +27,7 @@ import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
 import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
 import { findNewerBuild, alreadyReloadedFor, reloadForBuild } from './appUpdate'
+import { hostedAppFrame } from './appBridge'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
 import MicTest from './components/MicTest'
@@ -5024,8 +5025,9 @@ export default function App() {
     descriptionFor: (appId) => publicApps.find((a) => a.id === appId)?.description || '',
   }
   // What this person may start in a room, which is what the server will accept: any published
-  // bundle; their own while it is a draft or in review; and, for an instance owner, anyone's that
-  // is waiting for review (to try it with people before deciding). Never a rejected one.
+  // bundle (`embeddable`) or hosted app (`hosted`); a plain link only opens in a tab. Their
+  // own while it is a draft or in review; and, for an instance owner, anyone's that is waiting for
+  // review (to try it with people before deciding). Never a rejected one.
   const appLaunchNote = (a) => {
     const status = a.status || 'published'
     if (status === 'published') return ''
@@ -5033,7 +5035,9 @@ export default function App() {
     if (a.createdBy === name) return status === 'draft' ? 'Draft — only you can start this' : 'In review — only you can start this'
     return instanceOwner && status === 'pending' ? `In review — by ${a.createdBy || 'someone'}, not approved yet` : null
   }
-  const launchableApps = publicApps.filter((a) => a.embeddable && appLaunchNote(a) !== null)
+  // A hosted app this client would refuse to frame (its address is LAN Party's own) is not offered:
+  // starting it would only put a card in the room that nobody can open.
+  const launchableApps = publicApps.filter((a) => (a.hosted ? hostedAppFrame(a.url, [emojiSrc('/')]).ok : a.embeddable) && appLaunchNote(a) !== null)
   const closeActivity = () => { socketRef.current?.emit('activity:stop', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1' }) }
 
   // Keyboard shortcuts on the pre-join dialog: Esc cancels, Enter joins.
@@ -5677,8 +5681,10 @@ export default function App() {
   // ---- Picking up a new deploy without being relaunched ----
   // Reloading is only done on the user's behalf when it costs them nothing: no call or activity to
   // drop, nothing half-typed or half-uploaded, no dialog mid-edit. Anything else gets the bar instead.
+  // An app open on its own in the viewer counts too: a reload would throw away whatever is in it (a
+  // game in progress, a hosted site's unsaved form) just as surely as it would end a room's activity.
   busyForReloadRef.current = Boolean(
-    inVoice || call || activity || uploadingFile || promptModal || editingProfile || editingSettings ||
+    inVoice || call || activity || viewerApp || uploadingFile || promptModal || editingProfile || editingSettings ||
     text.trim() || composerStack.length
   )
   useEffect(() => {
@@ -8858,7 +8864,8 @@ export default function App() {
         resolveSrc={emojiSrc}
       />
 
-      {/* Sandboxed viewer for embedded (uploaded) mini-apps. Opened from the directory, it sits
+      {/* Viewer for apps that run inside LAN Party: uploaded mini-apps (sandboxed) and hosted apps
+          (framed from their own site). Opened from the directory, it sits
           under that modal, so the directory steps aside for it and comes back when it closes. */}
       <AppViewer
         app={viewerApp}

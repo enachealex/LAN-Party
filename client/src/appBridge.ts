@@ -10,9 +10,15 @@
 //   - the app picks payloads, never destinations: its three message types map onto three fixed
 //     activity events, and the room they go to is whichever one the host is in;
 //   - nothing that arrives is rendered. It is only passed on as data.
-// In the other direction the frame is sent four things and nothing else: the viewer's public
-// identity, the public identities of the people who joined, the app's own shared state, and the
-// app's own transient messages.
+// In the other direction the frame is sent five things and nothing else: the viewer's public
+// identity, the public identities of the people who joined, the app's own opaque id for the voice
+// channel it is running in, the app's own shared state, and the app's own transient messages.
+//
+// A HOSTED app (a link app set to run inside LAN Party) is somebody's site on its own server, and
+// its frame is on that site's real origin. Everything above still holds for it, and two things are
+// tighter, because this frame does have an origin that can be named: messages are posted to that
+// exact origin, never '*', and one is accepted only when it came from the iframe's window AND from
+// that origin. See hostedAppFrame() for the rule that makes a real-origin frame safe to have.
 
 /** The sandbox for every uploaded app frame. No allow-same-origin, ever: that is what keeps the
  *  app in an opaque origin, away from LAN Party's cookies, storage and API. The server sends the
@@ -20,6 +26,65 @@
 export const APP_FRAME_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock'
 /** Opt-in device features games tend to want. Nothing here exposes the camera or microphone. */
 export const APP_FRAME_ALLOW = 'fullscreen; gamepad; autoplay'
+
+/** The sandbox for a hosted app's frame. allow-same-origin is here because the site needs to be
+ *  itself: its own cookies, storage and backend. Next to allow-scripts that is safe for ONE reason
+ *  only — the frame's origin is not this page's. A frame that is same-origin with the page around
+ *  it and has both flags can reach up, take its own sandbox off and read the session. So this
+ *  string is never put on a frame except through hostedAppFrame(), which refuses our own origin.
+ *  No allow-top-navigation: a hosted site cannot take the LAN Party window somewhere else. */
+export const HOSTED_FRAME_SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock'
+/** What a hosted app's frame is granted: enough to play media. Still no camera or microphone. */
+export const HOSTED_FRAME_ALLOW = 'autoplay; encrypted-media; fullscreen; gamepad'
+/** Added to a hosted app's address as `lanparty=1`, so the site knows to try the bridge. It is the
+ *  only thing LAN Party ever puts in the url: no name, no token, no room. */
+export const HOSTED_APP_PARAM = 'lanparty'
+// Plain http is allowed for an app on these hosts, and only while this page is itself on a loopback
+// address: a developer running LAN Party and their app on one machine. On a real instance an
+// http://localhost address would frame whatever each viewer happens to run on their own computer.
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1'])
+const LOOPBACK_PAGE_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+const pageIsLoopback = () => LOOPBACK_PAGE_HOSTS.has(window.location.hostname)
+// Scheme, host and port, with "example.com." read as "example.com": the browser calls those two
+// origins, but they are one machine, and this comparison errs towards refusing.
+const originKey = (u: URL) => `${u.protocol}//${u.hostname.replace(/\.+$/, '')}:${u.port}`
+
+export type HostedFrame =
+  /** `src` is the address with lanparty=1 added; `origin` is what the bridge posts to and checks. */
+  | { ok: true; src: string; origin: string; host: string }
+  | { ok: false; problem: 'invalid' | 'own-origin' }
+
+/**
+ * What to put in the iframe for a hosted app, or why there must not be one.
+ *
+ * The server checked the address when it was saved, published and started. This is the client's
+ * own, independent answer, asked at the moment a frame is about to exist: the server cannot always
+ * know the name this page was reached by (a proxy may rewrite it), and the page always does.
+ * `ownAddresses` are other places this LAN Party is served from, as far as the caller knows — the
+ * API server's address, when the client runs on a different one.
+ */
+export function hostedAppFrame(url: unknown, ownAddresses: string[] = []): HostedFrame {
+  const invalid = { ok: false, problem: 'invalid' } as const
+  if (typeof url !== 'string' || url.length > MAX_URL_LENGTH) return invalid
+  // As typed, with nothing for the parser to quietly repair: a scheme, two slashes, a host.
+  // eslint-disable-next-line no-control-regex
+  if (/[\s\\\u0000-\u001f\u007f]/.test(url) || !/^https?:\/\/[^/?#]/i.test(url)) return invalid
+  let u: URL
+  try { u = new URL(url) } catch { return invalid }
+  const host = u.hostname.replace(/\.+$/, '')
+  if (!host || u.username || u.password) return invalid
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOOPBACK_HOSTS.has(host) && pageIsLoopback())) return invalid
+  const own = new Set<string>()
+  for (const address of [window.location.href, ...ownAddresses]) {
+    try { own.add(originKey(new URL(address, window.location.href))) } catch { /* names nothing */ }
+  }
+  if (own.has(originKey(u))) return { ok: false, problem: 'own-origin' }
+  // Added to whatever query the address already has, which is left exactly as it was written.
+  const flag = u.searchParams.get(HOSTED_APP_PARAM)
+  if (flag === null) u.search = u.search ? `${u.search}&${HOSTED_APP_PARAM}=1` : `?${HOSTED_APP_PARAM}=1`
+  else if (flag !== '1') u.searchParams.set(HOSTED_APP_PARAM, '1')
+  return { ok: true, src: u.href, origin: u.origin, host: u.host }
+}
 
 export const BRIDGE_PROTOCOL = 1
 // Mirrors the server (server/services/activities.js APP_LIMITS). The server enforces these for
@@ -51,8 +116,18 @@ const MAX_PEOPLE = 500
 const MAX_URL_LENGTH = 2048
 
 export interface BridgePerson { username: string; displayName: string; avatarUrl: string }
+/** The voice channel, as this app is told about it: an opaque id the server makes for (this app,
+ *  this channel). The same every time for the same pair, different for every other app. */
+export interface BridgeRoom { id: string }
 export type SharedState = Record<string, unknown>
-export interface BridgeSnapshot { me: BridgePerson; participants: BridgePerson[]; shared: SharedState; rev: number }
+export interface BridgeSnapshot {
+  me: BridgePerson
+  participants: BridgePerson[]
+  shared: SharedState
+  rev: number
+  /** null (or left out) when there is no voice channel: the solo viewer. */
+  room?: BridgeRoom | null
+}
 export interface ChangeResult { ok: boolean; reason?: string; rev?: number }
 
 /** Where an app's requests go: the voice room's activity events, or local state in the solo viewer. */
@@ -154,6 +229,11 @@ function cleanPerson(p: BridgePerson | null | undefined): BridgePerson {
 }
 const cleanPeople = (list: BridgePerson[]) => (Array.isArray(list) ? list.slice(0, MAX_PEOPLE).map(cleanPerson) : [])
 const cleanShared = (shared: unknown): SharedState => (isPlainObject(shared) ? shared : {})
+/** The room key as the server sends it in the activity state (`roomKey`), as the bridge's `room`.
+ *  Only the one shape the server makes counts: 32 lower-case hex characters. Anything else is no
+ *  room, which an app treats as "on my own" — the safe way to be wrong. */
+export const bridgeRoom = (key: unknown): BridgeRoom | null => (typeof key === 'string' && /^[0-9a-f]{32}$/.test(key) ? { id: key } : null)
+const cleanRoom = (room: BridgeRoom | null | undefined): BridgeRoom | null => bridgeRoom(room?.id)
 
 interface BridgeOptions {
   /** The iframe's window right now, or null. Read on every message rather than captured once, so
@@ -162,9 +242,17 @@ interface BridgeOptions {
   /** What to answer a hello with: the freshest identity, participants and state the host has. */
   getSnapshot: () => BridgeSnapshot
   transport: BridgeTransport
+  /** A hosted app's exact origin (hostedAppFrame().origin). Left out for an uploaded bundle, whose
+   *  frame has no origin to name. Once given it is all there is: a value that is not an origin
+   *  means nothing is sent and nothing accepted — never a quiet return to '*'. */
+  frameOrigin?: string
 }
 
-export function createAppBridge({ getFrameWindow, getSnapshot, transport }: BridgeOptions): AppBridge {
+export function createAppBridge({ getFrameWindow, getSnapshot, transport, frameOrigin }: BridgeOptions): AppBridge {
+  const exact = frameOrigin !== undefined
+  // Spelled the way event.origin spells one, or it could never match (and '*' and "null" are out).
+  // '' when what was given is not that: `exact` with no origin is the closed state.
+  const origin = typeof frameOrigin === 'string' && /^https?:\/\/[^/?#@\s\\*]+$/.test(frameOrigin) ? frameOrigin : ''
   let destroyed = false
   let closed = false
   // Nothing is forwarded until the app has said hello and been welcomed: before that it has no
@@ -180,10 +268,19 @@ export function createAppBridge({ getFrameWindow, getSnapshot, transport }: Brid
     if (destroyed) return
     const frame = getFrameWindow()
     if (!frame) return
+    // A hosted app has an origin, so it is named: the browser then hands the message over only if
+    // the document in the frame really is on it. Whatever the frame has since navigated itself to
+    // (a sign-in page, another site) receives nothing.
+    if (exact) {
+      if (!origin) return
+      try { frame.postMessage({ ...message, lanparty: BRIDGE_PROTOCOL }, origin) } catch { /* frame is going away */ }
+      return
+    }
     // '*' because an opaque-origin frame has no origin that could be named here. That is only
     // acceptable because nothing secret ever goes through this function — public names and
-    // avatars, and the app's own state and messages. Keep it that way: no tokens, no ids, nothing
-    // from the session.
+    // avatars, the app's own state and messages, and the app's own id for the room (made for this
+    // app alone, and its to know). Keep it that way: no tokens, no LAN Party ids, nothing from the
+    // session.
     try { frame.postMessage({ ...message, lanparty: BRIDGE_PROTOCOL }, '*') } catch { /* frame is going away */ }
   }
   // One bucket for everything the app sends, like the server's, so a runaway loop in an app is
@@ -210,7 +307,7 @@ export function createAppBridge({ getFrameWindow, getSnapshot, transport }: Brid
     sentRev = Number.isFinite(snap.rev) ? snap.rev : 0
     const participants = cleanPeople(snap.participants)
     sentParticipants = JSON.stringify(participants)
-    post({ type: 'welcome', me: cleanPerson(snap.me), participants, shared: cleanShared(snap.shared), rev: sentRev })
+    post({ type: 'welcome', me: cleanPerson(snap.me), participants, room: cleanRoom(snap.room), shared: cleanShared(snap.shared), rev: sentRev })
     releaseHeld(sentRev)
   }
 
@@ -251,6 +348,10 @@ export function createAppBridge({ getFrameWindow, getSnapshot, transport }: Brid
     // exact window object.
     const frame = getFrameWindow()
     if (!frame || event.source !== frame) return
+    // For a hosted app the origin is checked as well. The window alone is not enough there: the
+    // frame can navigate (or be redirected) to any other site and stay the same window, and that
+    // site is not the app that was reviewed and joined.
+    if (exact && (!origin || event.origin !== origin)) return
     const m: unknown = event.data
     if (!isPlainObject(m) || m.lanparty !== BRIDGE_PROTOCOL || typeof m.type !== 'string') return
     if (m.type === 'hello') {
@@ -320,15 +421,18 @@ export interface SoloBridgeWatch {
 
 /** The bridge for an app opened on its own from the directory: the same SDK works, but there is
  *  no room. Identity is the viewer, the participants are just the viewer, and the shared state
- *  lives in this object — never sent anywhere, gone when the viewer closes. */
-export function createSoloBridge({ getFrameWindow, getMe, watch }: { getFrameWindow: () => Window | null; getMe: () => BridgePerson; watch?: SoloBridgeWatch }): AppBridge {
+ *  lives in this object — never sent anywhere, gone when the viewer closes. `frameOrigin` is for a
+ *  hosted app, as in createAppBridge. */
+export function createSoloBridge({ getFrameWindow, getMe, watch, frameOrigin }: { getFrameWindow: () => Window | null; getMe: () => BridgePerson; watch?: SoloBridgeWatch; frameOrigin?: string }): AppBridge {
   let shared: SharedState = {}
   let rev = 0
   const bridge: AppBridge = createAppBridge({
     getFrameWindow,
+    frameOrigin,
     // Only ever asked for when a hello is being answered, which is what makes it the place to
-    // notice one.
-    getSnapshot: () => { const me = getMe(); watch?.onHello?.(); return { me, participants: [me], shared, rev } },
+    // notice one. No room: there is no voice channel here, and an app that keys its own backend by
+    // room must not be handed one that other people share.
+    getSnapshot: () => { const me = getMe(); watch?.onHello?.(); return { me, participants: [me], shared, rev, room: null } },
     transport: {
       change(kind, value, done) {
         const result = applySharedChange(shared, kind, value)

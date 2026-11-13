@@ -351,6 +351,17 @@ const MIGRATIONS = [
       await addColumn(db, 'apps', 'submitted_at', 'INTEGER');
     },
   },
+  {
+    // "Run inside LAN Party" for a link app: with embed = 1 the app is HOSTED — framed on its own
+    // origin in the viewer and startable in a voice room like a bundle, instead of only opening in a
+    // new tab (services/hostedApps.js). 0 for every app that exists when this runs, so a link that
+    // was approved as a link stays one; turning it on is an edit, and goes through review.
+    // Meaningless for a bundle, where it stays 0.
+    name: '0012_app_embed',
+    up: async (db) => {
+      await addColumn(db, 'apps', 'embed', 'INTEGER NOT NULL DEFAULT 0');
+    },
+  },
 ];
 
 /**

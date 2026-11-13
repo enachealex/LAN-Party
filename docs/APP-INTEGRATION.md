@@ -10,6 +10,12 @@ everybody else once an instance owner has approved it (see
 SDK** — which tells it who is looking, who else has joined, and gives it a shared object and a way
 to send short messages. Nothing has to be changed on the server to add an app.
 
+An app can also be a site that lives **on its own server**: a link app with **Run inside LAN
+Party** turned on. LAN Party frames it from its own address instead of hosting its files, and it
+uses a copy of the same SDK. That is a [hosted app](#hosted-apps), and it has a section of its own;
+everything else in this document is written for uploaded apps and says so where a hosted app
+differs.
+
 - [Upload an app](#upload-an-app)
 - [Drafts, review and publishing](#drafts-review-and-publishing)
 - [A complete example](#a-complete-example)
@@ -17,6 +23,7 @@ to send short messages. Nothing has to be changed on the server to add an app.
 - [Limits](#limits)
 - [What an app can and cannot see](#what-an-app-can-and-cannot-see)
 - [Developing without a room](#developing-without-a-room)
+- [Hosted apps](#hosted-apps)
 - [Patterns that work](#patterns-that-work)
 - [Not yet](#not-yet)
 
@@ -77,8 +84,12 @@ A new upload is a draft. (An instance owner's own upload is published at once: t
 else to ask.) Apps that existed before review was introduced stayed published.
 
 A **link** app needs a full web address (`http://` or `https://`); the upload form refuses
-anything else. The address is shown in full to the uploader and the reviewer, and cannot be
-changed after uploading — delete the app and add it again.
+anything else. The address is shown in full to the uploader and the reviewer. A link either opens
+in a new browser tab, or — with **Run inside LAN Party** on — runs in a frame like an uploaded app
+(a [hosted app](#hosted-apps), which asks more of the address). Both the address and that setting
+can be changed later under **Edit details**, and both are what a reviewer approved: changing
+either sends the app back to **Draft** and ends it in any voice channel running it, exactly as
+replacing a bundle does.
 
 **What the uploader can do**, from the Developer tab:
 
@@ -87,6 +98,9 @@ changed after uploading — delete the app and add it again.
 - **Submit for review** (draft or changes requested → in review) and **Withdraw** (back to draft).
   An uploader who is an instance owner has nobody to submit to: they get **Publish** instead.
 - **Edit details** — name, description, icon — in any status. This never changes the status.
+  For a link app the same dialog holds the address and **Run inside LAN Party**; changing either
+  of those two does reset the status to Draft (an instance owner's own app keeps its status) and
+  ends the app in any voice channel running it. The dialog says so before you save.
 - **Replace bundle** — upload new files for the same app, with the same checks and limits as a
   first upload. The app goes back to **Draft**, because what was reviewed is no longer what would
   run; submit it again. The old files are deleted and the app gets a new address, so a room running
@@ -95,6 +109,9 @@ changed after uploading — delete the app and add it again.
 - **Check app** — loads the bundle out of sight for a few seconds and reports three things: did the
   page load, did it say hello to the bridge, did it set any state. It is a diagnostic for the
   developer. It is not a review, and it says nothing about whether the app will be approved.
+  It is offered for bundles only: the check runs the app with no origin and no storage, which is
+  how a bundle really runs and not how a hosted site does, so its answers about a hosted app would
+  be wrong. Test a hosted app with **Open**, and in a voice channel.
 
 **What an instance owner can do**, from the **Review** tab (which only they are shown):
 
@@ -103,7 +120,14 @@ changed after uploading — delete the app and add it again.
   a bundle approves the files the owner was shown: the request names them (`POST /apps/:id/approve`
   with `{ "url": "<the app's url as listed>" }`), and if the uploader has replaced the bundle since,
   the server refuses with 409 and nothing is published. The Review tab marks such an app and asks
-  for it to be opened again first. A link needs no `url`;
+  for it to be opened again first. A hosted app is held to the same, on both things that were
+  reviewed: the request must name its address and say that it runs inside
+  (`{ "url": "<its address as listed>", "embed": true }`), and an edit to either since then is
+  refused with 409. A plain link is held to it too (`{ "url": "<its address as listed>", "embed":
+  false }`): its uploader can repoint it, or switch it to run inside and back, while it is being
+  looked at. A request that leaves out `url` or `embed` for any link app is refused with 400; one
+  that names something other than the app as it stands, with 409. The client always sends both, as
+  `{ url, embed }`, for what it showed the reviewer;
 - **Reject** an app that is in review or published, with an optional note (up to 500 characters)
   that the uploader sees next to the app;
 - **Unpublish** or **Delete** anyone's app.
@@ -115,7 +139,8 @@ owners are told when an app is submitted.
 the channel get the same card as for any app, with one difference: it says clearly that the app is
 **not approved yet**, and by whom it was started. Nothing loads for anyone who does not press
 Join. If the app is approved while it is running, the warning goes away; if it is rejected,
-unpublished, replaced or deleted while it is running, it ends for the room.
+unpublished, replaced or deleted while it is running — or, for a link app, its address or its
+**Run inside LAN Party** setting is edited — it ends for the room.
 
 **What a draft is not.** A draft is hidden from the directory, and nobody else can find out that it
 exists. But an app's files are served from an address that is long and random, not from one that
@@ -201,12 +226,14 @@ Calling it again returns the same connection.
 | Option | Default | |
 | --- | --- | --- |
 | `timeoutMs` | `1500` | How long to wait for LAN Party before going standalone. |
+| `hostOrigins` | not set | For [hosted apps](#hosted-apps). The only origins the page accepts as its host, for example `['https://lanparty.example.com']`. Leave it out in an uploaded app. |
 
 ### `lp`
 
 | | |
 | --- | --- |
 | `lp.me` | `{ username, displayName, avatarUrl }` — the person looking at this copy of the app. `avatarUrl` may be `''`. |
+| `lp.room` | `{ id }` in a voice channel, `null` when the app is open on its own or standalone. `id` is an opaque name for *this app in this voice channel*: 32 lower-case hex characters, the same every time the app runs in that channel, different for every other app. See [The room id](#the-room-id). |
 | `lp.participants` | The people who have **joined the app**, each `{ username, displayName, avatarUrl }`. Kept up to date. Someone who is in the voice channel but has not pressed Join is not listed. |
 | `lp.state` | The shared object — a fresh copy each time you read it, so read it once into a variable if you need it several times. Writing to the copy changes nothing, for you or anyone else: change the state with `setState` / `replaceState`. |
 | `lp.setState(patch)` | Shallow merge: each key in `patch` replaces that key in the state; a value of `null` deletes the key. Returns `false` (and warns in the console) if the change was refused on the spot. |
@@ -263,16 +290,24 @@ rate allows; a state near the 64 KB limit can change about four times a second *
 room**, not per person. Anything that changes often belongs in a small state or in `emit`.
 
 The state lasts as long as the activity does. When it is ended, or the voice channel empties, it is
-gone. There is no storage that outlives a session.
+gone. There is no storage that outlives a session. (A [hosted app](#hosted-apps) has a server of
+its own and can keep whatever it likes there, filed under [the room id](#the-room-id).)
 
 ## What an app can and cannot see
 
 Apps are uploaded by members, so LAN Party treats every one as untrusted code.
 
+What follows is about **uploaded** apps. A hosted app is told exactly the same things over the
+bridge and nothing more, but it is a site of its own rather than code in LAN Party's sandbox; what
+that changes is under [Hosted apps](#what-a-hosted-app-is-and-is-not-trusted-with).
+
 **An app can see**
 
 - your username, display name and avatar;
 - the same for the other people who joined the app;
+- an opaque id for the voice channel it is running in (`lp.room`), once you have joined it. It is
+  made for that one app, says nothing about which server or channel it is, and is not the id any
+  other app is given for the same channel;
 - its own shared state and its own messages.
 
 **An app cannot**
@@ -319,6 +354,230 @@ channel: a draft is yours to run, and the others see it marked as not approved a
 to join. **Check app** in the Developer tab is the quickest way to see whether the uploaded copy
 reaches the SDK at all.
 
+## Hosted apps
+
+A hosted app is a web site on **your own server**, at its own address, that LAN Party shows in a
+frame: on its own from the App Directory, and as a Thing To Do in a voice channel. Nothing is
+uploaded. It keeps its own storage, cookies and backend, which an uploaded app does not have — so
+it suits something that already exists as a site, or that needs a server of its own (a shared
+music queue, a game with accounts).
+
+### Adding one
+
+1. **App Directory → Developer → Upload an app → Link (external URL).**
+2. Enter the address and tick **Run inside LAN Party**.
+3. It is saved as a draft like any other app, and goes through the same review: you can open it
+   and start it in a voice channel yourself straight away (marked as not approved), and everyone
+   can once an instance owner has approved it.
+
+An existing link app becomes a hosted app the same way, under **Edit details**. Turning the
+setting on or off, or changing the address, is a change to what was reviewed: a published app goes
+back to Draft (unless you are an instance owner), and it ends in any voice channel running it.
+
+### What the site has to do
+
+- **Be served over `https://`.** Plain `http://` is accepted only for `localhost` and `127.0.0.1`,
+  and only while LAN Party itself is being opened at a loopback address (`localhost`, `127.0.0.1`
+  or `[::1]`): that is developing both on your own machine. On a real LAN Party an
+  `http://localhost` address would frame whatever each viewer runs on their own computer, so it is
+  refused there, by the server and by the client. No username or password in the address; 2000
+  characters at most. The address is stored the way a browser spells it (lower-case host, default port dropped).
+- **Be on a different origin than LAN Party.** This is the one rule everything else rests on, and
+  it is checked by the server (when the address is saved, when the app is approved and when it is
+  started) and again by the client before it builds the frame. A different port counts as a
+  different origin; a path on LAN Party's own address does not. See
+  [why](#what-a-hosted-app-is-and-is-not-trusted-with) below.
+- **Allow being framed by LAN Party.** If the site sends `X-Frame-Options`, or a
+  `Content-Security-Policy` with `frame-ancestors`, it must let the LAN Party origin in
+  (`frame-ancestors https://lanparty.example.com`). A site that refuses shows as an empty frame;
+  LAN Party cannot detect that for you.
+- **Work inside a sandboxed frame.** The frame is
+  `sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock"` with
+  `allow="autoplay; encrypted-media; fullscreen; gamepad"`. So: scripts, forms, your own storage
+  and cookies, media playback and pop-ups work. There is no `allow-modals`, so `alert` /
+  `confirm` / `prompt` do nothing (they return at once: `confirm` is `false`, `prompt` is `null`)
+  — ask in your own page instead. The site cannot navigate the LAN Party window, a pop-up it opens
+  stays under the same sandbox, and there is no camera or microphone. See also
+  [Known limits](#known-limits).
+- **Expect partitioned storage.** Browsers generally keep a framed site's cookies and storage apart
+  from the same site visited directly, unless the two are on the same registrable domain
+  (`music.example.com` inside `lanparty.example.com` shares; `music.example.org` does not). On an
+  unrelated domain, someone signed in to your site in a tab is not signed in inside the frame.
+
+Optionally, the site can **use the SDK** to learn who is looking and which room it is in. Without
+it the site still runs; it just knows nothing about LAN Party.
+
+### `lanparty=1`
+
+LAN Party adds the query parameter `lanparty=1` to the address when it frames it, and leaves the
+rest of the query and the fragment as they were. That is all that ever goes in the URL — no name,
+no token, no room. It is a hint that the bridge is worth trying, not evidence of anything: anybody
+can type it. Decide that you are inside LAN Party only when the page is framed **and** the
+handshake below succeeds.
+
+### Vendoring the SDK
+
+Copy `server/sdk/lanparty.js` (the file every LAN Party serves at `/sdk/lanparty.js`) into your
+own code and serve it from your own origin. Do **not** load it from a LAN Party server at run
+time: a script from another origin runs with all the powers of yours — your users' sessions and
+tokens included — and you would be handing those to whoever runs that server.
+
+The file is a plain script that sets `window.LANParty`; it has no exports and no dependencies. In
+a bundled project, import it for its side effect. Additions to the protocol are backwards
+compatible, so a copy keeps working; take a new one when you want a newer feature.
+
+### `hostOrigins`: saying which LAN Party you trust
+
+An uploaded app has no origin and nothing of its own to protect, so it talks to whatever page
+frames it. A hosted app must not: any page on the internet can frame your site and play the host.
+So name the LAN Party origins you accept:
+
+```js
+import './vendor/lanparty.js';            // your copy; sets window.LANParty
+
+const LANPARTY_ORIGINS = ['https://lanparty.example.com'];   // decided at build time
+
+async function start() {
+  const framed = window.parent !== window;
+  const asked = new URLSearchParams(location.search).get('lanparty') === '1';
+  if (framed && asked) {
+    const lp = await window.LANParty.connect({ hostOrigins: LANPARTY_ORIGINS, timeoutMs: 3000 });
+    if (!lp.standalone) {
+      const user = { id: 'lp:' + lp.me.username, name: lp.me.displayName };
+      // null: opened on its own, so a private session for this one person
+      const room = lp.room && /^[0-9a-f]{32}$/.test(lp.room.id) ? 'lanparty:' + lp.room.id : null;
+      return startInsideLanParty(lp, user, room);
+    }
+  }
+  startAsUsual();                          // never a blank page
+}
+```
+
+With `hostOrigins` given:
+
+- `hello` is posted once per listed origin, with that origin as the `postMessage` target — never
+  `'*'`. The browser delivers it only if the parent page really is on that origin.
+- A message from the host is accepted only if it comes from the parent window **and** its
+  `event.origin` is in the list. After the first `welcome`, only that origin is listened to and
+  posted to.
+- Each entry is reduced to its origin by the browser's own URL parser, so it matches
+  `event.origin` exactly: case and a default port are tidied, a trailing slash or a path is
+  dropped (`https://lanparty.example.com/app/` is `https://lanparty.example.com`), and an
+  international domain name becomes its punycode form (`https://bücher.example` is
+  `https://xn--bcher-kva.example`). An entry that is not an absolute `http(s)://` address with a
+  host — `'*'`, `//host`, a bare name, a non-string, or one with a username or password in it — is
+  dropped with a console warning, and the entries after it are still used.
+- At most **20** origins are used; any after the twentieth are ignored, with a warning.
+- If nothing usable is left, no host is accepted at all and `connect()` resolves in standalone mode
+  at once; it never falls back to accepting anyone.
+- If no listed host answers within `timeoutMs`, you get standalone mode, as always. `connect()`
+  never rejects: a target the browser refuses to post to is skipped (with a warning) and the others
+  are still tried, and anything that goes wrong while connecting ends in standalone mode.
+
+The list is the trust decision, so keep it in your build or your server's configuration. Never
+take a host origin, or the address of a script to load, from the query string or from a message.
+
+LAN Party does the same from its side: it posts to your app's exact origin, and accepts a message
+only from your frame's window **and** your origin. If the frame navigates to another site, that
+site hears nothing and is not listened to.
+
+### The room id
+
+In a voice channel `lp.room` is `{ id }`: 32 lower-case hex characters that name *your app in
+that voice channel*. It is what makes "everyone in this channel lands in the same place" work
+without your site knowing anything about LAN Party's servers or channels:
+
+- **It is stable.** The same channel gives your app the same id every time, across sessions and
+  server restarts. Use it as the key of a room on your own backend (`'lanparty:' + lp.room.id`),
+  and whatever you keep there — a queue, a scoreboard — is still there next time.
+- **It is yours alone.** It is an HMAC, keyed by a secret on the LAN Party server, over your app's
+  id, your app's **origin** and the channel. Another app gets a different id for the same channel,
+  so two apps cannot compare notes; and the id reveals nothing about the server or the channel.
+- **It is given only to people who joined.** Someone in the voice channel who has not pressed Join
+  never receives it.
+- **It is `null`** when the app is opened on its own from the directory, and in standalone mode.
+  Treat `null` as "a private session for this one person" — never as a room that people share.
+- **Check its shape** (`/^[0-9a-f]{32}$/`) before using it in a key, a path or a query of your own.
+- **It can change** if the person running the LAN Party server changes its signing secret, if
+  your app is deleted and added again (it is then a new app), or if your app's address is moved to
+  a **different origin** (another host, scheme or port): the key is bound to the site it is given
+  to, so a new site gets new keys rather than inheriting the old one's. A new path or query on the
+  same origin keeps them. What you stored under the old ids is not reachable through the new ones.
+
+Uploaded apps get `lp.room` too, though with no backend to key by it most have no use for it.
+
+`lp.state`, `lp.setState`, `lp.emit` and `lp.participants` work in a hosted app exactly as in an
+uploaded one, with the same [limits](#limits). An app with its own backend will usually keep its
+real state there and use the bridge for identity, the room id and who has joined.
+
+### Identity is a name, not proof
+
+What the bridge tells your app is the viewer's **public name** (and avatar) and the room id. It
+arrives by `postMessage` from the page that frames you. Checking `hostOrigins` tells your page
+that this really is the LAN Party it trusts — and that is all it tells anyone.
+
+**Your backend has no way to verify it.** Nothing is signed. Whatever your page then sends to your
+own server ("I am `ann`, in room `lanparty:3f…`") is a claim made by a browser, and anyone can
+open your site, skip the SDK and send the same request with any name they like. Likewise the room
+id is a shared secret among the people who joined the app in that channel — holding it shows that
+someone was let in (or was given it by someone who was), not who they are.
+
+So, for now:
+
+- use the name for display and for attributing things inside a room ("queued by Ann");
+- do not attach anything valuable to it: no account, no purchases, no private data keyed by a
+  LAN Party name;
+- keep ids that came from LAN Party apart from your own accounts (a prefix like `lp:` does it), so
+  a LAN Party name can never collide with, or be mistaken for, a real account on your site;
+- treat a `lanparty:` room like a link shared among friends: fine for a queue, not for secrets.
+
+A signed assertion your server could check — sign-in with LAN Party — is planned; see
+[Not yet](#not-yet).
+
+### What a hosted app is, and is not, trusted with
+
+A hosted app is told the same things as an uploaded one (names, avatars, the room id, its own
+state and messages) and LAN Party's own interface is just as closed to it: it cannot join anyone,
+start or end itself, or see messages, friends or channels. What is different is where it runs.
+
+- **It is not in LAN Party's sandbox.** An uploaded app is forced into an origin of its own with
+  no storage and no way out. A hosted app runs as the site it is: it has that site's cookies and
+  storage, talks freely to that site's server, and can load anything else it likes.
+- **It is kept away from your LAN Party session by being a different origin** — the browser's
+  ordinary wall between two sites. That is why the address may never be LAN Party's own: a frame
+  that is same-origin with the page around it, with scripts allowed, could reach up into that
+  page and read your session. The server refuses such an address and the client refuses to frame
+  one, each on its own.
+- **Approval covers an address, not a version.** A reviewer approves *that site, framed*. Its
+  owner can change what it serves the next day without anything coming back for review, which is
+  not true of an uploaded bundle. An instance owner should approve a hosted app only from someone
+  they would trust with that.
+- **What you do inside it goes to that site.** The Join card says so, and names the site. The
+  usual sense applies even more than for an uploaded app: it is somebody's web site.
+
+### Trying it
+
+- **Open** in the App Directory runs it in the viewer: the SDK connects, `lp.me` is you,
+  `lp.room` is `null`. **Open in new tab** is the site as anyone visits it (no `lanparty=1`).
+- Start your draft in a voice channel to see the real thing, room id included.
+- For local development, run LAN Party on your machine too, open it at `http://localhost:<port>`,
+  register `http://localhost:<another port>/` as the address and put the origin you open LAN Party
+  at in `hostOrigins`. The app must be on a different port than LAN Party. (Against a real LAN
+  Party, an app has to be on `https://`.)
+- **Check app** is not offered for hosted apps (it would test them under conditions they never run
+  in).
+
+### Known limits
+
+- **No DRM playback in the Windows desktop app.** The LAN Party desktop app is stock Electron, which
+  has no Widevine, so anything that needs DRM / Encrypted Media Extensions — Spotify's player, and
+  most paid streaming services — does not play inside it. YouTube and other media without DRM play
+  fine. In a browser (and in the Android app) DRM playback works as the browser allows it.
+- **No dialogs.** As above, hosted frames get no `allow-modals`: `alert`, `confirm` and `prompt` do
+  nothing. Put confirmations in your page.
+- **Directory entries in old tabs.** A LAN Party tab opened before hosted apps existed lists a
+  hosted app as a plain link, which opens the site in a new tab. Reloading it is enough.
+
 ## Patterns that work
 
 - **Give each player their own keys.** `setState` merges per top-level key, and the last write to a
@@ -343,7 +602,9 @@ Planned, not built — do not design around them:
 
 - **Registered apps with credentials.** Client ids and secrets, and a server-to-server API.
 - **Scopes.** Asking for more than name and avatar, with the user's consent.
-- **Sign-in with LAN Party** for apps hosted elsewhere.
+- **Sign-in with LAN Party** for apps hosted elsewhere: something signed that a hosted app's own
+  server can check. Until it exists, what a [hosted app](#hosted-apps) is told is a public name,
+  [not proof of who is there](#identity-is-a-name-not-proof).
 - **Storage that outlives a session**, per app or per player.
 
 ## For people working on LAN Party itself
@@ -357,16 +618,50 @@ Planned, not built — do not design around them:
 | The directory: Browse, Developer and Review tabs | `client/src/components/AppDirectoryModal.jsx`, `AppDeveloperTab.tsx`, `AppReviewTab.tsx`, `AppDirectoryDialog.tsx` |
 | "Check app" | `client/src/appCheck.ts` |
 | Statuses, transitions, who may see and change an app | `server/routes/library.js` |
+| Hosted apps: the address rules, the room key | `server/services/hostedApps.js`; the frame and its origin check in `client/src/appBridge.ts` (`hostedAppFrame`) |
 | Who is an instance owner | `server/services/instanceOwners.js` |
 | Server rules: limits, joined list, rate limit | `server/services/activities.js` (`applyAppEvent`), socket handlers in `server/index.js` |
-| Tests | `server/test/appActivity.test.js`, `server/test/appApproval.test.js` |
+| Tests | `server/test/appActivity.test.js`, `server/test/appApproval.test.js`, `server/test/hostedApps.test.js` |
+
+In `GET /apps`, **`embeddable` means "uploaded bundle" and nothing else**; a hosted app has
+`embeddable: false, hosted: true`. Tabs opened before hosted apps existed read `embeddable` as
+"frame it in the bundle sandbox", where a hosted site is a blank page; with it false they show a
+hosted app as a plain link (it opens in a new tab), which works. Current client code asks `hosted`
+first and treats an app as runnable inside when `hosted || embeddable` (`runsInside()` and
+`isBundleApp()` in `client/src/components/AppDirectoryParts.tsx`).
 
 The app and the host talk over `postMessage`. Every message is an object with `lanparty: 1` and a
 `type`. App to host: `hello`, `set`, `replace`, `emit`. Host to app: `welcome`, `state`, `ack`,
-`participants`, `message`, `closed`. The frame's origin is opaque, so neither side can check an
-origin: each accepts a message only from the exact window it expects (the app from its parent, the
-host from that iframe), and the host posts with a `'*'` target — which is acceptable only because
-nothing secret is ever put on the bridge.
+`participants`, `message`, `closed`. The `welcome` carries `me`, `participants`, `room`
+(`{ id }` or `null`), `shared` and `rev`.
+
+For an uploaded bundle the frame's origin is opaque, so neither side can check an origin: each
+accepts a message only from the exact window it expects (the app from its parent, the host from
+that iframe), and the host posts with a `'*'` target — which is acceptable only because nothing
+secret is ever put on the bridge. A hosted app's frame has a real origin, and both sides use it:
+the host posts to that exact origin and accepts a message only from the iframe's window **and**
+that origin (`frameOrigin` in `createAppBridge`); the app does the mirror image with `hostOrigins`.
+
+**A hosted app's frame** is built by `hostedAppFrame()` and nowhere else. It returns the address
+with `lanparty=1` added and the origin for the bridge, or refuses: when the address is not a plain
+`https://` one — the one exception being `http://localhost` and `http://127.0.0.1`, and only while
+the page itself is on a loopback host (`window.location.hostname` is `localhost`, `127.0.0.1` or
+`[::1]`); the server applies the same exception only when every name the request was sent to
+(Host, X-Forwarded-Host, Origin) is a loopback one (`servedFromLoopback`) — and when its origin
+is this page's own (or the API server's, where the client is served from somewhere else). That refusal is independent of the server's — the server cannot
+always know the name a browser reached it by. The real-origin sandbox
+(`allow-scripts allow-same-origin …`) is only ever put on a frame whose `src` came from there.
+The frame's `src`, `sandbox` and `allow` are worked out from the run's own url and never change
+while it is mounted, so a re-render never reloads the app.
+
+**The room key** (`state.roomKey`) is computed by the server when the app is started:
+`HMAC-SHA256` under a key derived from `JWT_SECRET`, over
+`JSON.stringify([appId, frameOrigin, serverId, channelId])`, cut to 32 hex characters.
+`frameOrigin` is the hosted app's origin (`new URL(url).origin`) or the constant `'bundle'` for an
+uploaded one (`appFrameOrigin`), so moving a hosted app to another origin rotates all of its keys,
+and a bundle and a hosted app never share one. It is in the activity state only for sockets that have joined the app; everyone
+else's copy has `null`. The client passes it to the app as `room` in the `welcome`, and the solo
+viewer always sends `room: null`.
 
 **Who has joined** is tracked by the server, per connection: pressing Join sends a `join` event,
 Leave sends `leave` (so does the app's panel going off screen, when the person looks at another

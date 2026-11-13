@@ -2,11 +2,12 @@ import React, { useEffect, useRef, useState } from 'react'
 import AppDeveloperTab from './AppDeveloperTab'
 import AppReviewTab from './AppReviewTab'
 import AppDirectoryDialog from './AppDirectoryDialog'
-import { safeLinkUrl, statusOf } from './AppDirectoryParts'
+import { runsInside, safeLinkUrl, statusOf } from './AppDirectoryParts'
 
-// Centered modal for community apps. An app is either a LINK (opens an external URL in a new tab)
-// or an uploaded BUNDLE (a self-contained .html/.zip that LAN Party hosts + runs sandboxed inside
-// the in-app viewer). Three tabs:
+// Centered modal for community apps. An app is either a LINK (an external URL: opened in a new tab,
+// or — when it is set to run inside LAN Party, a HOSTED app — framed in the in-app viewer from its
+// own address) or an uploaded BUNDLE (a self-contained .html/.zip that LAN Party hosts + runs
+// sandboxed inside the in-app viewer). Three tabs:
 //   Browse    — the published apps, for everyone;
 //   Developer — the SDK essentials, the upload form and the viewer's own apps in any status;
 //   Review    — only for an instance owner: what is waiting for approval, and what is published.
@@ -25,9 +26,10 @@ export default function AppDirectoryModal({ open, apps = [], instanceOwner = fal
   // Set when this modal hands an app to the viewer (which closes the directory): the directory
   // comes back on the tab the person was working in, not on Browse.
   const resumeModeRef = useRef(null)
-  // The url each bundle had when this person last opened it from here. Approving sends it, so the
-  // server can refuse when the uploader has swapped the files since (server/routes/library.js).
-  const [openedUrls, setOpenedUrls] = useState({})
+  // What each app was when this person last opened it from here: a bundle's url (its files), or a
+  // hosted app's address and the fact that it ran inside. Approving sends it, so the server can
+  // refuse when the uploader has changed any of that since (server/routes/library.js).
+  const [opened, setOpened] = useState({}) // app id -> { url, hosted }
 
   // Reset to browse view each time the modal opens — except when coming back from the viewer.
   useEffect(() => {
@@ -67,12 +69,17 @@ export default function AppDirectoryModal({ open, apps = [], instanceOwner = fal
 
   const openApp = (app) => {
     resumeModeRef.current = mode
-    if (app.embeddable && app.url) setOpenedUrls((prev) => ({ ...prev, [app.id]: app.url }))
+    if (runsInside(app) && app.url) setOpened((prev) => ({ ...prev, [app.id]: { url: app.url, hosted: app.hosted === true } }))
     onOpenApp?.(app)
   }
-  // Someone else's bundle that was opened from here and has different files now: what was looked
-  // at is not what an approval would publish. (Their own app they replaced themselves.)
-  const replacedSinceOpened = (app) => !!app.embeddable && app.createdBy !== currentUser && !!openedUrls[app.id] && openedUrls[app.id] !== app.url
+  // Someone else's app that was opened from here and is something else now — a bundle with
+  // different files, a hosted app at a different address, or one that was switched between running
+  // inside LAN Party and opening in a tab: what was looked at is not what an approval would
+  // publish. (Their own app they changed themselves.)
+  const changedSinceOpened = (app) => {
+    const seen = opened[app.id]
+    return !!seen && app.createdBy !== currentUser && (seen.url !== app.url || seen.hosted !== (app.hosted === true))
+  }
 
   // The one-click status changes (submit, withdraw, approve). The row's buttons are disabled while
   // one is in flight; a refusal is shown, and the list is fetched again because a refusal usually
@@ -82,8 +89,14 @@ export default function AppDirectoryModal({ open, apps = [], instanceOwner = fal
     setBusyKey(`${app.id}:${action}`)
     setActionError(null)
     try {
-      // An approval names the files it is for: the ones this person opened, else the ones listed.
-      const json = action === 'approve' ? { url: replacedSinceOpened(app) ? openedUrls[app.id] : app.url } : {}
+      // An approval names what it is for: the app as this person opened it, else as it is listed
+      // — its url (a bundle's files, a link's address) and whether it runs inside LAN Party. An app
+      // that can no longer be opened here (it is a plain link now) has nothing left to open again:
+      // its row shows the address it would publish, and that is what gets named.
+      const seen = changedSinceOpened(app) && runsInside(app) ? opened[app.id] : { url: app.url, hosted: app.hosted === true }
+      // Both, always, for every kind of app: the server refuses an approval that leaves either out.
+      // A link saved with no address at all is listed without one, and is named as ''.
+      const json = action === 'approve' ? { url: seen.url ?? '', embed: seen.hosted === true } : {}
       await request(`/apps/${app.id}/${action}`, { method: 'POST', json })
     } catch (err) {
       setActionError(`${app.name}: ${err?.message || 'that did not work'}`)
@@ -132,13 +145,17 @@ export default function AppDirectoryModal({ open, apps = [], instanceOwner = fal
                       <div className="app-card-meta">
                         <div className="app-card-name">
                           {app.name}
-                          {app.embeddable && <span className="app-card-badge" title="Runs inside LAN Party">embedded</span>}
+                          {runsInside(app) && <span className="app-card-badge" title="Runs inside LAN Party">embedded</span>}
                         </div>
                         {app.description && <div className="app-card-desc">{app.description}</div>}
                         <div className="app-card-foot">
                           <span className="app-card-by">by {app.createdBy || 'someone'}</span>
-                          {app.embeddable ? (
-                            <button type="button" className="app-card-try" onClick={() => openApp(app)}>Open →</button>
+                          {runsInside(app) ? (
+                            <span className="app-card-actions">
+                              {/* A hosted app is still a site of its own: it can be visited as one. */}
+                              {app.hosted && link && <a className="app-card-try app-card-newtab" href={link} target="_blank" rel="noreferrer noopener" title="Open the site in a new browser tab instead">New tab ↗</a>}
+                              <button type="button" className="app-card-try" onClick={() => openApp(app)}>Open →</button>
+                            </span>
                           ) : (
                             link
                               ? <a className="app-card-try" href={link} target="_blank" rel="noreferrer noopener">Try it →</a>
@@ -171,7 +188,7 @@ export default function AppDirectoryModal({ open, apps = [], instanceOwner = fal
             />
           )}
           {mode === 'review' && instanceOwner && (
-            <AppReviewTab apps={apps} busyKey={busyKey} resolveSrc={resolveSrc} replacedSinceOpened={replacedSinceOpened} onOpenApp={openApp} onAction={runAction} onDialog={openDialog} />
+            <AppReviewTab apps={apps} busyKey={busyKey} resolveSrc={resolveSrc} changedSinceOpened={changedSinceOpened} onOpenApp={openApp} onAction={runAction} onDialog={openDialog} />
           )}
         </div>
 
