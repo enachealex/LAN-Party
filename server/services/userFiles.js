@@ -54,6 +54,9 @@ const INLINE_TYPE = /^(image|audio|video)\/[a-z0-9.+-]+$/;
 // them application/octet-stream, and they would download instead of display).
 const TYPE_OVERRIDES = /** @type {Record<string, string>} */ ({ '.avif': 'image/avif' });
 
+// Part of every ETag these folders hand out; see setHeaders in userFileStatic.
+const HEADERS_VERSION = 'uf2';
+
 /**
  * express.static for a folder of uploaded files, with the headers that keep any of them from ever
  * being active content on this origin (see the top of this file).
@@ -65,8 +68,18 @@ function userFileStatic(dir, frameAncestors, options = {}) {
   const lookup = /** @type {(p: string) => string} */ ((p) => express.static.mime.lookup(p));
   return express.static(dir, {
     ...options,
-    /** @param {any} res @param {string} filePath */
-    setHeaders(res, filePath) {
+    // Validators are ours, not the static server's defaults (see HEADERS_VERSION): no Last-Modified,
+    // and an ETag that carries the headers' version.
+    lastModified: false,
+    /** @param {any} res @param {string} filePath @param {import('fs').Stats} stat */
+    setHeaders(res, filePath, stat) {
+      // A shared cache (Cloudflare here) that stored a file before these headers existed keeps
+      // serving its stored copy, old headers and all, for as long as the origin answers its
+      // revalidation with "not modified" — and the file itself never changes. Versioning the ETag
+      // makes every validator issued before a change to these headers stale, so the cache has to
+      // fetch the file again and takes the new headers with it. Bump HEADERS_VERSION whenever the
+      // headers below change.
+      if (stat) res.setHeader('ETag', `W/"${HEADERS_VERSION}-${stat.size.toString(16)}-${stat.mtime.getTime().toString(16)}"`);
       const override = TYPE_OVERRIDES[path.extname(filePath).toLowerCase()];
       const type = String(override || lookup(filePath) || '').split(';')[0].trim().toLowerCase();
       res.setHeader('X-Content-Type-Options', 'nosniff');

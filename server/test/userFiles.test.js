@@ -145,6 +145,31 @@ describe('uploaded files and framing (server)', () => {
     assertInline(await served(await upload(MP3, 'audio/mpeg', 'song.mp3')), 'audio/mpeg', 'mp3');
   });
 
+  // A shared cache that stored a file before the protective headers existed must not be told
+  // "not modified": it would keep serving its stored copy, old headers included, indefinitely.
+  test('a validator from before the headers changed gets the whole file again, with the headers', async () => {
+    const up = await call('POST', '/files/upload', form('file', PNG, 'image/png', 'cached.png'), token);
+    const url = up.data.attachment.url;
+    const first = await served(url);
+    const etag = first.headers.get('etag');
+    assert.match(etag || '', /^W\/"uf\d+-[0-9a-f]+-[0-9a-f]+"$/, 'the ETag carries the headers version');
+    assert.equal(first.headers.get('last-modified'), null, 'no second validator that an old cache could still use');
+
+    // What the static server used to hand out for the same file: size and mtime, no version.
+    const [, size, mtime] = /^W\/"uf\d+-([0-9a-f]+)-([0-9a-f]+)"$/.exec(etag);
+    const before = await fetch(base + url, { headers: { 'If-None-Match': `W/"${size}-${mtime}"`, 'If-Modified-Since': new Date().toUTCString() } });
+    await before.arrayBuffer();
+    assertInline(before, 'image/png', 'a pre-change validator is stale: full response, protective headers');
+
+    // The current one still saves the transfer. (Raw http: fetch adds Cache-Control: no-cache to a
+    // request that sets If-None-Match itself, and that alone forces a full response.)
+    const now = await new Promise((resolve, reject) => {
+      require('node:http').get(base + url, { headers: { 'If-None-Match': etag } }, (res) => { res.resume(); resolve(res); }).on('error', reject);
+    });
+    assert.equal(now.statusCode, 304);
+    assert.match(String(now.headers['content-security-policy'] || ''), SANDBOX_CSP, 'and a 304 carries the policy too');
+  });
+
   // --- /gifs ---
   test('/gifs: only raster image types are taken, stored under their own extension', async () => {
     for (const [bytes, type, filename] of [[HTML, 'text/html', 'x.html'], [SVG, 'image/svg+xml', 'x.svg'], [HTML, 'application/octet-stream', 'x.gif']]) {
