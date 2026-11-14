@@ -7,8 +7,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('../email');
 
-/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, isInstanceOwner: (username: string) => Promise<boolean>, isReservedOwnerName: (name: unknown) => boolean }} deps */
-function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName }) {
+/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, isInstanceOwner: (username: string) => Promise<boolean>, isReservedOwnerName: (name: unknown) => boolean, appRooms: { rotate: (serverId: string) => Promise<number | null> }, endAppActivitiesInServer: (serverId: string, reason?: string | null) => void }} deps */
+function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer }) {
   app.post('/auth/register', rateLimit({ id: 'register', windowMs: 60 * 60_000, max: 10 }), async (req, res) => {
     const { username, email, password, passwordConfirm } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
@@ -108,6 +108,10 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
   // Permanently delete a user and everything they own/authored (used by account deactivation).
   async function deleteUserCompletely(userId, username) {
     const owned = await db.all('SELECT id FROM servers WHERE owner = ?', username);
+    // The servers they were only a member of. Read now: the rows that say so are about to go.
+    const ownedIds = new Set(owned.map((s) => s.id));
+    const memberOf = (await db.all('SELECT server_id FROM server_members WHERE username = ?', username))
+      .map((m) => m.server_id).filter((id) => !ownedIds.has(id));
     await db.run('BEGIN');
     try {
       for (const s of owned) {
@@ -160,6 +164,15 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     } catch (e) {
       await db.run('ROLLBACK').catch(() => {});
       throw e;
+    }
+    // The account is gone from here on, so nothing below may undo that or report it as failed.
+    // A deleted account still holds the room keys of every app it joined (services/appRooms.js):
+    // each server it was a member of gets new ones. The servers it owned no longer exist, so there
+    // is no epoch to bump; the apps still running in their voice rooms are ended instead.
+    for (const s of owned) endAppActivitiesInServer(s.id, 'rooms-reset');
+    for (const serverId of memberOf) {
+      try { await appRooms.rotate(serverId); }
+      catch (err) { console.error('[app-rooms] could not rotate after an account was deleted:', serverId, err && err.message); }
     }
   }
 

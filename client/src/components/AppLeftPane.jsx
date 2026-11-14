@@ -202,6 +202,7 @@ export default function AppLeftPane({
   onCreateChannel,
   onRenameServer,
   onDeleteServer,
+  onResetAppRooms,        // (serverId, serverName) => void — owner/admins; asks before it does anything
   onRenameChannel,
   onDeleteChannel,
   onManageAccess,
@@ -627,6 +628,11 @@ export default function AppLeftPane({
                   <button key="icon-reset" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetTileImage?.({ kind: 'server', id: ctxMenu.id, name: ctxMenu.name }) }}>↩️ Reset icon</button>
                 )
               }
+              // New room ids for every app in this server's voice channels. The "…" is a promise
+              // that nothing happens yet: App asks first, and says what it ends.
+              items.push(
+                <button key="app-rooms" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetAppRooms?.(ctxMenu.id, ctxMenu.name) }}>🔄 Reset app rooms…</button>
+              )
             }
             if (role !== 'owner' && !isDemo) {
               items.push(

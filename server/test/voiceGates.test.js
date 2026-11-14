@@ -31,7 +31,7 @@ const connect = async (base, token) => {
 };
 
 describe('voice + activity membership gates', () => {
-  let server, call, base, ownerToken, outsiderToken, privateServerId;
+  let server, call, base, ownerToken, outsiderToken, privateServerId, voiceId;
 
   before(async () => {
     server = await startServer();
@@ -41,6 +41,9 @@ describe('voice + activity membership gates', () => {
     outsiderToken = await makeUser(call, 'outsider');
     const made = await call('POST', '/servers', { name: 'Private Lounge' }, ownerToken);
     privateServerId = made.data.server.id;
+    // Outside the commons a voice room is a channel of the server, so the tests need a real one.
+    const ch = await call('POST', `/servers/${privateServerId}/channels`, { name: 'Lounge', type: 'voice' }, ownerToken);
+    voiceId = ch.data.channel.id;
   });
   after(async () => { await server.stop(); });
 
@@ -73,7 +76,7 @@ describe('voice + activity membership gates', () => {
     const sock = await connect(base, ownerToken);
     try {
       const peers = once(sock, 'voice:peers');
-      sock.emit('voice:join', { serverId: privateServerId, channelId: 'voice1' });
+      sock.emit('voice:join', { serverId: privateServerId, channelId: voiceId });
       assert.ok(Array.isArray(await peers), 'member gets the roster');
     } finally { sock.close(); }
 
@@ -90,11 +93,11 @@ describe('voice + activity membership gates', () => {
     const owner = await connect(base, ownerToken);
     try {
       // Owner is in the room and would receive any activity broadcast.
-      owner.emit('voice:join', { serverId: privateServerId, channelId: 'voice1' });
+      owner.emit('voice:join', { serverId: privateServerId, channelId: voiceId });
       await new Promise((r) => setTimeout(r, 300));
 
       const broadcast = notWithin(owner, 'activity:update', 1500);
-      outsider.emit('activity:start', { serverId: privateServerId, channelId: 'voice1', type: 'whiteboard' });
+      outsider.emit('activity:start', { serverId: privateServerId, channelId: voiceId, type: 'whiteboard' });
       assert.equal(await broadcast, null, 'no activity is started by a non-member');
     } finally { outsider.close(); owner.close(); }
   });
@@ -102,10 +105,90 @@ describe('voice + activity membership gates', () => {
   test('sfu:caps answers null for a server the socket does not belong to', async () => {
     const outsider = await connect(base, outsiderToken);
     try {
-      const answer = await request(outsider, 'sfu:caps', { serverId: privateServerId, channelId: 'voice1' });
+      const answer = await request(outsider, 'sfu:caps', { serverId: privateServerId, channelId: voiceId });
       // null = "use the mesh"; it must not hand back router capabilities for someone else's room.
       assert.equal(answer, null);
     } finally { outsider.close(); }
+  });
+
+  // Being a member of the server was all the door asked about, so a private voice channel could be
+  // joined by any member who knew its id — and a member who was kicked stayed in the call.
+  describe('voice rooms follow channel access', () => {
+    let memberToken, listedToken, privId;
+    const enter = async (token, channelId) => {
+      const sock = await connect(base, token);
+      const peers = once(sock, 'voice:peers');
+      sock.emit('voice:join', { serverId: privateServerId, channelId });
+      return { sock, peers: await peers };
+    };
+
+    before(async () => {
+      memberToken = await makeUser(call, 'member');
+      listedToken = await makeUser(call, 'listed');
+      for (const username of ['member', 'listed']) await call('POST', `/servers/${privateServerId}/invite`, { username }, ownerToken);
+      const ch = await call('POST', `/servers/${privateServerId}/channels`, { name: 'Officers', type: 'voice', privacy: 'private', members: ['listed'] }, ownerToken);
+      privId = ch.data.channel.id;
+    });
+
+    test('a member who is not on a private voice channel\'s list is refused at its door', async () => {
+      const inside = await enter(listedToken, privId);
+      const sock = await connect(base, memberToken);
+      try {
+        const refused = once(sock, 'voice:removed');
+        const peers = notWithin(sock, 'voice:peers', 800);
+        const heard = notWithin(inside.sock, 'voice:peer-joined', 800);
+        sock.emit('voice:join', { serverId: privateServerId, channelId: privId });
+        assert.deepEqual(await refused, { serverId: privateServerId, channelId: privId });
+        assert.equal(await peers, null, 'no roster of who is in there');
+        assert.equal(await heard, null, 'and nobody inside is told someone joined');
+      } finally { sock.close(); inside.sock.close(); }
+    });
+
+    test('a voice room that is no channel of the server cannot be joined; the commons still takes any name', async () => {
+      const sock = await connect(base, memberToken);
+      try {
+        const refused = once(sock, 'voice:removed');
+        sock.emit('voice:join', { serverId: privateServerId, channelId: 'voice1' });
+        assert.deepEqual(await refused, { serverId: privateServerId, channelId: 'voice1' });
+        const peers = once(sock, 'voice:peers');
+        sock.emit('voice:join', { serverId: 'demo', channelId: 'any-name-at-all' });
+        assert.ok(Array.isArray(await peers));
+      } finally { sock.close(); }
+    });
+
+    test('taken off the list while in the call: out of the room, and the others are told', async () => {
+      const staying = await enter(ownerToken, privId);
+      const leaving = await enter(listedToken, privId);
+      try {
+        const removed = once(leaving.sock, 'voice:removed');
+        const gone = once(staying.sock, 'voice:peer-left');
+        const res = await call('DELETE', `/servers/${privateServerId}/channels/${privId}/members/listed`, undefined, ownerToken);
+        assert.equal(res.status, 200);
+        assert.deepEqual(await removed, { serverId: privateServerId, channelId: privId });
+        assert.deepEqual(await gone, { id: leaving.sock.id });
+        // Really out, not just told: someone arriving now is not given that socket as a peer.
+        const late = await enter(ownerToken, privId);
+        assert.ok(!late.peers.some((p) => p.id === leaving.sock.id));
+        late.sock.close();
+      } finally { staying.sock.close(); leaving.sock.close(); }
+    });
+
+    test('kicked from the server while in a call: out of every voice room in it', async () => {
+      const staying = await enter(ownerToken, voiceId);
+      const kicked = await enter(memberToken, voiceId);
+      try {
+        const removed = once(kicked.sock, 'voice:removed');
+        const gone = once(staying.sock, 'voice:peer-left');
+        const res = await call('DELETE', `/servers/${privateServerId}/members/member`, undefined, ownerToken);
+        assert.equal(res.status, 200);
+        assert.deepEqual(await removed, { serverId: privateServerId, channelId: voiceId });
+        assert.deepEqual(await gone, { id: kicked.sock.id });
+        // And cannot walk back in.
+        const denied = once(kicked.sock, 'server:denied');
+        kicked.sock.emit('voice:join', { serverId: privateServerId, channelId: voiceId });
+        assert.equal((await denied).serverId, privateServerId);
+      } finally { staying.sock.close(); kicked.sock.close(); }
+    });
   });
 });
 

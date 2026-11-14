@@ -362,6 +362,21 @@ const MIGRATIONS = [
       await addColumn(db, 'apps', 'embed', 'INTEGER NOT NULL DEFAULT 0');
     },
   },
+  {
+    // The app room epoch: a counter per server that is part of every room key an app is given for
+    // that server's voice channels (services/hostedApps.js, services/appRooms.js). Bumping it is
+    // how those keys are revoked when someone stops being entitled to them (kicked, left, taken
+    // off a private channel) or when staff reset them by hand.
+    //
+    // 0 for every server that exists when this runs, and for every server made afterwards. No room
+    // key had been stored by any app under the earlier formula, so there is nothing to carry over.
+    // Only ever counted up, never reset: a value that came round again would bring back keys that
+    // were revoked.
+    name: '0013_app_room_epoch',
+    up: async (db) => {
+      await addColumn(db, 'servers', 'app_room_epoch', 'INTEGER NOT NULL DEFAULT 0');
+    },
+  },
 ];
 
 /**

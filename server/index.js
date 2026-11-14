@@ -16,6 +16,7 @@ const { feedbackInput, inviteInput, inviteLinkInput, pushSubscribeInput, pushUns
 const { migrate } = require('./db/schema');
 const { createActivities } = require('./services/activities');
 const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl, createAppRoomKeys, appFrameOrigin } = require('./services/hostedApps');
+const { createAppRooms } = require('./services/appRooms');
 const { userFileStatic, FRAME_ANCESTORS_SELF, frameAncestorsDirective, GIF_TYPES, SOUND_TYPES, SOUND_EXTENSIONS, ENTRANCE_TYPES, ENTRANCE_EXTENSIONS, FEEDBACK_IMAGE_TYPES, storedExtension } = require('./services/userFiles');
 const { createMessages } = require('./services/messages');
 const { createSfu } = require('./services/sfu');
@@ -340,13 +341,17 @@ async function main() {
   // document runs in an opaque origin (see the sandbox CSP above), so to it this is a cross-origin
   // fetch: the CORS header keeps it loadable however the app pulls it in (plain script, module,
   // fetch). The file is public and identical for everyone — there is nothing here to protect.
-  // Short cache so a fixed shim reaches running apps within minutes, not whenever caches expire.
+  // no-cache: a copy may be kept, but is checked with the server before every use, so a fixed shim
+  // reaches running apps at their next load. The check is cheap (sendFile's ETag answers it with a
+  // 304 and no body). It was `max-age=300`, which never held in production: Cloudflare rewrites a
+  // max-age shorter than its configured browser TTL up to that TTL (4 hours), so browsers could go
+  // on running a stale SDK for hours. no-cache carries no lifetime for it to raise.
   const SDK_FILE = path.join(__dirname, 'sdk', 'lanparty.js');
   app.get('/sdk/lanparty.js', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.setHeader('Cache-Control', 'no-cache');
     res.type('application/javascript').sendFile(SDK_FILE);
   });
   // Terminal for the same reason as the mounts above: a mistyped SDK path must 404, not hand a
@@ -477,8 +482,22 @@ async function main() {
   // is no longer everyone's to start), has its bundle replaced (the files it points at are going),
   // or is a hosted app whose address or "run inside" setting was edited (the room is on the old one).
   function endAppActivities(appId) {
+    endAppActivitiesWhere((room, act) => act.state.appId === appId);
+  }
+  // Every app running in one server's voice rooms: its room keys were just replaced (a rotation,
+  // services/appRooms.js), or the server itself is gone. Server ids never contain a colon, so the
+  // prefix names that server's rooms and no other's.
+  function endAppActivitiesInServer(serverId, reason = null) {
+    const prefix = `voice:${serverId}:`;
+    endAppActivitiesWhere((room) => room.startsWith(prefix), reason);
+  }
+  // The one place an app activity is ended from outside its room. With a `reason`, the people who
+  // had JOINED it are told why first (their app is about to vanish mid-use); the rest of the room
+  // only ever saw a card, and for them it just goes away, as it does on any other ending.
+  function endAppActivitiesWhere(matches, reason = null) {
     for (const [room, act] of Object.entries(activities)) {
-      if (act.type !== APP_ACTIVITY || act.state.appId !== appId) continue;
+      if (act.type !== APP_ACTIVITY || !matches(room, act)) continue;
+      if (reason) for (const id of appJoinedSockets(act)) io.to(id).emit('activity:app-ended', { run: act.state.run, reason });
       delete activities[room];
       io.to(room).emit('activity:update', null);
     }
@@ -492,6 +511,11 @@ async function main() {
       broadcastActivity(room, act);
     }
   }
+  // The public commons: every account is a member of it, and nobody is ever removed from it.
+  const DEMO_ID = 'demo';
+  // Per-server app room epochs: how room keys are revoked when someone loses access, or by hand
+  // (services/appRooms.js, which lists every caller). Never for the commons.
+  const appRooms = createAppRooms({ db, commonsId: DEMO_ID, endAppActivitiesInServer });
 
   // Message parsing/serialisation + reaction & pin storage (services/messages.js).
   const {
@@ -691,7 +715,7 @@ async function main() {
   }
 
   // Auth + account lifecycle (routes/auth.js).
-  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName });
+  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer });
 
   app.get('/user/settings', authMiddleware, async (req, res) => {
     const username = req.user.username;
@@ -1054,7 +1078,6 @@ async function main() {
 
   // --- Servers & channels ---
   const newId = (prefix) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-  const DEMO_ID = 'demo';
 
   // --- Membership & roles ---
   const isStaffRole = (role) => role === 'owner' || role === 'admin';
@@ -1201,7 +1224,7 @@ async function main() {
   }
 
   // Servers / channels / membership (routes/servers.js).
-  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile });
+  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess });
 
   // Shareable invite links (routes/invites.js).
   registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput });
@@ -1371,6 +1394,52 @@ async function main() {
   // unsupported they fall back to the P2P mesh. Media flows on its own port, not the tunnel.
   const sfu = createSfu({ io });
 
+  // A socket stops being in a voice room: by leaving, or by being taken out (enforceVoiceAccess).
+  // One function, so that both tell the room the same things.
+  function dropFromVoiceRoom(sock, room) {
+    sock.leave(room);
+    sock.to(room).emit('voice:peer-left', { id: sock.id });
+    sfu.removePeer(room, sock.id); // close their SFU transports + notify consumers
+    if (liveStreams[sock.id]) { delete liveStreams[sock.id]; broadcastDiscover(); }
+    const act = activities[room];
+    if (act && (io.sockets.adapter.rooms.get(room) || new Set()).size === 0) delete activities[room];
+    // Leaving voice leaves the app too: the people still playing must see them go.
+    else if (appLeave(act, sock.id)) io.to(room).emit('activity:app-joined', { run: act.state.run, joined: act.state.joined });
+  }
+
+  // Can this account be in that voice room? Membership of the server, and — outside the commons,
+  // where a room is just a name — a channel that exists and that they may open. A private voice
+  // channel used to be reachable by any member who knew its id: the join only asked about the server.
+  async function mayBeInVoice(username, serverId, channelId) {
+    if (typeof serverId !== 'string' || typeof channelId !== 'string') return false;
+    const role = await roleOf(serverId, username);
+    if (!role) return false;
+    if (serverId === DEMO_ID) return true;
+    const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+    return !!ch && canAccessChannel(serverId, channelId, username, ch.privacy, role);
+  }
+
+  // Someone just lost access here (kicked, left, taken off a private channel's list, demoted).
+  // Their sockets are still sitting in the voice rooms they had joined, hearing the call: the
+  // membership check happens at the door, not afterwards. So after access is taken away, go
+  // through the rooms they are in and take them out of every one they may no longer be in.
+  async function enforceVoiceAccess(username, serverId) {
+    const prefix = `voice:${serverId}:`;
+    for (const [room, members] of [...io.sockets.adapter.rooms]) {
+      if (!room.startsWith(prefix)) continue;
+      const mine = [...members].filter((id) => io.sockets.sockets.get(id)?.data?.username === username);
+      if (mine.length === 0) continue;
+      const channelId = room.slice(prefix.length);
+      if (await mayBeInVoice(username, serverId, channelId)) continue;
+      for (const id of mine) {
+        const sock = io.sockets.sockets.get(id);
+        if (!sock) continue;
+        dropFromVoiceRoom(sock, room);
+        sock.emit('voice:removed', { serverId, channelId }); // the client hangs up its side
+      }
+    }
+  }
+
   // Socket.IO handlers
   io.on('connection', (socket) => {
     console.log('socket connected', socket.id);
@@ -1391,6 +1460,10 @@ async function main() {
     if (token) {
       try { socketUser = jwt.verify(token, JWT_SECRET).username; } catch (e) { socketUser = null }
     }
+    // Kept on the socket as well, for code that starts from a room and needs to know whose sockets
+    // are in it (enforceVoiceAccess). `clients` cannot answer that: it is only filled in by 'join',
+    // which a hand-written client can skip on its way into a voice room.
+    socket.data.username = socketUser;
 
     // Membership gate for VOICE rooms and activities. Text channels were gated (the 'join' handler
     // checks roleOf and answers server:denied) but voice and activities were not: any socket — even
@@ -1697,6 +1770,21 @@ async function main() {
     // outside. Built-in activities with no app involved keep the membership check they always had.
     const appName = () => socketUser || clients[socket.id]?.name || 'Anon';
     const outsideAppRoom = (room) => activities[room]?.type === APP_ACTIVITY && !socket.rooms.has(room);
+    // Whether this person may be given a channel's room key NOW, asked of the database each time an
+    // app is started or joined. Being in the voice room is not enough for that: a socket stays in a
+    // room it joined after its user is kicked from the server or taken off a private channel, and a
+    // room key that such a socket could still collect would make revoking the old one pointless.
+    // In a real server the channel has to exist as well: a channel that was deleted has nobody's
+    // access rules left, and its id must not go on yielding the keys it had while it was private.
+    // The commons has no private channels and no members to lose, so any room name will do there.
+    const mayUseAppRoom = async (serverId, channelId) => {
+      if (typeof serverId !== 'string' || typeof channelId !== 'string') return false;
+      const role = await roleOf(serverId, socketUser);
+      if (!role) return false;
+      if (serverId === DEMO_ID) return true;
+      const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+      return !!ch && canAccessChannel(serverId, channelId, socketUser, ch.privacy, role);
+    };
     // The joined list changed. Nobody is re-sent the app's shared state for that (up to 64 KB each,
     // for a list of names): the room gets just the list. `self` — the socket whose own view changed,
     // because it joined and now needs the state, or left and must drop it — gets its full view.
@@ -1710,6 +1798,14 @@ async function main() {
       if (type === APP_ACTIVITY) {
         if (!Number.isSafeInteger(appId) || !socket.rooms.has(room)) return;
         if (!appEventAllowed(socket.id)) return; // a start costs a query and a room-wide broadcast
+        // The room key is made for the server's current epoch (services/appRooms.js). Noted before
+        // anything is awaited and compared at the very end: if the server's keys were replaced
+        // while this start was reading, the rotation has already ended the server's apps, and an
+        // activity created after that would be left running on a key that was just revoked.
+        const generation = appRooms.generation(serverId);
+        if (!(await mayUseAppRoom(serverId, channelId))) return;
+        const epoch = await appRooms.epochOf(serverId);
+        if (epoch == null) return;
         // Name, url and icon come from this row. Whatever else the client sent is ignored, so a
         // start can never point the room at a url of the sender's choosing.
         // Asked BEFORE the app's row is read, so that nothing is awaited between reading its status
@@ -1739,8 +1835,10 @@ async function main() {
         // rule here would only look like a ban. Deleting the app is how an owner removes it.
         const ownDraft = (row.status === 'draft' || row.status === 'pending') && !!socketUser && (row.created_by === socketUser || starterIsOwner);
         if (row.status !== 'published' && !ownDraft) return;
-        // Bound to the site the frame is on as well as to the channel (services/hostedApps.js).
-        const act = { type: APP_ACTIVITY, state: appActivityInit(row, appRoomKey(row.id, frameOrigin, serverId, channelId)), by: appName() };
+        if (appRooms.generation(serverId) !== generation) return; // the keys were replaced meanwhile
+        // Bound to the site the frame is on and to the server's epoch as well as to the channel
+        // (services/hostedApps.js).
+        const act = { type: APP_ACTIVITY, state: appActivityInit(row, appRoomKey(row.id, frameOrigin, serverId, channelId, epoch)), by: appName() };
         activities[room] = act;
         // Whoever starts it has already chosen to run it, so they are joined from the first update.
         applyAppEvent(act, { kind: 'join' }, appName(), socket.id);
@@ -1761,8 +1859,8 @@ async function main() {
       // seating someone in a game of Tic-Tac-Toe, a Tic-Tac-Toe "join" adding someone to an app
       // they never chose, one app's frame writing into the next app's state.
       if (appRun !== undefined || activities[room]?.type === APP_ACTIVITY) {
-        // Entirely synchronous, and the bucket comes first: being in the room already proves
-        // membership (voice:join checked it), so a flooding app costs no database query at all.
+        // Synchronous for everything an app itself sends, and the bucket comes first: only someone
+        // who has joined can set or emit, so a flooding app costs no database query at all.
         // The ack tells the sender's SDK whether to keep or roll back its optimistic change; a
         // dropped event is otherwise silent — nobody else in the room hears about it.
         const reply = (r) => { if (typeof ack === 'function') ack(r); };
@@ -1771,6 +1869,16 @@ async function main() {
         if (!socket.rooms.has(room)) return reply({ ok: false, reason: 'not-in-room' });
         if (!appEventAllowed(socket.id)) return reply({ ok: false, reason: 'rate-limited' });
         if (appRun !== act.state.run) return reply({ ok: false, reason: 'ended' });
+        // Joining is what hands over the room key, so it is the one event that asks the database
+        // whether this person may still have it (mayUseAppRoom). It comes from LAN Party's own
+        // Join button, not from the app, and the bucket above has already been charged for it.
+        // Everything is looked at again afterwards: the activity may have been ended (a rotation
+        // does that), or they may have left the room, while the answer was on its way.
+        if (event && typeof event === 'object' && event.kind === 'join') {
+          if (!(await mayUseAppRoom(serverId, channelId))) return reply({ ok: false, reason: 'no-access' });
+          if (activities[room] !== act) return reply({ ok: false, reason: 'ended' });
+          if (!socket.rooms.has(room)) return reply({ ok: false, reason: 'not-in-room' });
+        }
         const result = applyAppEvent(act, event, appName(), socket.id);
         if (!result.ok) return reply({ ok: false, reason: result.reason });
         if (result.relay) {
@@ -1837,6 +1945,8 @@ async function main() {
     // Voice signaling: simple mesh signaling via server
     socket.on('voice:join', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
       if (!(await mayUseVoice(serverId))) { socket.emit('server:denied', { serverId }); return; }
+      // A member, but not of this channel (or it does not exist): refused at the door.
+      if (!(await mayBeInVoice(socketUser, serverId, channelId))) { socket.emit('voice:removed', { serverId, channelId }); return; }
       const room = `voice:${serverId}:${channelId}`;
       socket.join(room);
       const roomSet = io.sockets.adapter.rooms.get(room) || new Set();
@@ -1854,14 +1964,7 @@ async function main() {
     });
 
     socket.on('voice:leave', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
-      const room = `voice:${serverId}:${channelId}`;
-      socket.leave(room);
-      socket.to(room).emit('voice:peer-left', { id: socket.id });
-      sfu.removePeer(room, socket.id); // close their SFU transports + notify consumers
-      if (liveStreams[socket.id]) { delete liveStreams[socket.id]; broadcastDiscover(); }
-      if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size === 0) delete activities[room];
-      // Leaving voice leaves the app too: the people still playing must see them go.
-      else if (appLeave(activities[room], socket.id)) sendAppJoined(room, activities[room], null);
+      dropFromVoiceRoom(socket, `voice:${serverId}:${channelId}`);
     });
 
     socket.on('voice:signal', ({ to, signal } = {}) => {

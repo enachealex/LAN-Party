@@ -3,9 +3,19 @@
 // Role checks and the state broadcasts are shared with the socket layer, so they are injected.
 const { mentionedUsernames } = require('../services/push');
 const { parsePageQuery, fetchPage, channelHistory } = require('../services/history');
+const { rateLimit } = require('../rateLimit');
+
+// Resetting app rooms ends every app running in the server and orphans what apps stored for its
+// channels, so it is not something to do in a loop. Counted per account (the route knows who is
+// asking), and generous enough for someone who is actually cleaning up after a problem.
+const APP_ROOMS_RESET_LIMIT = {
+  id: 'app-rooms-reset', windowMs: 10 * 60_000, max: 10,
+  message: 'App rooms were reset several times just now. Wait a few minutes before doing it again.',
+  keyOf: (/** @type {any} */ req) => req.user && req.user.username,
+};
 
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess }) {
   // The rail shows only the servers the user owns or has been invited to. New users start with an
   // empty rail (no server is auto-joined at registration) and land on the home view.
   app.get('/servers', authMiddleware, async (req, res) => {
@@ -146,7 +156,14 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
   app.delete('/servers/:serverId/channels/:channelId/members/:username', authMiddleware, async (req, res) => {
     const { serverId, channelId, username } = req.params;
     if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
-    await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ? AND username = ?', serverId, channelId, username);
+    const removed = await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ? AND username = ?', serverId, channelId, username);
+    // They can no longer open this channel, so the room keys they collected in it are revoked
+    // (services/appRooms.js). Only when something was really taken away: a name that was not on
+    // the list changes nothing, and neither does a row for an owner or admin, who can open every
+    // channel with or without one.
+    if (removed.changes > 0 && !isStaffRole(await roleOf(serverId, username))) await appRooms.rotate(serverId);
+    // ...and if they are sitting in that channel's voice room right now, they are taken out of it.
+    if (removed.changes > 0) await enforceVoiceAccess(username, serverId);
     await broadcastServerState(serverId);
     return res.json({ success: true });
   });
@@ -229,6 +246,9 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     await db.run('DELETE FROM server_removed WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
+    // Nobody is a member any more, and there is no epoch left to bump (services/appRooms.js): the
+    // apps still running in its voice rooms are ended, and no room key is made for it again.
+    endAppActivitiesInServer(serverId, 'rooms-reset');
     if (srv.icon_url) removeTileIconFile(srv.icon_url); // otherwise the icon outlives its server
     for (const m of members) io.to(`user:${m.username}`).emit('servers:updated'); // drop it from every member's rail
     return res.json({ success: true });
@@ -321,6 +341,12 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
       serverId, target, req.user.username, Date.now()
     );
     await revokeInvitesBy(serverId, target);
+    // And against the apps they joined here: they still hold those channels' room keys, which is
+    // all an app's own server asks for. New keys for the whole server (services/appRooms.js).
+    // After the rows above are gone, so that they cannot be handed one of the new keys.
+    await appRooms.rotate(serverId);
+    // Out of the server means out of its calls, now — not whenever they next hang up.
+    await enforceVoiceAccess(target, serverId);
     io.to(`user:${target}`).emit('servers:updated');
     io.to(`user:${target}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);
@@ -336,9 +362,24 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (srv.owner !== req.user.username) return res.status(403).json({ error: 'Only the owner can change roles' });
     if (target === srv.owner) return res.status(400).json({ error: "The owner's role can't change" });
     const role = (req.body || {}).role === 'admin' ? 'admin' : 'member';
-    if (!(await isMember(serverId, target))) return res.status(404).json({ error: 'Not a member' });
+    const before = await roleOf(serverId, target);
+    if (!before) return res.status(404).json({ error: 'Not a member' });
     await db.run('UPDATE server_members SET role = ? WHERE server_id = ? AND username = ?', role, serverId, target);
     if (role === 'member') await revokeInvitesBy(serverId, target); // no longer staff: see revokeInvitesBy
+    // An admin can open every private channel; a member only the ones they are listed on. So a
+    // demotion can take channels away just as a removal from their lists would, and the room keys
+    // go with them (services/appRooms.js). Not when it takes nothing away: a server with no
+    // private channel the person is missing from keeps its apps running through a role change.
+    if (before === 'admin' && role === 'member') {
+      const lost = await db.get(
+        `SELECT 1 FROM channels c WHERE c.server_id = ? AND COALESCE(c.privacy, 'public') = 'private'
+           AND NOT EXISTS (SELECT 1 FROM channel_members m WHERE m.server_id = c.server_id AND m.channel_id = c.id AND m.username = ?)
+         LIMIT 1`,
+        serverId, target
+      );
+      if (lost) await appRooms.rotate(serverId);
+      await enforceVoiceAccess(target, serverId);
+    }
     io.to(`user:${target}`).emit('servers:updated');
     await broadcastServerState(serverId);
     return res.json({ success: true, role });
@@ -358,10 +399,29 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     // An admin who walks out takes their links with them. Nothing is written to server_removed:
     // leaving is not being removed, so they may come back through a link someone else made.
     await revokeInvitesBy(serverId, me);
+    // Leaving is not being removed, but it ends their claim on the server's app rooms all the
+    // same: they walk out holding room keys, so the server gets new ones (services/appRooms.js).
+    await appRooms.rotate(serverId);
+    await enforceVoiceAccess(me, serverId);
     io.to(`user:${me}`).emit('servers:updated');
     io.to(`user:${me}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);
     return res.json({ success: true });
+  });
+
+  // Reset app rooms (owner/admin): give every voice channel of this server a new room key for
+  // every app, by hand. For when a key may have got out some other way than someone leaving, which
+  // rotates on its own. Apps running in the server are ended (they are on the old keys), and what
+  // an app's own server kept for a channel is no longer where that channel leads.
+  // Not for the commons: it has no staff, and its rooms are everyone's (services/appRooms.js).
+  app.post('/servers/:serverId/app-rooms/reset', authMiddleware, rateLimit(APP_ROOMS_RESET_LIMIT), async (req, res) => {
+    const serverId = req.params.serverId;
+    if (serverId === DEMO_ID) return res.status(400).json({ error: "App rooms can't be reset in the public server" });
+    const srv = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
+    if (!srv) return res.status(404).json({ error: 'Server not found' });
+    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can reset app rooms' });
+    const epoch = await appRooms.rotate(serverId);
+    return res.json({ success: true, epoch });
   });
 }
 

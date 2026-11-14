@@ -167,7 +167,9 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
       clearTimeout(timer)
       if (!aliveRef.current) return
       if (result && result.ok === true) { seenSelfRef.current = false; setPhaseNow('joined') }
-      else fail(result?.reason === 'not-in-room' ? 'Join the voice channel to use this app.' : 'Could not join. Try again in a moment.')
+      // 'no-access': the server asks, at every join, whether this person may still open the channel
+      // (they may have been removed from it, or from the server, while their tab stayed where it was).
+      else fail(result?.reason === 'not-in-room' ? 'Join the voice channel to use this app.' : result?.reason === 'no-access' ? 'You no longer have access to this channel.' : 'Could not join. Try again in a moment.')
     })
   }, [setPhaseNow, send])
 

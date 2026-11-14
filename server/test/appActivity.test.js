@@ -7,6 +7,7 @@
 const { test, before, after, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
 const vm = require('node:vm');
 const { io } = require('socket.io-client');
@@ -709,7 +710,21 @@ describe('app activity (sockets)', () => {
     assert.equal(res.status, 200);
     assert.match(res.headers.get('content-type') || '', /javascript/);
     assert.equal(res.headers.get('access-control-allow-origin'), '*');
-    assert.match(res.headers.get('cache-control') || '', /max-age=\d+/);
+    // Always checked with the server before use, and never given a lifetime: a proxy in front of
+    // the server (Cloudflare) raises a short max-age to hours, and a stale SDK would run that long.
+    assert.equal(res.headers.get('cache-control'), 'no-cache');
+    const etag = res.headers.get('etag');
+    assert.ok(etag, 'an ETag, so that check costs a 304 and no body');
+    // Asked the way a browser revalidates its copy. Not with fetch(): given an If-None-Match it
+    // adds `Cache-Control: no-cache` to the REQUEST, which tells the server to answer in full.
+    const again = await new Promise((resolve, reject) => {
+      http.get(base + '/sdk/lanparty.js', { headers: { 'If-None-Match': etag } }, (r) => {
+        let size = 0;
+        r.on('data', (d) => { size += d.length; });
+        r.on('end', () => resolve({ status: r.statusCode, cacheControl: r.headers['cache-control'], size }));
+      }).on('error', reject);
+    });
+    assert.deepEqual(again, { status: 304, cacheControl: 'no-cache', size: 0 });
     const body = await res.text();
     assert.match(body, /LANParty/);
     assert.doesNotMatch(body, /<!doctype html>/i);

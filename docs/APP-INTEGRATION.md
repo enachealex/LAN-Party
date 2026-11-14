@@ -217,6 +217,10 @@ other if you build HTML out of what they send.
 A plain script, no build step, served by every LAN Party server at that path. It defines one
 global, `LANParty`.
 
+It is served with `Cache-Control: no-cache`: a browser may keep a copy, but checks it with the
+server every time before using it (a `304` with no body when nothing changed). So an uploaded app
+gets a corrected SDK the next time it loads, with no cache lifetime to wait out.
+
 ### `LANParty.connect(options?)` → `Promise<lp>`
 
 Resolves once LAN Party has answered. It never rejects: if nothing answers (see
@@ -233,7 +237,7 @@ Calling it again returns the same connection.
 | | |
 | --- | --- |
 | `lp.me` | `{ username, displayName, avatarUrl }` — the person looking at this copy of the app. `avatarUrl` may be `''`. |
-| `lp.room` | `{ id }` in a voice channel, `null` when the app is open on its own or standalone. `id` is an opaque name for *this app in this voice channel*: 32 lower-case hex characters, the same every time the app runs in that channel, different for every other app. See [The room id](#the-room-id). |
+| `lp.room` | `{ id }` in a voice channel, `null` when the app is open on its own or standalone. `id` is an opaque name for *this app in this voice channel*: 32 lower-case hex characters, the same every time the app runs in that channel until the server's app rooms are [replaced](#when-the-room-id-is-replaced), different for every other app. See [The room id](#the-room-id). |
 | `lp.participants` | The people who have **joined the app**, each `{ username, displayName, avatarUrl }`. Kept up to date. Someone who is in the voice channel but has not pressed Join is not listed. |
 | `lp.state` | The shared object — a fresh copy each time you read it, so read it once into a variable if you need it several times. Writing to the copy changes nothing, for you or anyone else: change the state with `setState` / `replaceState`. |
 | `lp.setState(patch)` | Shallow merge: each key in `patch` replaces that key in the state; a value of `null` deletes the key. Returns `false` (and warns in the console) if the change was refused on the spot. |
@@ -487,24 +491,78 @@ In a voice channel `lp.room` is `{ id }`: 32 lower-case hex characters that name
 that voice channel*. It is what makes "everyone in this channel lands in the same place" work
 without your site knowing anything about LAN Party's servers or channels:
 
-- **It is stable.** The same channel gives your app the same id every time, across sessions and
-  server restarts. Use it as the key of a room on your own backend (`'lanparty:' + lp.room.id`),
-  and whatever you keep there — a queue, a scoreboard — is still there next time.
+- **It is stable, until it is replaced.** The same channel gives your app the same id every time,
+  across sessions and server restarts. Use it as the key of a room on your own backend
+  (`'lanparty:' + lp.room.id`), and whatever you keep there — a queue, a scoreboard — is still
+  there next time. It stops being the same when the LAN Party server (the community, not the
+  machine) that the channel belongs to has its app rooms replaced:
+  see [When the room id is replaced](#when-the-room-id-is-replaced).
 - **It is yours alone.** It is an HMAC, keyed by a secret on the LAN Party server, over your app's
-  id, your app's **origin** and the channel. Another app gets a different id for the same channel,
-  so two apps cannot compare notes; and the id reveals nothing about the server or the channel.
-- **It is given only to people who joined.** Someone in the voice channel who has not pressed Join
-  never receives it.
+  id, your app's **origin**, the channel, and a counter kept for the channel's server (its *app
+  room epoch*). Another app gets a different id for the same channel, so two apps cannot compare
+  notes; and the id reveals nothing about the server, the channel or the counter.
+- **It is given only to people who joined**, and only while they may open the channel. Someone in
+  the voice channel who has not pressed Join never receives it; neither does someone who has been
+  removed from the server or from a private channel, even if their client is still connected.
 - **It is `null`** when the app is opened on its own from the directory, and in standalone mode.
   Treat `null` as "a private session for this one person" — never as a room that people share.
 - **Check its shape** (`/^[0-9a-f]{32}$/`) before using it in a key, a path or a query of your own.
-- **It can change** if the person running the LAN Party server changes its signing secret, if
-  your app is deleted and added again (it is then a new app), or if your app's address is moved to
-  a **different origin** (another host, scheme or port): the key is bound to the site it is given
-  to, so a new site gets new keys rather than inheriting the old one's. A new path or query on the
-  same origin keeps them. What you stored under the old ids is not reachable through the new ones.
+- **It can also change** if the person running the LAN Party instance changes its signing secret,
+  if your app is deleted and added again (it is then a new app), or if your app's address is moved
+  to a **different origin** (another host, scheme or port): the key is bound to the site it is
+  given to, so a new site gets new keys rather than inheriting the old one's. A new path or query
+  on the same origin keeps them. What you stored under the old ids is not reachable through the
+  new ones.
 
 Uploaded apps get `lp.room` too, though with no backend to key by it most have no use for it.
+
+#### When the room id is replaced
+
+The room id is a bearer value: your backend lets in whoever presents it. Someone who joined your
+app in a channel keeps the id they were given, and LAN Party cannot take it out of their hands. So
+that a person who has left a server does not keep a way into its channels' rooms on your backend,
+every room id also depends on a counter that LAN Party keeps per server, the **app room epoch**.
+When the counter moves, every voice channel of that server has a new room id for every app, and
+the old ids are never given out again.
+
+The counter moves, for the one server concerned and no other:
+
+- when a member is **removed** from the server (kicked);
+- when a member **leaves** the server;
+- when a member is **taken off a private channel's access list**;
+- when an **admin is made a member again** and there is a private channel they are not listed on
+  (as an admin they could open it; as a member they cannot);
+- when someone's **account is deleted** — in every server they were a member of;
+- when the server's owner or an admin chooses **Reset app rooms…** in the server's menu
+  (`POST /servers/:serverId/app-rooms/reset`, at most ten times in ten minutes per person).
+
+Nothing else moves it: not joining a server, not being added to a channel, not starting or ending
+an app, not a restart of LAN Party. The **public commons never changes**: everyone is a member of
+it and nobody is ever removed, so there is nobody to take a room away from, and it cannot be reset
+by hand either. Channels there keep their room ids.
+
+When the counter moves, **every app running in that server's voice channels is ended** at that
+moment (the people in it were on the old id), and people who were in one are told that app rooms
+were reset. Whoever starts your app there next gets the new id. To your app this looks like a room
+it has never seen: `lp.room.id` is a different 32 characters and your backend has nothing under it.
+That is the whole of what your app has to handle. In practice: start an empty room, and expect it —
+on a busy server it can happen whenever anybody leaves.
+
+What this does and does not do, in plain words:
+
+- **It protects a channel's room from people who have left.** After they go, the room everyone
+  else is sent to is one they were never given the id of.
+- **It cannot stop a current member from sharing an id.** Anyone who has joined your app holds the
+  current id and can pass it on. That person, and whoever they gave it to, can reach the room on
+  your backend until the next time the counter moves.
+- **What you stored under an old id stays on your server.** LAN Party does not tell your backend
+  that an id was retired, and cannot delete anything there. The old room is simply no longer where
+  LAN Party sends anyone; someone who still holds the old id can still open the old room, with
+  whatever was in it. If that matters, do not keep rooms for ever: expire a room that nobody has
+  opened for a while.
+- **It does not make identity trustworthy.** Who a visitor says they are is still a name your page
+  passes on, not something your backend can check; see
+  [Identity is a name, not proof](#identity-is-a-name-not-proof).
 
 `lp.state`, `lp.setState`, `lp.emit` and `lp.participants` work in a hosted app exactly as in an
 uploaded one, with the same [limits](#limits). An app with its own backend will usually keep its
@@ -520,7 +578,8 @@ that this really is the LAN Party it trusts — and that is all it tells anyone.
 own server ("I am `ann`, in room `lanparty:3f…`") is a claim made by a browser, and anyone can
 open your site, skip the SDK and send the same request with any name they like. Likewise the room
 id is a shared secret among the people who joined the app in that channel — holding it shows that
-someone was let in (or was given it by someone who was), not who they are.
+someone was let in (or was given it by someone who was) at some point since the room id was last
+[replaced](#when-the-room-id-is-replaced), not who they are.
 
 So, for now:
 
@@ -619,9 +678,10 @@ Planned, not built — do not design around them:
 | "Check app" | `client/src/appCheck.ts` |
 | Statuses, transitions, who may see and change an app | `server/routes/library.js` |
 | Hosted apps: the address rules, the room key | `server/services/hostedApps.js`; the frame and its origin check in `client/src/appBridge.ts` (`hostedAppFrame`) |
+| The app room epoch: when room keys are replaced | `server/services/appRooms.js` (which lists every caller); the reset route in `server/routes/servers.js` |
 | Who is an instance owner | `server/services/instanceOwners.js` |
 | Server rules: limits, joined list, rate limit | `server/services/activities.js` (`applyAppEvent`), socket handlers in `server/index.js` |
-| Tests | `server/test/appActivity.test.js`, `server/test/appApproval.test.js`, `server/test/hostedApps.test.js` |
+| Tests | `server/test/appActivity.test.js`, `server/test/appApproval.test.js`, `server/test/hostedApps.test.js`, `server/test/appRooms.test.js` |
 
 In `GET /apps`, **`embeddable` means "uploaded bundle" and nothing else**; a hosted app has
 `embeddable: false, hosted: true`. Tabs opened before hosted apps existed read `embeddable` as
@@ -656,12 +716,33 @@ while it is mounted, so a re-render never reloads the app.
 
 **The room key** (`state.roomKey`) is computed by the server when the app is started:
 `HMAC-SHA256` under a key derived from `JWT_SECRET`, over
-`JSON.stringify([appId, frameOrigin, serverId, channelId])`, cut to 32 hex characters.
+`JSON.stringify([appId, frameOrigin, serverId, channelId, epoch])`, cut to 32 hex characters.
 `frameOrigin` is the hosted app's origin (`new URL(url).origin`) or the constant `'bundle'` for an
 uploaded one (`appFrameOrigin`), so moving a hosted app to another origin rotates all of its keys,
 and a bundle and a hosted app never share one. It is in the activity state only for sockets that have joined the app; everyone
 else's copy has `null`. The client passes it to the app as `room` in the `welcome`, and the solo
 viewer always sends `room: null`.
+
+**The epoch** is `servers.app_room_epoch`, an integer that starts at 0 and only ever counts up
+(migration `0013_app_room_epoch`). It is in the signed text from 0 on; there is no four-part form
+of the key and no compatibility path for one, because nothing had been stored under such a key
+when the epoch was added. `appRooms.rotate(serverId)` (`server/services/appRooms.js`) adds one and
+ends every app activity in that server's voice rooms, through the same function that ends an app
+when it is deleted or unpublished (`endAppActivitiesWhere` in `server/index.js`): each room gets
+`activity:update` `null`, and the sockets that had joined are first sent `activity:app-ended`
+`{ run, reason: 'rooms-reset' }`, which the client shows as a toast. The callers are the routes
+listed under [When the room id is replaced](#when-the-room-id-is-replaced); a new way of losing
+access to a channel has to call it too. Deleting a server ends its apps the same way, with no
+epoch left to bump. The commons (`demo`) is refused inside `rotate` itself.
+
+Because a rotation has to mean something, **who may be handed a room key is asked of the database
+each time**, not inferred from being in the voice room (a socket stays in a room after its user is
+kicked): an app start, and the `join` event, both check that the person is a member of the server
+and may open that channel, and that the channel exists (`mayUseAppRoom`; in the commons any room
+name will do). A refused join is answered `{ ok: false, reason: 'no-access' }`. A start also notes
+the server's rotation counter before it reads anything and gives up if it has moved by the time
+the activity would be created, so a start that overlaps a rotation can never leave a room running
+on the old key.
 
 **Who has joined** is tracked by the server, per connection: pressing Join sends a `join` event,
 Leave sends `leave` (so does the app's panel going off screen, when the person looks at another

@@ -232,30 +232,30 @@ describe('room keys (services/hostedApps.js)', () => {
   const SITE = 'https://music.example.test';
 
   test('32 lower-case hex characters, the same every time for the same app on the same site in the same channel', () => {
-    const k = key(7, SITE, 'demo', 'voice1');
+    const k = key(7, SITE, 'demo', 'voice1', 0);
     assert.match(k, /^[0-9a-f]{32}$/);
-    assert.equal(key(7, SITE, 'demo', 'voice1'), k);
-    assert.equal(createAppRoomKeys('a-server-secret')(7, SITE, 'demo', 'voice1'), k, 'and after a restart');
+    assert.equal(key(7, SITE, 'demo', 'voice1', 0), k);
+    assert.equal(createAppRoomKeys('a-server-secret')(7, SITE, 'demo', 'voice1', 0), k, 'and after a restart');
   });
 
   test('different for another app, another channel, another server', () => {
     const seen = new Set([
-      key(7, SITE, 'demo', 'voice1'),
-      key(8, SITE, 'demo', 'voice1'),
-      key(7, SITE, 'demo', 'voice2'),
-      key(7, SITE, 'other', 'voice1'),
-      key(71, SITE, 'demo', 'voice1'),
+      key(7, SITE, 'demo', 'voice1', 0),
+      key(8, SITE, 'demo', 'voice1', 0),
+      key(7, SITE, 'demo', 'voice2', 0),
+      key(7, SITE, 'other', 'voice1', 0),
+      key(71, SITE, 'demo', 'voice1', 0),
       // Parts that could run together into another set's text stay apart.
-      key(7, SITE, 'demo:voice', '1'),
-      key(7, SITE, 'demo', ':voice1'),
+      key(7, SITE, 'demo:voice', '1', 0),
+      key(7, SITE, 'demo', ':voice1', 0),
     ]);
     assert.equal(seen.size, 7);
   });
 
   test('bound to the site it is given to: another origin for the same app is another key, and a bundle is not a hosted app', () => {
-    const here = key(7, SITE, 'demo', 'voice1');
+    const here = key(7, SITE, 'demo', 'voice1', 0);
     for (const other of ['https://elsewhere.example.test', 'http://music.example.test', 'https://music.example.test:8443', 'bundle']) {
-      assert.notEqual(key(7, other, 'demo', 'voice1'), here, other);
+      assert.notEqual(key(7, other, 'demo', 'voice1', 0), here, other);
     }
     // What decides the origin: a hosted app's address (path and query do not count), or 'bundle'.
     const hosted = (url) => appFrameOrigin({ kind: 'link', embed: 1, url });
@@ -268,18 +268,18 @@ describe('room keys (services/hostedApps.js)', () => {
       assert.equal(appFrameOrigin(row), null, JSON.stringify(row));
     }
     // So moving an app to a new path keeps its keys, and to a new origin rotates them.
-    assert.equal(key(7, hosted('https://music.example.test/v2/'), 'demo', 'voice1'), here);
-    assert.notEqual(key(7, hosted('https://music2.example.test/'), 'demo', 'voice1'), here);
+    assert.equal(key(7, hosted('https://music.example.test/v2/'), 'demo', 'voice1', 0), here);
+    assert.notEqual(key(7, hosted('https://music2.example.test/'), 'demo', 'voice1', 0), here);
   });
 
   test('it cannot be worked out without the server\'s secret, and says nothing about the ids', () => {
-    const k = key(7, SITE, 'demo', 'voice1');
-    assert.notEqual(createAppRoomKeys('another-secret')(7, SITE, 'demo', 'voice1'), k);
+    const k = key(7, SITE, 'demo', 'voice1', 0);
+    assert.notEqual(createAppRoomKeys('another-secret')(7, SITE, 'demo', 'voice1', 0), k);
     for (const part of ['demo', 'voice1', 'music']) assert.ok(!k.includes(Buffer.from(part).toString('hex')), part);
     // Keyed under a label of its own, not with the base secret itself: the same HMAC made
     // straight from that secret is a different value.
     const crypto = require('node:crypto');
-    const direct = crypto.createHmac('sha256', 'a-server-secret').update(JSON.stringify([7, SITE, 'demo', 'voice1'])).digest('hex').slice(0, 32);
+    const direct = crypto.createHmac('sha256', 'a-server-secret').update(JSON.stringify([7, SITE, 'demo', 'voice1', 0])).digest('hex').slice(0, 32);
     assert.notEqual(k, direct);
   });
 });

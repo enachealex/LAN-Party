@@ -1344,6 +1344,7 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .prompt-card{width:100%;max-width:420px;background:#12161c;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:22px 22px 18px;box-shadow:0 24px 64px rgba(0,0,0,.55);color:#edf3fb}
 .prompt-title{font-size:17px;font-weight:800;margin-bottom:12px}
 .prompt-label{display:block;font-size:12px;font-weight:700;letter-spacing:.02em;color:#9fb0bf;margin:0 0 6px}
+.prompt-message{margin:0;font-size:13.5px;line-height:1.5;color:#c9d5e2;overflow-wrap:anywhere}
 .prompt-input{width:100%;box-sizing:border-box;padding:11px 13px;border-radius:9px;background:#0c1015;border:1px solid rgba(255,255,255,.14);color:#edf3fb;font-size:15px}
 .prompt-input:focus{outline:none;border-color:var(--accent-start)}
 .prompt-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}

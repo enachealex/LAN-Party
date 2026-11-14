@@ -127,7 +127,8 @@ function checkHostedUrl(raw, ownKeys, where = {}) {
 
 /**
  * The room key: what an app is told instead of "which voice channel is this". Stable for one app in
- * one channel, so the app can keep something per channel (a queue, a scoreboard) on its own server;
+ * one channel (until the server's epoch moves, below), so the app can keep something per channel (a
+ * queue, a scoreboard) on its own server;
  * different for every app, so two apps cannot compare notes about who shares a channel; and an HMAC,
  * so it says nothing about the server or channel ids and cannot be worked out for a channel one is
  * not in.
@@ -141,16 +142,32 @@ function checkHostedUrl(raw, ownKeys, where = {}) {
  * the same voice channel"), so an app whose address is moved to another origin must not carry its
  * old keys there; the new site gets keys of its own. It follows that moving a hosted app to a new
  * origin rotates all of its room keys. A change of path or query on the same origin does not.
+ *
+ * And it is bound to the server's app room EPOCH (services/appRooms.js), which is what makes it
+ * revocable. Someone who joined an app keeps the key they were given; without the epoch that key
+ * would name the channel's room on the app's own backend for ever, long after they were removed
+ * from the server. Bumping the epoch gives every channel of that server a new key for every app,
+ * and the old ones are never handed out again.
+ *
+ * The epoch is part of the signed text from 0 on: there is no "no epoch" form of the key, and so
+ * nothing to stay compatible with. That is deliberate, and safe only because no app had stored
+ * anything under a key made the old way ([appId, origin, server, channel], four parts) when this
+ * shipped. Do not add a shim that maps epoch 0 back to the four-part text.
  * @param {string} baseSecret
- * @returns {(appId: number, frameOrigin: string, serverId: string, channelId: string) => string}
+ * @returns {(appId: number, frameOrigin: string, serverId: string, channelId: string, epoch: number) => string}
  *   32 lower-case hex characters
  */
 function createAppRoomKeys(baseSecret) {
   const key = deriveKey(baseSecret, 'lanparty:app-room-key:v1');
-  // JSON, so that no app id, origin and channel can run together into another set's bytes.
-  return (appId, frameOrigin, serverId, channelId) => crypto.createHmac('sha256', key)
-    .update(JSON.stringify([appId, String(frameOrigin), String(serverId), String(channelId)]))
-    .digest('hex').slice(0, 32);
+  return (appId, frameOrigin, serverId, channelId, epoch) => {
+    // Thrown rather than read as 0: a caller that forgot the epoch would otherwise hand out the
+    // epoch-0 key of a server that has since revoked it, and nothing would look wrong.
+    if (!Number.isSafeInteger(epoch) || epoch < 0) throw new TypeError('An app room key needs the server\'s app room epoch');
+    // JSON, so that no app id, origin and channel can run together into another set's bytes.
+    return crypto.createHmac('sha256', key)
+      .update(JSON.stringify([appId, String(frameOrigin), String(serverId), String(channelId), epoch]))
+      .digest('hex').slice(0, 32);
+  };
 }
 
 /**

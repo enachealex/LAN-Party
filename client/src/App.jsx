@@ -1078,6 +1078,10 @@ export default function App() {
   const sfuRef = useRef(null)
   const [remoteStreams, setRemoteStreams] = useState({})
   const [inVoice, setInVoice] = useState(false)
+  // For the socket handlers, which are registered once and would otherwise see the first render's
+  // `inVoice` and `leaveVoice` for ever.
+  const inVoiceRef = useRef(false)
+  const leaveVoiceRef = useRef(() => {})
   const [videoOn, setVideoOn] = useState(false) // is the local camera on
   const [screenSharing, setScreenSharing] = useState(false) // is the local screen being shared
   const [screenQuality, setScreenQuality] = useState('1080p30') // selected screen-share quality
@@ -3374,6 +3378,16 @@ export default function App() {
     s.on('server:removed', ({ serverId } = {}) => {
       loadServers()
       if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
+      // Out of the server means out of its call. The server has already taken this socket out of
+      // the room; this hangs up our side, so the microphone is not left open into nothing.
+      if (inVoiceRef.current && voiceServerIdRef.current === serverId) leaveVoiceRef.current()
+    })
+    // Taken out of one voice channel (access to it was removed), or refused at its door.
+    s.on('voice:removed', ({ serverId } = {}) => {
+      if (inVoiceRef.current && voiceServerIdRef.current === serverId) {
+        leaveVoiceRef.current()
+        setToast('You no longer have access to that voice channel')
+      }
     })
     // Community app review (server/routes/library.js). Each carries { id, name, status } and
     // nothing else, so the list is fetched again: GET /apps is where the details and the
@@ -3723,6 +3737,13 @@ export default function App() {
       if (!m || typeof m !== 'object' || !Array.isArray(m.joined)) return
       setActivity((prev) => (prev && prev.type === 'app' && prev.state && prev.state.run === m.run ? { ...prev, state: { ...prev.state, joined: m.joined } } : prev))
     })
+    // The app this client had joined was ended from outside the room, and the server says why. Sent
+    // just before the `activity:update` that takes it away, and only to the people who were in it:
+    // without it their app would simply vanish. 'rooms-reset' covers a manual reset and the
+    // automatic one (someone left or was removed); which of the two is not this person's business.
+    s.on('activity:app-ended', (m) => {
+      if (m && typeof m === 'object' && m.reason === 'rooms-reset') setToast('App rooms were reset, so the app was ended. Start it again to carry on.')
+    })
     // A transient message from an uploaded app someone else in the room is running. Passed on as
     // data to the app's own frame and never rendered here.
     s.on('activity:app-message', (m) => {
@@ -3974,6 +3995,17 @@ export default function App() {
     })
   })
   const resolvePrompt = (value) => { promptModal?.resolve(value); setPromptModal(null) }
+  // The same modal as a yes/no question: `message` in place of the text field. Resolves true or
+  // null. For anything that must be confirmed in the desktop app, where window.confirm does nothing.
+  const askConfirm = (opts = {}) => new Promise((resolve) => {
+    setPromptModal({
+      title: opts.title || 'Are you sure?',
+      message: opts.message || '',
+      confirmOnly: true,
+      submitLabel: opts.submitLabel || 'OK',
+      resolve,
+    })
+  })
 
   const createServer = async () => {
     const serverName = ((await askPrompt({ title: 'Create a server', label: 'Server name', placeholder: 'e.g. Game Night', submitLabel: 'Create' })) || '').trim()
@@ -4029,6 +4061,24 @@ export default function App() {
     const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' })
     if (!res.ok) { alert((await res.json()).error || 'Delete failed'); return }
     if (selectedServerId === serverId) setSelectedServerId('home')
+  }
+
+  // Give every voice channel of a server a new room id for every app (owner/admins). The server
+  // also does this by itself whenever someone leaves or is removed; this is the same thing by hand.
+  const resetAppRooms = async (serverId, serverName2) => {
+    const ok = await askConfirm({
+      title: `Reset app rooms in “${serverName2 || 'this server'}”?`,
+      message: 'Apps running in this server’s voice channels are ended for everyone. Apps that keep something for each channel on their own servers, such as a music queue, start fresh: what they kept before stays on the app’s server, but this server’s channels no longer lead to it. This cannot be undone.',
+      submitLabel: 'Reset app rooms',
+    })
+    if (!ok) return
+    try {
+      const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/app-rooms/reset`, { method: 'POST' })
+      if (res.ok) setToast('App rooms were reset')
+      else setToast((await res.json().catch(() => ({}))).error || 'Could not reset app rooms')
+    } catch (_) {
+      setToast('Could not reach the server')
+    }
   }
 
   const renameChannel = async (channelId, oldName) => {
@@ -5597,6 +5647,8 @@ export default function App() {
     setVoiceChannelId(null)
     setVoiceRailTarget(null)
   }
+  inVoiceRef.current = inVoice
+  leaveVoiceRef.current = leaveVoice
 
   const handleSignOut = () => {
     if (socket) {
@@ -7410,6 +7462,7 @@ export default function App() {
         onCreateChannel={createChannel}
         onRenameServer={renameServer}
         onDeleteServer={deleteServer}
+        onResetAppRooms={resetAppRooms}
         onRenameChannel={renameChannel}
         onDeleteChannel={deleteChannel}
         onManageAccess={(id, chName) => setManageAccessChannel({ id, name: chName })}
@@ -8673,26 +8726,33 @@ export default function App() {
       {/* In-app text prompt — replaces window.prompt (unsupported in the Electron desktop app) */}
       {promptModal && (
         <div className="prompt-overlay" role="dialog" aria-modal="true" aria-labelledby="prompt-title" onMouseDown={(e) => { if (e.target === e.currentTarget) resolvePrompt(null) }}>
-          <div className="prompt-card">
+          <div className="prompt-card" onKeyDown={(e) => { if (promptModal.confirmOnly && e.key === 'Escape') { e.preventDefault(); resolvePrompt(null) } }}>
             <div id="prompt-title" className="prompt-title">{promptModal.title}</div>
-            {promptModal.label && <label className="prompt-label" htmlFor="prompt-input">{promptModal.label}</label>}
-            <input
-              id="prompt-input"
-              className="prompt-input"
-              autoFocus
-              type="text"
-              maxLength={80}
-              placeholder={promptModal.placeholder}
-              value={promptValue}
-              onChange={(e) => setPromptValue(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') { e.preventDefault(); resolvePrompt(promptValue) }
-                else if (e.key === 'Escape') { e.preventDefault(); resolvePrompt(null) }
-              }}
-            />
+            {promptModal.confirmOnly ? (
+              <p className="prompt-message">{promptModal.message}</p>
+            ) : (
+              <>
+                {promptModal.label && <label className="prompt-label" htmlFor="prompt-input">{promptModal.label}</label>}
+                <input
+                  id="prompt-input"
+                  className="prompt-input"
+                  autoFocus
+                  type="text"
+                  maxLength={80}
+                  placeholder={promptModal.placeholder}
+                  value={promptValue}
+                  onChange={(e) => setPromptValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); resolvePrompt(promptValue) }
+                    else if (e.key === 'Escape') { e.preventDefault(); resolvePrompt(null) }
+                  }}
+                />
+              </>
+            )}
             <div className="prompt-actions">
-              <button className="prompt-btn ghost" onClick={() => resolvePrompt(null)}>Cancel</button>
-              <button className="prompt-btn primary" onClick={() => resolvePrompt(promptValue)}>{promptModal.submitLabel}</button>
+              {/* A question opens on Cancel: Enter or Space must not confirm something by reflex. */}
+              <button className="prompt-btn ghost" autoFocus={!!promptModal.confirmOnly} onClick={() => resolvePrompt(null)}>Cancel</button>
+              <button className="prompt-btn primary" onClick={() => resolvePrompt(promptModal.confirmOnly ? true : promptValue)}>{promptModal.submitLabel}</button>
             </div>
           </div>
         </div>
