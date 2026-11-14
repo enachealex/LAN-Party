@@ -15,6 +15,7 @@
 // The whole module is defensive: if the worker can't spawn (unsupported platform, port in use),
 // enabled() turns false and every client request answers null → mesh fallback, never an outage.
 const os = require('os');
+const { isPublicAddress } = require('./sfuAddress');
 
 const MEDIA_CODECS = [
   { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
@@ -26,6 +27,18 @@ const MEDIA_CODECS = [
   },
 ];
 
+// How long an sfu:* request waits for a voice:join of the same socket that is still being decided.
+// A join is two database reads; this only has to outlast a slow disk, not a stuck one.
+const JOIN_WAIT_MS = 5000;
+
+// Connection check (sfu:probe-*): a transport that carries no media and exists only so a browser
+// can find out whether it reaches the media port. Each one is a real port binding in the worker, so
+// they are few, short-lived and counted per account.
+const PROBE_TTL_MS = 20_000;
+const PROBE_MAX_LIVE = 2; // one over UDP and one over TCP, side by side
+const PROBE_WINDOW_MS = 60_000;
+const PROBE_MAX_PER_WINDOW = 6;
+
 function lanIPv4s() {
   const out = [];
   for (const infos of Object.values(os.networkInterfaces())) {
@@ -34,6 +47,14 @@ function lanIPv4s() {
     }
   }
   return out;
+}
+
+// Wait for `promise`, but not for ever, and never throw: whatever became of the join, the caller
+// goes on to read the room for itself.
+function settled(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(resolve, ms); });
+  return Promise.race([Promise.resolve(promise).catch(() => {}), timeout]).finally(() => clearTimeout(timer));
 }
 
 function createSfu({ io }) {
@@ -45,22 +66,27 @@ function createSfu({ io }) {
   let mediasoup = null;
   try { mediasoup = require('mediasoup'); } catch (_) { /* not installed → SFU off */ }
 
-  let worker = null;
+  let workerPromise = null;
   let webRtcServer = null;
   let broken = false;
   const rooms = new Map(); // room name -> { router, peers: Map<socketId, peerState> }
+  let probeRouterPromise = null;
+  const probes = new Map(); // socket id -> Map<transport id, { transport, timer }>
+  const probeStarts = new Map(); // account -> { count, resetAt }
 
-  async function getWorker() {
-    if (worker) return worker;
-    worker = await mediasoup.createWorker({ logLevel: 'warn' });
+  async function startWorker() {
+    const worker = await mediasoup.createWorker({ logLevel: 'warn' });
     worker.on('died', () => {
       // A dead worker takes every room with it. Mark the SFU broken (clients joining later get the
       // mesh) rather than crash the whole app server.
       console.error('[sfu] mediasoup worker died — SFU disabled until restart');
       broken = true;
-      worker = null;
+      workerPromise = null;
       webRtcServer = null;
+      probeRouterPromise = null;
       rooms.clear();
+      for (const live of probes.values()) for (const p of live.values()) clearTimeout(p.timer);
+      probes.clear();
     });
     // One shared port per announced address (its udp and tcp bindings share the number). Two
     // bindings can't share the same ip:port, so the i-th announced address gets PORT+i — a host
@@ -75,18 +101,60 @@ function createSfu({ io }) {
         listenInfos.push({ protocol, ip: '0.0.0.0', announcedAddress: addr, port: PORT + i });
       }
     });
-    webRtcServer = await worker.createWebRtcServer({ listenInfos });
+    try {
+      webRtcServer = await worker.createWebRtcServer({ listenInfos });
+    } catch (err) {
+      // The port is taken. Without this the worker process stayed behind with nothing to do.
+      try { worker.close(); } catch (_) { /* already gone */ }
+      throw err;
+    }
     console.log(`[sfu] ready from port ${PORT} (udp/tcp), announcing: ${announcedAddresses.join(', ') || '(none)'}`);
     return worker;
   }
 
+  // One worker, however many callers ask at once. Two rooms opening in the same moment (or a room
+  // and a connection check) each used to start a worker of their own, and the second one's port
+  // binding failed — which marked the whole SFU broken.
+  function getWorker() {
+    if (!workerPromise) {
+      workerPromise = startWorker().catch((err) => { workerPromise = null; throw err; });
+    }
+    return workerPromise;
+  }
+
   function enabled() { return !!mediasoup && !disabled && !broken; }
+
+  // Can a call actually be carried right now? enabled() only says nothing has gone wrong YET; this
+  // starts the worker to find out, exactly as the first join would.
+  async function ready() {
+    if (!enabled()) return false;
+    try { await getWorker(); return true; } catch (err) {
+      console.error('[sfu] worker failed to start:', err.message);
+      broken = true; // e.g. media port already bound — don't retry on every request
+      return false;
+    }
+  }
+
+  // What an operator or a client's connection check may know. No addresses: whether one of them is
+  // public is the useful fact, and the address itself is nobody's business.
+  function info() {
+    return {
+      enabled: !!mediasoup && !disabled,
+      ports: announcedAddresses.length ? announcedAddresses.map((_, i) => PORT + i) : [PORT],
+      publicAddressAnnounced: announcedAddresses.some(isPublicAddress),
+    };
+  }
 
   async function getRoom(name) {
     let room = rooms.get(name);
     if (room) return room;
     const w = await getWorker();
+    // Two requests for a room that does not exist yet both get here; the first one's router wins.
+    room = rooms.get(name);
+    if (room) return room;
     const router = await w.createRouter({ mediaCodecs: MEDIA_CODECS });
+    room = rooms.get(name);
+    if (room) { try { router.close() } catch (_) { /* already closed */ } return room; }
     room = { router, peers: new Map() };
     rooms.set(name, room);
     return room;
@@ -114,7 +182,8 @@ function createSfu({ io }) {
   }
 
   // Remove one participant: close their transports (which closes producers/consumers) and tell the
-  // room their media is gone. Called on voice:leave and on disconnect.
+  // room their media is gone. Called on voice:leave, on disconnect, and when a participant says it
+  // has switched to direct connections (its producers would otherwise sit there, silent).
   function removePeer(roomName, socketId) {
     const room = rooms.get(roomName);
     if (!room) return;
@@ -131,11 +200,55 @@ function createSfu({ io }) {
     }
   }
 
+  // ---- Connection check ----
+  // Its own router, in no voice room: a check must work before any call exists, and must never be
+  // able to produce into or consume from one.
+  function getProbeRouter() {
+    if (!probeRouterPromise) {
+      probeRouterPromise = getWorker()
+        .then((w) => w.createRouter({ mediaCodecs: MEDIA_CODECS }))
+        .catch((err) => { probeRouterPromise = null; throw err; });
+    }
+    return probeRouterPromise;
+  }
+
+  function closeProbe(socketId, transportId) {
+    const live = probes.get(socketId);
+    const probe = live && live.get(transportId);
+    if (!probe) return;
+    clearTimeout(probe.timer);
+    try { probe.transport.close() } catch (_) { /* already closed */ }
+    live.delete(transportId);
+    if (live.size === 0) probes.delete(socketId);
+  }
+
+  function closeProbes(socketId) {
+    for (const transportId of [...(probes.get(socketId)?.keys() || [])]) closeProbe(socketId, transportId);
+  }
+
+  function probeAllowed(account) {
+    const now = Date.now();
+    if (probeStarts.size > 1000) for (const [k, v] of probeStarts) if (v.resetAt <= now) probeStarts.delete(k);
+    let bucket = probeStarts.get(account);
+    if (!bucket || bucket.resetAt <= now) { bucket = { count: 0, resetAt: now + PROBE_WINDOW_MS }; probeStarts.set(account, bucket); }
+    bucket.count += 1;
+    return bucket.count <= PROBE_MAX_PER_WINDOW;
+  }
+
   // Wire the per-socket signaling. `roomOf(socket)` returns the voice room this socket is in (the
   // caller owns room membership); handlers verify it so a socket can't produce into a room it left.
   // `mayUseVoice(serverId)` is the membership gate — sfu:caps names a server/channel explicitly, so
   // without it an ungated socket could probe (and spin up a router for) any room it could name.
-  function bindSocket(socket, roomOf, mayUseVoice = async () => true) {
+  //
+  // `pendingJoin()` returns a promise while a voice:join of this socket is still being decided, and
+  // null otherwise. A client sends voice:join and its first sfu:* request back to back; the join
+  // reads the database before the socket enters the room, so the request that followed it was
+  // handled first, found no room, and was told "sfu unavailable" — every time, which is why no
+  // call ever used the SFU. Each handler that reads the room now lets such a join finish first.
+  // With no join in flight nothing is awaited, so the order of everything else is what it was.
+  //
+  // `probeAs` is the account a connection check is counted against; null (not signed in) gets none.
+  function bindSocket(socket, roomOf, mayUseVoice = async () => true, { pendingJoin = () => null, probeAs = null } = {}) {
     const fail = (cb, msg) => { if (typeof cb === 'function') cb({ error: msg }) };
 
     // Capability probe + router caps. Answering null (not an error) = "use the mesh". The client
@@ -149,6 +262,7 @@ function createSfu({ io }) {
       // An explicitly named server must be one this socket is a member of. Answering null (not an
       // error) keeps the client's mesh fallback working for a genuine non-member.
       if (explicit && !(await mayUseVoice(payload.serverId))) return cb(null);
+      if (!explicit) { const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS); }
       const roomName = explicit || roomOf(socket);
       if (!roomName) return cb(null);
       try {
@@ -162,6 +276,7 @@ function createSfu({ io }) {
     });
 
     socket.on('sfu:create-transport', async (_payload, cb) => {
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       if (!enabled() || !roomName) return fail(cb, 'sfu unavailable');
       try {
@@ -172,7 +287,10 @@ function createSfu({ io }) {
           enableTcp: true,
           preferUdp: true,
         });
+        // Left (or was taken out) while the transport was being made: it belongs to nobody now.
+        if (roomOf(socket) !== roomName) { try { transport.close() } catch (_) { /* already closed */ } return fail(cb, 'sfu unavailable'); }
         getPeer(room, socket.id).transports.set(transport.id, transport);
+        if (typeof cb !== 'function') return;
         cb({
           id: transport.id,
           iceParameters: transport.iceParameters,
@@ -183,15 +301,17 @@ function createSfu({ io }) {
     });
 
     socket.on('sfu:connect-transport', async ({ transportId, dtlsParameters } = {}, cb) => {
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       const peer = roomName && rooms.get(roomName)?.peers.get(socket.id);
       const transport = peer?.transports.get(transportId);
       if (!transport) return fail(cb, 'unknown transport');
-      try { await transport.connect({ dtlsParameters }); cb({ ok: true }) }
+      try { await transport.connect({ dtlsParameters }); if (typeof cb === 'function') cb({ ok: true }) }
       catch (err) { fail(cb, err.message) }
     });
 
     socket.on('sfu:produce', async ({ transportId, kind, rtpParameters, appData } = {}, cb) => {
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       const room = roomName && rooms.get(roomName);
       const peer = room?.peers.get(socket.id);
@@ -202,11 +322,12 @@ function createSfu({ io }) {
         peer.producers.set(producer.id, producer);
         producer.on('transportclose', () => peer.producers.delete(producer.id));
         socket.to(roomName).emit('sfu:new-producer', { producerId: producer.id, peerSocketId: socket.id, kind });
-        cb({ id: producer.id });
+        if (typeof cb === 'function') cb({ id: producer.id });
       } catch (err) { fail(cb, err.message) }
     });
 
-    socket.on('sfu:close-producer', ({ producerId } = {}) => {
+    socket.on('sfu:close-producer', async ({ producerId } = {}) => {
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       const peer = roomName && rooms.get(roomName)?.peers.get(socket.id);
       const producer = peer?.producers.get(producerId);
@@ -216,14 +337,16 @@ function createSfu({ io }) {
       socket.to(roomName).emit('sfu:producer-closed', { producerId, peerSocketId: socket.id });
     });
 
-    socket.on('sfu:producers', (_payload, cb) => {
+    socket.on('sfu:producers', async (_payload, cb) => {
       if (typeof cb !== 'function') return;
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       const room = roomName && rooms.get(roomName);
       cb(room ? producerList(room, socket.id) : []);
     });
 
     socket.on('sfu:consume', async ({ transportId, producerId, rtpCapabilities } = {}, cb) => {
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       const room = roomName && rooms.get(roomName);
       const peer = room?.peers.get(socket.id);
@@ -240,6 +363,7 @@ function createSfu({ io }) {
           peer.consumers.delete(consumer.id);
           socket.emit('sfu:consumer-closed', { consumerId: consumer.id });
         });
+        if (typeof cb !== 'function') return;
         cb({
           id: consumer.id,
           producerId,
@@ -250,6 +374,7 @@ function createSfu({ io }) {
     });
 
     socket.on('sfu:resume-consumer', async ({ consumerId } = {}, cb) => {
+      const joining = pendingJoin(); if (joining) await settled(joining, JOIN_WAIT_MS);
       const roomName = roomOf(socket);
       const peer = roomName && rooms.get(roomName)?.peers.get(socket.id);
       const consumer = peer?.consumers.get(consumerId);
@@ -257,9 +382,57 @@ function createSfu({ io }) {
       try { await consumer.resume(); if (typeof cb === 'function') cb({ ok: true }) }
       catch (err) { fail(cb, err.message) }
     });
+
+    // ---- Connection check: "can this browser reach the media port?", asked outside any call ----
+    // A transport limited to ONE protocol, so the client learns about UDP and TCP separately. The
+    // error is a code, not a sentence: the client turns it into its own words.
+    socket.on('sfu:probe-start', async ({ protocol } = {}, cb) => {
+      if (typeof cb !== 'function') return;
+      if (!probeAs) return cb({ error: 'not-allowed' });
+      if (protocol !== 'udp' && protocol !== 'tcp') return cb({ error: 'bad-protocol' });
+      if (!probeAllowed(probeAs)) return cb({ error: 'rate-limited' });
+      if (!(await ready())) return cb({ error: 'sfu-off' });
+      try {
+        const router = await getProbeRouter();
+        const transport = await router.createWebRtcTransport({
+          webRtcServer,
+          enableUdp: protocol === 'udp',
+          enableTcp: protocol === 'tcp',
+        });
+        if (!socket.connected) { try { transport.close() } catch (_) { /* already closed */ } return; }
+        let live = probes.get(socket.id);
+        if (!live) { live = new Map(); probes.set(socket.id, live); }
+        // Starting a third lets go of the oldest: a client that never says "stop" cannot pile them up.
+        while (live.size >= PROBE_MAX_LIVE) closeProbe(socket.id, live.keys().next().value);
+        const timer = setTimeout(() => closeProbe(socket.id, transport.id), PROBE_TTL_MS);
+        timer.unref();
+        live.set(transport.id, { transport, timer });
+        cb({
+          routerRtpCapabilities: router.rtpCapabilities,
+          id: transport.id,
+          iceParameters: transport.iceParameters,
+          iceCandidates: transport.iceCandidates,
+          dtlsParameters: transport.dtlsParameters,
+        });
+      } catch (err) {
+        console.error('[sfu] connection check failed:', err.message);
+        cb({ error: 'failed' });
+      }
+    });
+
+    socket.on('sfu:probe-connect', async ({ transportId, dtlsParameters } = {}, cb) => {
+      const probe = probes.get(socket.id)?.get(transportId);
+      if (!probe) return fail(cb, 'unknown transport');
+      try { await probe.transport.connect({ dtlsParameters }); if (typeof cb === 'function') cb({ ok: true }) }
+      catch (err) { fail(cb, err.message) }
+    });
+
+    socket.on('sfu:probe-stop', ({ transportId } = {}) => closeProbe(socket.id, transportId));
+
+    socket.on('disconnect', () => closeProbes(socket.id));
   }
 
-  return { enabled, bindSocket, removePeer };
+  return { enabled, ready, info, announcedAddresses: () => [...announcedAddresses], bindSocket, removePeer };
 }
 
 module.exports = { createSfu };

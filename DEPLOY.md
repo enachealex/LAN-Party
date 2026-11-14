@@ -131,11 +131,49 @@ Chosen automatically per join:
     bound to `SFU_PORT + i`: remote clients use **40000** (UDP+TCP, forwarded on the router to
     `.33`), LAN clients use **40001** directly. `ufw` allows both. Never rely on auto-detect, which
     would also advertise Docker bridge addresses.
-  - If the home's public IP changes, remote media stops until `SFU_ANNOUNCED_IPS` is updated.
+  - If the home's public IP changes, remote media stops until `SFU_ANNOUNCED_IPS` is updated. The
+    server checks for this at boot and every 30 minutes (it asks `cloudflare.com/cdn-cgi/trace`
+    what address it is seen from) and logs once, when the two differ:
+    `[sfu] the announced public address no longer matches this network's public address; ...`.
+    `SFU_ADDRESS_CHECK=0` turns the check off.
   - `mediasoup` is a native module installed on the host. If it's missing, or `SFU_DISABLED=1`,
     every client uses the mesh and nothing breaks.
 - **P2P mesh**, the fallback: STUN only in production, so peers on hard NATs can't connect unless
   a TURN relay is added (coturn per `deploy/turnserver.conf.example`, then the `TURN_*` vars).
+
+Until November 2026 **no call ever used the SFU**. The client sent `voice:join` and its first SFU
+request back to back; the join read the database before putting the socket in the room, so the SFU
+request was handled first, found no room, and was refused, and the client fell back to the mesh.
+The server now holds SFU requests until the join is decided, which fixes clients already in the
+field too. Expect the media port to carry traffic for the first time: if remote callers go quiet
+after this deploy, the port forward or `SFU_ANNOUNCED_IPS` was never right.
+
+A room can mix both kinds. Each client declares its mode (`sfu` or `mesh`) when it joins and when
+it changes; two participants connect directly exactly when at least one of them is in mesh mode. A
+client still running a build from before this declares nothing: it works with other old builds as
+before and with new ones in SFU mode, but **a new client in mesh mode and an old client in SFU mode
+cannot hear each other** until the old one reloads.
+
+When someone "cannot hear anyone":
+
+- **In the call**, the dot at the left of the call controls opens the connection details: through
+  the voice server or directly, why not the server if not (media port unreachable from their
+  network, voice server off, their own "Direct connection only" setting, or the server's refusal),
+  and per person the state, the path, and for direct links the ICE candidate type, round trip and
+  loss. `window.__lanpartyVoice()` in the browser console returns the same as data.
+- **Before a call**, "Check connection" (next to the microphone test, in the pre-join screen and in
+  Settings) connects a real transport to the media port over UDP and over TCP, asks STUN for a
+  public address, and says whether a TURN relay is configured.
+- **On the host**, `pm2 logs` has one line per fallback, e.g.
+  `[voice] <socket id> fell back to direct connections (reason: media-unreachable)`. Reasons:
+  `media-unreachable` (the port did not answer within 8 s: forwarding, firewall, or a stale
+  announced address), `media-lost`, `refused`, `sfu-off` (the worker failed to start),
+  `user-choice`, `old-client`.
+- `GET /webrtc/diagnostics` (signed in) reports whether the SFU is enabled and usable, its ports,
+  whether a public address is announced and whether it has gone stale (`announcedAddressStale`),
+  the STUN urls, and whether TURN is configured. No addresses or credentials.
+- "Direct connection only (skip the voice server)" in the in-call audio menu is the workaround for
+  one person the SFU does not work for; it is per device and off by default.
 
 ## Environment variables and key files
 
@@ -147,7 +185,7 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `PORT`, `DATA_DIR`, `CLIENT_DIST`, `CLIENT_ORIGIN` | `5280`, `/mnt/data/lan-party/data`, `/srv/apps/lan-party/client/dist`, `https://lanparty.thejumpvault.com` |
 | `INSTANCE_OWNERS` | Optional. Comma-separated usernames who run the instance; today that means approving uploaded apps for the public app directory. When set and non-empty it replaces the default, which is the oldest account (lowest `users.id`). **The accounts must already exist**, spelled exactly as registered (case matters): a listed name that no account has makes nobody an owner and is logged as a warning at every boot. A listed name is reserved in any capitalisation — it cannot be registered or renamed into — and the list does not follow a rename, so a listed account cannot change its username until this variable is changed (then restart). |
 | `PUBLIC_APP_URL` | Public base URL for links the server hands out, e.g. feedback screenshots in Vaultline tickets |
-| `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED` | Voice networking, above |
+| `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED`, `SFU_ADDRESS_CHECK` | Voice networking, above |
 | `STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web Push (notifications while the app is closed). All optional: with none set, a keypair is generated on first boot and kept in `DATA_DIR/vapid.json`, and the subject is `mailto:admin@<CLIENT_ORIGIN host>`. See below. |
 | `TENOR_API_KEY` / `tenor.key` | GIF search |

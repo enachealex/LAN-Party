@@ -20,6 +20,7 @@ const { createAppRooms } = require('./services/appRooms');
 const { userFileStatic, FRAME_ANCESTORS_SELF, frameAncestorsDirective, GIF_TYPES, SOUND_TYPES, SOUND_EXTENSIONS, ENTRANCE_TYPES, ENTRANCE_EXTENSIONS, FEEDBACK_IMAGE_TYPES, storedExtension } = require('./services/userFiles');
 const { createMessages } = require('./services/messages');
 const { createSfu } = require('./services/sfu');
+const { createAddressMonitor, fetchPublicAddress } = require('./services/sfuAddress');
 const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./services/push');
 const { createInstanceOwners } = require('./services/instanceOwners');
 const { registerMediaRoutes } = require('./routes/media');
@@ -287,8 +288,9 @@ async function main() {
   app.use(cors({ origin: corsOrigin }));
   // WebRTC ICE config (STUN + optional TURN from env) — served to clients so TURN creds aren't
   // baked into the public JS bundle and can be rotated without a rebuild.
+  const stunUrls = () => (process.env.STUN_URLS || 'stun:stun.l.google.com:19302').split(',').map((s) => s.trim()).filter(Boolean);
   app.get('/webrtc/ice', (_req, res) => {
-    const iceServers = [{ urls: (process.env.STUN_URLS || 'stun:stun.l.google.com:19302').split(',').map((s) => s.trim()) }];
+    const iceServers = [{ urls: stunUrls() }];
     if (process.env.TURN_URLS) {
       iceServers.push({ urls: process.env.TURN_URLS.split(',').map((s) => s.trim()), username: process.env.TURN_USERNAME || '', credential: process.env.TURN_CREDENTIAL || '' });
     }
@@ -1412,10 +1414,65 @@ async function main() {
   // unsupported they fall back to the P2P mesh. Media flows on its own port, not the tunnel.
   const sfu = createSfu({ io });
 
+  // Remote callers reach the SFU at the announced public address; when the home's address changes
+  // they silently stop getting through. Checked at boot and every half hour (services/sfuAddress.js).
+  // SFU_ADDRESS_CHECK=0 turns it off (the tests set it: they must not depend on the network), and
+  // SFU_ADDRESS_CHECK_URL points it at another trace service.
+  const sfuAddress = createAddressMonitor({
+    announced: sfu.info().enabled && process.env.SFU_ADDRESS_CHECK !== '0' ? sfu.announcedAddresses() : [],
+    fetchAddress: (family) => fetchPublicAddress({ family, ...(process.env.SFU_ADDRESS_CHECK_URL ? { url: process.env.SFU_ADDRESS_CHECK_URL } : {}) }),
+  });
+  sfuAddress.start();
+
+  // What a client's "Check connection" and the in-call connection panel need to explain themselves,
+  // and what an operator wants to see without a shell. Booleans and port numbers only: no address,
+  // no TURN credential (those stay on /webrtc/ice, which a call needs anyway).
+  app.get('/webrtc/diagnostics', authMiddleware, async (_req, res) => {
+    const info = sfu.info();
+    res.json({
+      sfu: {
+        enabled: info.enabled,
+        usable: await sfu.ready(),
+        publicAddressAnnounced: info.publicAddressAnnounced,
+        ports: info.ports,
+      },
+      announcedAddressStale: sfuAddress.isStale(),
+      turnConfigured: !!process.env.TURN_URLS,
+      stunUrls: stunUrls(),
+    });
+  });
+
+  // How each participant of a voice room gets its media: 'sfu' (through this server) or 'mesh'
+  // (directly to each person). The client says which when it joins and again if that changes; the
+  // room is told, because two participants need a direct connection between them exactly when at
+  // least one of them is in mesh mode. A client from before this existed never says, and is null.
+  const VOICE_MODES = ['sfu', 'mesh'];
+  const voiceModes = new Map(); // room -> Map<socket id, 'sfu' | 'mesh'>
+  const voiceModeOf = (room, socketId) => voiceModes.get(room)?.get(socketId) || null;
+  function setVoiceMode(room, socketId, mode) {
+    let modes = voiceModes.get(room);
+    if (!mode) {
+      if (modes && modes.delete(socketId) && modes.size === 0) voiceModes.delete(room);
+      return;
+    }
+    if (!modes) { modes = new Map(); voiceModes.set(room, modes); }
+    modes.set(socketId, mode);
+  }
+  // One line per fallback, for `pm2 logs`: a call quietly running on direct connections is the
+  // first thing to look for when someone "cannot hear anyone". The reason is a short code the
+  // client reports; anything that is not one is not written to the log. The socket id is what the
+  // log already prints for every connection, so this names nobody new.
+  function logVoiceFallback(socketId, reason) {
+    if (!sfu.info().enabled) return; // the SFU is off here: direct is how this instance runs, not a fallback
+    const code = typeof reason === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(reason) ? reason : 'unspecified';
+    console.log(`[voice] ${socketId} fell back to direct connections (reason: ${code})`);
+  }
+
   // A socket stops being in a voice room: by leaving, or by being taken out (enforceVoiceAccess).
   // One function, so that both tell the room the same things.
   function dropFromVoiceRoom(sock, room) {
     sock.leave(room);
+    setVoiceMode(room, sock.id, null);
     sock.to(room).emit('voice:peer-left', { id: sock.id });
     sfu.removePeer(room, sock.id); // close their SFU transports + notify consumers
     if (liveStreams[sock.id]) { delete liveStreams[sock.id]; broadcastDiscover(); }
@@ -1492,7 +1549,16 @@ async function main() {
     // is exactly the right check.
     const mayUseVoice = async (serverId) => !!(await roleOf(serverId, socketUser));
 
-    sfu.bindSocket(socket, voiceRoomOf, mayUseVoice);
+    // voice:join handlers of this socket that have not yet decided (joined, or refused). The SFU
+    // handlers wait for these before they ask which room the socket is in; see bindSocket.
+    const voiceJoins = new Set();
+    const pendingVoiceJoin = () => (voiceJoins.size ? Promise.all([...voiceJoins]) : null);
+    // A real client falls back once per call. Capped per connection so that one sending modes in a
+    // loop cannot fill the log.
+    let fallbacksLogged = 0;
+    const noteVoiceFallback = (reason) => { if (fallbacksLogged++ < 5) logVoiceFallback(socket.id, reason); };
+
+    sfu.bindSocket(socket, voiceRoomOf, mayUseVoice, { pendingJoin: pendingVoiceJoin, probeAs: socketUser });
     if (socketUser) {
       socket.join(`user:${socketUser}`);
       setUserPresenceByUsername(socketUser, 'available')
@@ -1961,14 +2027,45 @@ async function main() {
     socket.on('collab:leave', ({ sessionId } = {}) => { if (sessionId) socket.leave(`collab:${sessionId}`); });
 
     // Voice signaling: simple mesh signaling via server
-    socket.on('voice:join', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
-      if (!(await mayUseVoice(serverId))) { socket.emit('server:denied', { serverId }); return; }
-      // A member, but not of this channel (or it does not exist): refused at the door.
-      if (!(await mayBeInVoice(socketUser, serverId, channelId))) { socket.emit('voice:removed', { serverId, channelId }); return; }
+    // `mode` is how this client will carry its media ('sfu' or 'mesh', see VOICE_MODES) and
+    // `reason` why it is not using the SFU, when it is not. Both are optional: an older client
+    // sends neither.
+    socket.on('voice:join', async ({ serverId = 'demo', channelId = 'voice1', mode, reason } = {}) => {
+      // The two checks below read the database, and the client's next event is handled while they
+      // do. Anything that needs to know whether this socket is in the room waits on `deciding`,
+      // which ends the moment the answer exists — in `finally`, so a refusal (or a throw) can never
+      // leave a later request waiting for a join that is not coming.
+      let decided = () => {};
+      const deciding = new Promise((resolve) => { decided = resolve; });
+      voiceJoins.add(deciding);
       const room = `voice:${serverId}:${channelId}`;
-      socket.join(room);
+      const declared = VOICE_MODES.includes(mode) ? mode : null;
+      try {
+        if (!(await mayUseVoice(serverId))) { socket.emit('server:denied', { serverId }); return; }
+        // A member, but not of this channel (or it does not exist): refused at the door.
+        if (!(await mayBeInVoice(socketUser, serverId, channelId))) { socket.emit('voice:removed', { serverId, channelId }); return; }
+        // An older client that gives up on the SFU says so by joining the room it is already in
+        // (that made the server send it the roster again, which it then called directly). Its
+        // producers are still registered here, sending nothing; closing them is what lets everyone
+        // else stop waiting for audio from them.
+        const fellBack = !declared && socket.rooms.has(room);
+        socket.join(room);
+        setVoiceMode(room, socket.id, declared);
+        if (declared === 'mesh' || fellBack) sfu.removePeer(room, socket.id);
+        if (fellBack) {
+          noteVoiceFallback('old-client');
+          // Told to the room here, before the roster goes back to that client, so it is heard
+          // before the offers the client is about to send everyone: until this moment it ignored
+          // all signalling, so any connection someone started towards it is still waiting for an
+          // answer that will never come, and would collide with the offer that is on its way.
+          socket.to(room).emit('voice:mode', { id: socket.id, mode: null });
+        } else if (declared === 'mesh' && reason !== undefined) noteVoiceFallback(reason);
+      } finally {
+        voiceJoins.delete(deciding);
+        decided();
+      }
       const roomSet = io.sockets.adapter.rooms.get(room) || new Set();
-      const peers = Array.from(roomSet).filter(id => id !== socket.id).map(id => ({ id, name: clients[id]?.name || 'Anon' }));
+      const peers = Array.from(roomSet).filter(id => id !== socket.id).map(id => ({ id, name: clients[id]?.name || 'Anon', mode: voiceModeOf(room, id) }));
       socket.emit('voice:peers', peers);
       socket.emit('activity:update', activityViewFor(activities[room], socket.id) || null); // late-joiners get the current activity (word redacted)
       // The joiner's entrance clip is read from the DB, never taken from the client — otherwise a
@@ -1978,11 +2075,39 @@ async function main() {
         try { entranceSound = await currentEntranceUrl(socketUser); }
         catch (err) { console.warn('entrance lookup failed', err && err.message); }
       }
-      socket.to(room).emit('voice:peer-joined', { id: socket.id, name: clients[socket.id]?.name, entranceSound });
+      // Left again (or disconnected) while the clip was looked up: there is nobody to announce.
+      if (!socket.rooms.has(room)) return;
+      // The mode is read now, not taken from `declared`: it may have changed during the lookup.
+      socket.to(room).emit('voice:peer-joined', { id: socket.id, name: clients[socket.id]?.name, entranceSound, mode: voiceModeOf(room, socket.id) });
+    });
+
+    // A participant's mode changed mid-call — in practice from 'sfu' to 'mesh', when its media never
+    // reached the SFU. The room is told so that everyone who now needs a direct connection with it
+    // sets one up, and its SFU state is dropped so nobody keeps a silent stream of it.
+    // Synchronous unless a join is still being decided, so it reaches the room BEFORE the offers
+    // (voice:signal) the same client sends right behind it.
+    socket.on('voice:mode', ({ serverId = 'demo', channelId = 'voice1', mode, reason } = {}) => {
+      const apply = () => {
+        const room = `voice:${serverId}:${channelId}`;
+        if (!VOICE_MODES.includes(mode) || !socket.rooms.has(room)) return;
+        if (voiceModeOf(room, socket.id) === mode) return;
+        setVoiceMode(room, socket.id, mode);
+        if (mode === 'mesh') {
+          sfu.removePeer(room, socket.id);
+          noteVoiceFallback(reason);
+        }
+        socket.to(room).emit('voice:mode', { id: socket.id, mode });
+      };
+      const joining = pendingVoiceJoin();
+      if (joining) joining.then(apply); else apply();
     });
 
     socket.on('voice:leave', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
-      dropFromVoiceRoom(socket, `voice:${serverId}:${channelId}`);
+      // A leave sent right behind a join used to be handled first, and the join then put the socket
+      // into a room its client believed it had left.
+      const leave = () => dropFromVoiceRoom(socket, `voice:${serverId}:${channelId}`);
+      const joining = pendingVoiceJoin();
+      if (joining) joining.then(leave); else leave();
     });
 
     socket.on('voice:signal', ({ to, signal } = {}) => {
@@ -2026,6 +2151,7 @@ async function main() {
     socket.on('disconnecting', () => {
       for (const room of socket.rooms) {
         if (room.startsWith('voice:')) {
+          setVoiceMode(room, socket.id, null);
           socket.to(room).emit('voice:peer-left', { id: socket.id });
           sfu.removePeer(room, socket.id);
           // If this socket is the last one in the room, drop its activity.

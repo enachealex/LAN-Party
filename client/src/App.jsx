@@ -31,6 +31,8 @@ import { hostedAppFrame } from './appBridge'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
 import MicTest from './components/MicTest'
+import ConnectionCheck from './components/ConnectionCheck'
+import VoiceConnectionPanel from './components/VoiceConnectionPanel'
 import BootSplash from './components/BootSplash'
 import ImageCropModal from './components/ImageCropModal'
 import PrivateMessageModal from './components/PrivateMessageModal'
@@ -42,6 +44,7 @@ import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported, warmUpEffects } from './webcamEffects'
 import { SfuSession } from './sfu'
+import { UNKNOWN_PEER, acceptsSignal, asVoiceMode, lossPercent, shouldOffer, summarizeStats, voiceHealth, wantsDirectLink } from './voiceLinks'
 
 // API/socket origin. In dev, talk to the local server; in a production build, default to the
 // same origin (the server serves the client), so it "just works" behind one domain. Override with
@@ -1073,9 +1076,27 @@ export default function App() {
   const [text, setText] = useState('')
   const [localStream, setLocalStream] = useState(null)
   const peersRef = useRef({})
-  // Active SFU session for the joined voice room (null = P2P mesh mode). When set, the mesh
-  // handlers (voice:peers / voice:signal) stand down and all media flows through the server.
+  // Active SFU session for the joined voice room (null = mesh mode: every participant is reached
+  // over a direct connection). In SFU mode this client still holds direct connections, to whoever
+  // in the room is in mesh mode — see voiceLinks.ts for the rule and "Mixed voice rooms" below.
   const sfuRef = useRef(null)
+  // ---- The call's connection state. All refs: the socket handlers and WebRTC callbacks that
+  // read them are created once and would otherwise see the first render's values for ever. ----
+  const voiceModeRef = useRef(null)      // 'sfu' | 'mesh' while in a call, null outside one
+  const voiceFallbackRef = useRef(null)  // { code, detail } when in mesh mode: why not the server
+  const voiceRoomRef = useRef(null)      // { serverId, channelId } of the call
+  const voiceCallRef = useRef(null)      // identity of the current call; a join that outlives its call sees it change
+  const voiceJoinedRef = useRef(null)    // resolves the "server confirmed the join" wait in startVoice
+  const voicePeersRef = useRef({})       // socket id -> { mode, hereFirst, offered } (VoicePeer)
+  const sfuStreamsRef = useRef({})       // socket id -> the MediaStream the SFU session built for them
+  const directFailedRef = useRef({})     // socket id -> true once a direct connection to them failed
+  const voiceStatsRef = useRef({ server: null, direct: {}, previous: {} }) // last getStats readings
+  const peerNamesRef = useRef({})
+  // Mirrors of the above for rendering: how this client is connected, and whether all is well.
+  const [voiceConn, setVoiceConn] = useState({ mode: null, fallback: null })
+  const [connHealth, setConnHealth] = useState('ok') // 'ok' | 'connecting' | 'problem'
+  const [showConnInfo, setShowConnInfo] = useState(false)
+  const [connReport, setConnReport] = useState(null)
   const [remoteStreams, setRemoteStreams] = useState({})
   const [inVoice, setInVoice] = useState(false)
   // For the socket handlers, which are registered once and would otherwise see the first render's
@@ -1254,6 +1275,10 @@ export default function App() {
   const writePref = (key, value) => { try { localStorage.setItem(key, value) } catch (_) { /* private mode: lasts for the session */ } }
   // Browser noise suppression. On by default, which is also what the browser did before this was a setting.
   const [noiseSuppression, setNoiseSuppression] = useState(() => readPref('lanparty_noise_suppression', '1') === '1')
+  // "Direct connection only": never use the voice server from this device. For someone it does not
+  // work for (their network cannot reach its media port, and waiting out the attempt costs the first
+  // seconds of every call), and what lets a call with both kinds of participant be tried on purpose.
+  const [directOnly, setDirectOnly] = useState(() => readPref('lanparty_direct_only', '0') === '1')
   // Push-to-talk: the mic only transmits while the key is held. `pttKey` is a KeyboardEvent.code, so
   // it names the physical key and does not move with the keyboard layout.
   const [pttEnabled, setPttEnabled] = useState(() => readPref('lanparty_ptt', '0') === '1')
@@ -1317,6 +1342,7 @@ export default function App() {
   activityTypeRef.current = activity?.type || null
   // Wraps for the call-bar popovers, so an outside click can close whichever is open.
   const audioMenuRef = useRef(null)
+  const connMenuRef = useRef(null)
   const effectsMenuRef = useRef(null)
   const qualityMenuRef = useRef(null)
   const activityMenuRef = useRef(null)
@@ -3412,6 +3438,9 @@ export default function App() {
     s.on('server:denied', ({ serverId } = {}) => {
       if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
       loadServers()
+      // Also the answer to a voice:join that was refused. Without this the call screen stayed up,
+      // microphone open, in a room the server never let this client into.
+      if (inVoiceRef.current && voiceServerIdRef.current === serverId) leaveVoiceRef.current()
     })
     // messages:init is `{ serverId, channelId, messages, hasMore }`: the newest page of the channel
     // just entered, and whether older ones exist (older array shape still accepted).
@@ -3694,23 +3723,51 @@ export default function App() {
 
     // voice events — I (the newcomer) create a peer for each existing member; adding my tracks
     // triggers onnegotiationneeded, which sends the offer. Existing peers answer via voice:signal.
+    // Each entry carries the participant's mode ('sfu' | 'mesh' | null for an older app); which of
+    // them get a direct connection, and who starts it, is decided in reconcileLink.
     s.on('voice:peers', (peers) => {
+      // The roster of a call this client has already left (a leave sent right behind the join):
+      // acting on it would put the UI back "in voice" with nothing behind it.
+      if (!voiceRoomRef.current || !Array.isArray(peers)) return
       setPeerNames((prev) => ({ ...prev, ...Object.fromEntries(peers.map((p) => [p.id, p.name])) }))
-      // In SFU mode media comes via consumers, not P2P connections — no mesh peers.
-      if (!sfuRef.current) { for (const p of peers) createPeer(p.id) }
+      for (const p of peers) notePeer(p.id, { mode: asVoiceMode(p.mode), hereFirst: true })
+      reconcileAllLinks()
       setInVoice(true)
+      // The roster is the server's confirmation of the join: startVoice waits for it before it
+      // asks the voice server for anything.
+      voiceJoinedRef.current?.(true)
     })
-    s.on('voice:peer-joined', ({ id, name: peerName, entranceSound }) => {
-      // The newcomer offers to us; we create our peer when their offer arrives (handleSignal).
+    s.on('voice:peer-joined', ({ id, name: peerName, entranceSound, mode }) => {
       // Fires only for people arriving after us — the existing roster comes via voice:peers (silent).
+      // Between two mesh participants the newcomer offers and we answer (handleSignal); if they are
+      // in SFU mode and we are in mesh mode, the connection is ours to start.
       if (!id) return
       setPeerNames((prev) => ({ ...prev, [id]: peerName }))
+      if (voiceRoomRef.current) { notePeer(id, { mode: asVoiceMode(mode) }); reconcileLink(id) }
       // Their own recorded entrance clip takes the place of the generic join blip. The url is
       // supplied by the server (looked up from their profile), never by the joining client.
       if (typeof entranceSound === 'string' && entranceSound.startsWith('/entrances/')) playUiClip(emojiSrc(entranceSound))
       else playUiSound('peerJoin')
     })
-    s.on('voice:signal', ({ from, signal }) => { if (!sfuRef.current) handleSignal(from, signal) })
+    // Someone's mode changed mid-call (their media never reached the voice server, so they are on
+    // direct connections now). Whether we need a direct connection with them changes with it.
+    // mode null is the server speaking for an older app that has just given up on the voice server:
+    // it is about to offer a direct connection to everyone, as the newcomer.
+    s.on('voice:mode', ({ id, mode } = {}) => {
+      if (!id || !voicePeersRef.current[id]) return
+      const next = asVoiceMode(mode)
+      notePeer(id, { mode: next })
+      if (!next) {
+        // Until now it ignored all signalling. A connection we started towards it is therefore
+        // still waiting for an answer, and would collide with the offer that is on its way.
+        const st = peersRef.current[id]
+        if (st && st.pc.connectionState !== 'connected') removePeer(id)
+        delete directFailedRef.current[id]
+        notePeer(id, { hereFirst: false })
+      }
+      reconcileLink(id)
+    })
+    s.on('voice:signal', ({ from, signal }) => handleSignal(from, signal))
     // Direct 1:1 friend calls
     s.on('call:incoming', ({ from, fromSocket, video }) => onCallIncoming(from, fromSocket, video))
     s.on('call:accepted', ({ from, fromSocket }) => onCallAccepted(from, fromSocket))
@@ -3720,7 +3777,7 @@ export default function App() {
     s.on('call:unavailable', () => onCallUnavailable())
     s.on('call:handled', () => onCallHandledElsewhere())
     s.on('call:signal', ({ from, signal }) => handleCallSignal(from, signal))
-    s.on('voice:peer-left', ({ id }) => { removePeer(id); playUiSound('peerLeave'); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
+    s.on('voice:peer-left', ({ id }) => { forgetPeer(id); playUiSound('peerLeave'); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
     s.on('voice:screenshare-state', ({ id, sharing }) => setScreenSharingPeers((prev) => ({ ...prev, [id]: sharing })))
     // Watch/Discover: the server pushes the full list of who's live whenever it changes.
     s.on('discover:update', (list) => setDiscoverStreams(Array.isArray(list) ? list : []))
@@ -4048,6 +4105,10 @@ export default function App() {
     const t = token || localStorage.getItem('lanparty_token')
     return fetch(`${SERVER_URL}${path}`, { ...opts, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}`, ...(opts.headers || {}) } })
   }
+
+  // What the server says about its own voice setup (GET /webrtc/diagnostics), for the connection
+  // check. null when it cannot be had; the check then reports what it measured itself.
+  const fetchVoiceDiagnostics = () => authedFetch('/webrtc/diagnostics').then((r) => (r.ok ? r.json() : null)).catch(() => null)
 
   const renameServer = async (serverId, oldName) => {
     const name2 = ((await askPrompt({ title: 'Rename server', label: 'Server name', initial: oldName || '', submitLabel: 'Rename' })) || '').trim()
@@ -4619,12 +4680,212 @@ export default function App() {
     }
   }
 
-  // Tear down one peer connection and drop its remote stream.
+  // ---- Mixed voice rooms ----
+  // A room holds participants whose media goes through the voice server ('sfu') and participants
+  // who connect to each person directly ('mesh'), in any combination. The rule (voiceLinks.ts):
+  // a direct connection exists between two participants exactly when at least one is in mesh mode.
+  // So in SFU mode this client publishes to and listens on the server AND answers the mesh
+  // participants directly; in mesh mode it has a direct connection to everyone and no session.
+  //
+  // Everything below reads refs only, because it runs from socket handlers and WebRTC callbacks
+  // that were created on some earlier render.
+
+  // What is known about one participant; merged, so a mode arriving after their offer keeps the offer.
+  const notePeer = (peerId, patch) => {
+    voicePeersRef.current[peerId] = { ...UNKNOWN_PEER, ...voicePeersRef.current[peerId], ...patch }
+  }
+
+  // The inputs of the rule for one participant, as they are right now.
+  const linkContext = (peerId) => ({
+    myMode: voiceModeRef.current || 'mesh',
+    catalogueKnown: !!sfuRef.current?.catalogueKnown,
+    onSfu: !!sfuRef.current?.hasProducers(peerId),
+  })
+  const wantsDirect = (peerId) => wantsDirectLink(voicePeersRef.current[peerId] || UNKNOWN_PEER, linkContext(peerId))
+
+  // The ONE stream a participant is played from. Each has at most two: the one their direct
+  // connection delivers and the one the SFU session assembles. Which is used follows the same rule
+  // that decides whether the direct connection should exist, and only that one is ever handed to
+  // the UI — so nobody can be heard twice, not even for the moment both happen to exist while a
+  // participant changes mode.
+  const syncRemoteStream = (peerId) => {
+    const chosen = (wantsDirect(peerId) ? peersRef.current[peerId]?.stream : sfuStreamsRef.current[peerId]) || null
+    setRemoteStreams((prev) => {
+      if ((prev[peerId] || null) === chosen) return prev
+      const copy = { ...prev }
+      if (chosen) copy[peerId] = chosen; else delete copy[peerId]
+      return copy
+    })
+  }
+
+  // Tear down one peer connection; what is played for them is then decided again.
   const removePeer = (peerId) => {
     const st = peersRef.current[peerId]
     if (st?.pc) { try { st.pc.close() } catch (e) {} }
     delete peersRef.current[peerId]
-    setRemoteStreams((prev) => { const copy = { ...prev }; delete copy[peerId]; return copy })
+    delete voiceStatsRef.current.direct[peerId]
+    syncRemoteStream(peerId)
+  }
+
+  // They left the call: nothing about them is kept.
+  const forgetPeer = (peerId) => {
+    delete voicePeersRef.current[peerId]
+    delete sfuStreamsRef.current[peerId]
+    delete directFailedRef.current[peerId]
+    removePeer(peerId)
+  }
+
+  // Bring the direct connection to one participant in line with the rule: close it if it should
+  // not exist, start it if it should and starting is ours to do. Called whenever an input of the
+  // rule changes — they arrive, their mode or ours changes, they start or stop publishing to the
+  // server. A connection that failed is not started again here; an offer from them still is answered.
+  const reconcileLink = (peerId) => {
+    const peer = voicePeersRef.current[peerId]
+    if (!peer || !voiceModeRef.current) return
+    const ctx = linkContext(peerId)
+    if (!wantsDirectLink(peer, ctx)) {
+      if (peersRef.current[peerId]) removePeer(peerId)
+    } else if (!peersRef.current[peerId] && !directFailedRef.current[peerId] && shouldOffer(peer, ctx)) {
+      createPeer(peerId) // adding our tracks is what sends the offer (onnegotiationneeded)
+    }
+    syncRemoteStream(peerId)
+  }
+  const reconcileAllLinks = () => Object.keys(voicePeersRef.current).forEach(reconcileLink)
+
+  const setMyVoiceMode = (mode, fallback) => {
+    voiceModeRef.current = mode
+    voiceFallbackRef.current = fallback || null
+    setVoiceConn({ mode, fallback: fallback || null })
+  }
+
+  // Leave the voice server for direct connections, mid-call, without leaving the room: the media
+  // never reached the server (the watchdog in startVoice), the path died later, or the user asked
+  // for direct only. The room is told first — everyone in SFU mode has to know before our offers
+  // reach them, or they would turn them away — and then a connection is offered to everybody we do
+  // not have one with yet (the mesh participants already have theirs).
+  const switchToMesh = (reason) => {
+    const session = sfuRef.current
+    const room = voiceRoomRef.current
+    if (!session || !room || voiceModeRef.current !== 'sfu') return
+    console.warn('Voice: switching to direct connections:', reason.code, reason.detail || '')
+    sfuRef.current = null
+    try { session.close() } catch (e) { /* already closed */ }
+    sfuStreamsRef.current = {}
+    setMyVoiceMode('mesh', reason)
+    socketRef.current?.emit('voice:mode', { serverId: room.serverId, channelId: room.channelId, mode: 'mesh', reason: reason.code })
+    // We arrive in the mesh now, so to everyone here we are the newcomer: the one who offers.
+    Object.values(voicePeersRef.current).forEach((peer) => { peer.hereFirst = true })
+    reconcileAllLinks()
+  }
+
+  // ---- What the connection panel and window.__lanpartyVoice() are told ----
+  // Is a relay among the ICE servers the server handed out? Asked when a direct connection fails:
+  // without one, two home networks often cannot reach each other at all.
+  const hasRelayServer = () => (iceConfigRef.current || []).some((s) => [].concat(s.urls || []).some((u) => /^turns?:/i.test(u)))
+
+  const directLinkState = (peerId) => {
+    if (directFailedRef.current[peerId]) return 'failed'
+    return peersRef.current[peerId]?.pc.connectionState === 'connected' ? 'connected' : 'connecting'
+  }
+
+  // A VoiceReport (voiceLinks.ts) of the call as it is this instant, from the refs alone.
+  const buildVoiceReport = () => {
+    const session = sfuRef.current
+    const stats = voiceStatsRef.current
+    const peers = Object.keys(voicePeersRef.current).map((id) => {
+      const direct = wantsDirect(id)
+      const measured = (direct ? stats.direct[id] : stats.server) || {}
+      return {
+        id,
+        name: peerNamesRef.current[id] || 'Guest',
+        path: direct ? 'direct' : 'sfu',
+        state: direct ? directLinkState(id) : (session ? session.peerState(id) : 'connecting'),
+        candidateType: measured.candidateType ?? null,
+        protocol: measured.protocol ?? null,
+        rttMs: measured.rttMs ?? null,
+        lossPct: measured.lossPct ?? null,
+        oldApp: voicePeersRef.current[id].mode === null,
+      }
+    })
+    return {
+      mode: voiceModeRef.current,
+      fallback: voiceFallbackRef.current,
+      server: session ? { state: session.serverState(), candidateType: stats.server?.candidateType ?? null, protocol: stats.server?.protocol ?? null, rttMs: stats.server?.rttMs ?? null } : null,
+      peers,
+      relayConfigured: hasRelayServer(),
+    }
+  }
+
+  // One getStats() reading per connection in use: the path to the voice server and each direct
+  // connection. Kept in a ref — a reading every few seconds must not re-render the whole app.
+  const collectVoiceStats = async () => {
+    const stats = voiceStatsRef.current
+    const read = async (key, getStats) => {
+      try {
+        const now = await getStats()
+        if (!now || voiceStatsRef.current !== stats) return null // the call ended meanwhile
+        const lossPct = lossPercent(now, stats.previous[key])
+        stats.previous[key] = now
+        return { ...now, lossPct }
+      } catch (e) { return null }
+    }
+    const session = sfuRef.current
+    const jobs = []
+    if (session) jobs.push(read('server', () => session.stats()).then((s) => { if (sfuRef.current === session) stats.server = s }))
+    else stats.server = null
+    for (const [id, st] of Object.entries(peersRef.current)) {
+      if (st.pc.connectionState !== 'connected') { delete stats.direct[id]; continue }
+      jobs.push(read(`direct:${id}`, async () => summarizeStats(await st.pc.getStats())).then((s) => { if (s && peersRef.current[id] === st) stats.direct[id] = s }))
+    }
+    await Promise.all(jobs)
+  }
+
+  // The indicator's colour. Setting the same value again does not re-render.
+  const refreshVoiceHealth = () => { if (voiceModeRef.current) setConnHealth(voiceHealth(buildVoiceReport())) }
+
+  // While in a call: read the statistics every few seconds, keep the indicator's colour current,
+  // and — only while the panel is open — hand it a fresh report to draw.
+  useEffect(() => {
+    if (!inVoice) return undefined
+    let stopped = false
+    const tick = async () => {
+      await collectVoiceStats()
+      if (stopped || !voiceModeRef.current) return
+      const report = buildVoiceReport()
+      setConnHealth(voiceHealth(report))
+      if (showConnInfo) setConnReport(report)
+    }
+    tick()
+    const timer = setInterval(tick, 3000)
+    return () => { stopped = true; clearInterval(timer) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inVoice, showConnInfo])
+
+  // Read-only hook for automated browser tests (and for a curious person with the console open):
+  // how this client is connected and to whom. Socket ids and display names only — what the call
+  // screen already shows — and nothing that could be used to do anything.
+  const voiceReportRef = useRef(buildVoiceReport)
+  voiceReportRef.current = buildVoiceReport
+  useEffect(() => {
+    window.__lanpartyVoice = () => {
+      const report = voiceReportRef.current()
+      return {
+        mode: report.mode,
+        fallbackReason: report.fallback?.code ?? null,
+        peers: report.peers.map(({ id, name: peerName, path, state, candidateType, rttMs }) => ({ id, name: peerName, path, state, candidateType, rttMs })),
+      }
+    }
+    return () => { delete window.__lanpartyVoice }
+  }, [])
+
+  // "Direct connection only". Turning it on applies to the call in progress as well (the voice
+  // server is left at once, nobody re-joins); turning it off applies from the next call, because
+  // going back onto the server mid-call would mean setting the whole session up again.
+  const toggleDirectOnly = () => {
+    const next = !directOnly
+    setDirectOnly(next)
+    writePref('lanparty_direct_only', next ? '1' : '0')
+    if (next) switchToMesh({ code: 'user-choice' })
   }
 
   // Create a peer connection using the "perfect negotiation" pattern so tracks can be added or
@@ -4633,15 +4894,18 @@ export default function App() {
   const createPeer = (peerId) => {
     if (peersRef.current[peerId]) return peersRef.current[peerId]
     const pc = new RTCPeerConnection({ iceServers: iceConfigRef.current })
-    const st = { pc, polite: (socketRef.current?.id || '') < peerId, makingOffer: false, ignoreOffer: false }
+    const st = { pc, stream: null, polite: (socketRef.current?.id || '') < peerId, makingOffer: false, ignoreOffer: false }
     peersRef.current[peerId] = st
+    delete directFailedRef.current[peerId]
 
     pc.onicecandidate = (e) => {
       if (e.candidate) socketRef.current?.emit('voice:signal', { to: peerId, signal: { candidate: e.candidate } })
     }
     pc.ontrack = (e) => {
       const [stream] = e.streams
-      if (stream) setRemoteStreams((prev) => ({ ...prev, [peerId]: stream }))
+      if (!stream || peersRef.current[peerId] !== st) return
+      st.stream = stream
+      syncRemoteStream(peerId)
     }
     pc.onnegotiationneeded = async () => {
       try {
@@ -4655,16 +4919,37 @@ export default function App() {
       }
     }
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') removePeer(peerId)
+      if (peersRef.current[peerId] !== st) return // an earlier connection to the same person
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        // Remembered, so the connection panel can say "failed" (and why that happens) instead of
+        // the person just going quiet.
+        if (pc.connectionState === 'failed') directFailedRef.current[peerId] = true
+        removePeer(peerId)
+        refreshVoiceHealth()
+      }
     }
     // Send whatever local tracks we currently have (audio, plus video if the camera is already on).
+    // The same track objects feed the SFU session when there is one, so mute, push-to-talk and
+    // deafen — which all switch the track itself — reach both kinds of listener at once.
     const ls = localStreamRef.current
     if (ls) ls.getTracks().forEach((track) => pc.addTrack(track, ls))
     return st
   }
 
   const handleSignal = async (from, signal) => {
-    const st = peersRef.current[from] || createPeer(from)
+    if (!voiceRoomRef.current || !from || !signal) return
+    // In SFU mode a declared SFU participant is never negotiated with: they are heard through the server.
+    if (!acceptsSignal(voicePeersRef.current[from], voiceModeRef.current || 'mesh')) return
+    const isOffer = signal.description?.type === 'offer'
+    // An offer is how an older app shows it is in mesh mode (it has no other way to say so).
+    if (isOffer) notePeer(from, { offered: true })
+    let st = peersRef.current[from]
+    if (!st) {
+      // Only an offer opens a connection. A stray candidate or answer for one that has been closed
+      // used to create a new connection, which then sent an offer of its own.
+      if (!isOffer) return
+      st = createPeer(from)
+    }
     const pc = st.pc
     try {
       if (signal.description) {
@@ -4729,47 +5014,80 @@ export default function App() {
     setVoiceChannelId(channelId)
     setInVoice(true)
     playUiSound('joinVoice')
-    // SFU-first: probe the server BEFORE joining so the mode is settled when voice:peers arrives.
-    // A null answer (SFU off / old server) means the mesh path below runs exactly as before.
+    // This call, as distinct from any before or after it. Everything below that waits (the probe,
+    // the server's confirmation, the handshake, the watchdog) checks it afterwards: hanging up in
+    // the meantime must not be undone by a join that was still on its way.
+    const thisCall = {}
+    voiceCallRef.current = thisCall
+    const stillThisCall = () => voiceCallRef.current === thisCall
+    voiceRoomRef.current = { serverId: callServerId, channelId }
+    voicePeersRef.current = {}
+    sfuStreamsRef.current = {}
+    directFailedRef.current = {}
+    voiceStatsRef.current = { server: null, direct: {}, previous: {} }
+
+    // Settle on a mode for this call: through the voice server when there is one and this device
+    // has not opted out of it, otherwise direct — and remember why, because "why can't I hear
+    // anyone" starts with that answer. The probe comes BEFORE the join so the mode goes out with it.
     let sfuSession = null
-    try {
-      sfuSession = await SfuSession.create(socket, { serverId: callServerId, channelId }, {
-        onPeerStream: (peerId, stream) => setRemoteStreams((prev) => ({ ...prev, [peerId]: stream })),
-        onPeerGone: (peerId) => setRemoteStreams((prev) => { const c = { ...prev }; delete c[peerId]; return c }),
-      })
-    } catch (err) { console.warn('SFU probe failed — using mesh', err) }
-    sfuRef.current = sfuSession
-    socket.emit('voice:join', { serverId: callServerId, channelId })
-    if (sfuSession) {
-      // Drop the SFU and re-join so the server resends voice:peers, which now takes the mesh path
-      // (sfuRef is null again). Guarded so a watchdog fallback can't double-fire after a catch.
-      const fallbackToMesh = (why, err) => {
-        if (sfuRef.current !== sfuSession) return
-        console.warn(why, err || '')
-        try { sfuSession.close() } catch (e) { /* already closed */ }
-        sfuRef.current = null
-        socket.emit('voice:join', { serverId: callServerId, channelId })
-      }
+    let fallback = null
+    if (directOnly) {
+      fallback = { code: 'user-choice' }
+    } else {
       try {
-        await sfuSession.connect()
-        const audioTrack = localStreamRef.current?.getAudioTracks()[0]
-        if (audioTrack) await sfuSession.produceAudio(audioTrack)
-        const videoTrack = localStreamRef.current?.getVideoTracks()[0]
-        if (videoTrack) await sfuSession.setVideoTrack(videoTrack)
+        sfuSession = await SfuSession.create(socket, { serverId: callServerId, channelId }, {
+          // The session only reports; which stream is played, and whether a direct connection is
+          // needed as well, is decided in one place for both kinds of participant.
+          onPeerStream: (peerId, stream) => { if (sfuRef.current === sfuSession) { sfuStreamsRef.current[peerId] = stream; syncRemoteStream(peerId) } },
+          onPeerGone: (peerId) => { if (sfuRef.current === sfuSession) { delete sfuStreamsRef.current[peerId]; syncRemoteStream(peerId) } },
+          onPeerProducers: (peerId) => { if (sfuRef.current === sfuSession) reconcileLink(peerId) },
+          onTransportFailed: () => { if (sfuRef.current === sfuSession) switchToMesh({ code: 'media-lost' }) },
+        })
+        if (!sfuSession) fallback = { code: 'sfu-off' } // the server answered: no voice server here
       } catch (err) {
-        // Signaling-level failure (handshake threw) after we already skipped mesh setup.
-        fallbackToMesh('SFU connect failed — falling back to mesh', err)
-      }
-      // Media-path watchdog: connect()/produce resolve once DTLS params are exchanged over the
-      // socket, which succeeds even when the media port itself is unreachable (e.g. a remote user
-      // whose router isn't forwarded). If no transport actually reaches 'connected' in time, the
-      // audio would be silently dead — so fall back to the mesh, which the SFU can't do server-side.
-      if (sfuRef.current === sfuSession) {
-        const connected = await sfuSession.waitUntilConnected(8000)
-        if (!connected) fallbackToMesh('SFU media path did not connect — falling back to mesh')
+        console.warn('Voice server probe failed, connecting directly', err)
+        fallback = { code: 'refused', detail: err?.message || 'no answer' }
       }
     }
+    if (!stillThisCall()) { try { sfuSession?.close() } catch (e) { /* already closed */ } return }
+    sfuRef.current = sfuSession
+    setMyVoiceMode(sfuSession ? 'sfu' : 'mesh', fallback)
+
+    // The server answers a join with the roster (voice:peers), or with a refusal that hangs the
+    // call up. Either way nothing is asked of the voice server until that answer is in: its
+    // requests are only valid for a member of the room. (The server waits for the join too now;
+    // it used not to, which is why every call ended up on direct connections.)
+    const confirmed = new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 10000)
+      voiceJoinedRef.current = (ok) => { clearTimeout(timer); voiceJoinedRef.current = null; resolve(ok) }
+    })
+    socket.emit('voice:join', { serverId: callServerId, channelId, mode: sfuSession ? 'sfu' : 'mesh', ...(fallback ? { reason: fallback.code } : {}) })
     if (opts.camOn && outputTrackRef.current) emitStreamState(true, false, channelId) // announce our camera for Watch/Discover
+    if (!sfuSession) return
+
+    await confirmed
+    if (!stillThisCall() || sfuRef.current !== sfuSession) return
+    try {
+      await sfuSession.connect()
+      const audioTrack = localStreamRef.current?.getAudioTracks()[0]
+      if (audioTrack) await sfuSession.produceAudio(audioTrack)
+      const videoTrack = localStreamRef.current?.getVideoTracks()[0]
+      if (videoTrack) await sfuSession.setVideoTrack(videoTrack)
+    } catch (err) {
+      // The handshake itself was turned down (or timed out).
+      if (stillThisCall()) switchToMesh({ code: 'refused', detail: err?.message || 'no answer' })
+    }
+    if (!stillThisCall() || sfuRef.current !== sfuSession) return
+    // What is on the server is known now, which settles the participants whose apps are too old
+    // to say how they are connected.
+    reconcileAllLinks()
+    // Media-path watchdog: connect()/produce resolve once DTLS params are exchanged over the
+    // socket, which succeeds even when the media port itself is unreachable (e.g. a remote user
+    // whose router isn't forwarded). If no transport actually reaches 'connected' in time, the
+    // audio would be silently dead — so switch to direct connections, which the SFU can't do
+    // server-side. Nobody leaves or re-joins for it: see switchToMesh.
+    const connected = await sfuSession.waitUntilConnected(8000)
+    if (!connected && stillThisCall() && sfuRef.current === sfuSession) switchToMesh({ code: 'media-unreachable' })
   }
 
   // Join a voice channel from anywhere → open the pre-join screen (unless already in that channel).
@@ -5105,16 +5423,17 @@ export default function App() {
   // Close any open call-bar popover (audio devices / camera effects / screen-share quality) when
   // the user clicks outside it.
   useEffect(() => {
-    if (!showAudioMenu && !showEffectsMenu && !showQualityMenu && !showActivityMenu) return
+    if (!showAudioMenu && !showEffectsMenu && !showQualityMenu && !showActivityMenu && !showConnInfo) return
     const onDown = (e) => {
       if (showAudioMenu && audioMenuRef.current && !audioMenuRef.current.contains(e.target)) setShowAudioMenu(false)
+      if (showConnInfo && connMenuRef.current && !connMenuRef.current.contains(e.target)) setShowConnInfo(false)
       if (showEffectsMenu && effectsMenuRef.current && !effectsMenuRef.current.contains(e.target)) setShowEffectsMenu(false)
       if (showQualityMenu && qualityMenuRef.current && !qualityMenuRef.current.contains(e.target)) setShowQualityMenu(false)
       if (showActivityMenu && activityMenuRef.current && !activityMenuRef.current.contains(e.target)) setShowActivityMenu(false)
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
-  }, [showAudioMenu, showEffectsMenu, showQualityMenu, showActivityMenu])
+  }, [showAudioMenu, showEffectsMenu, showQualityMenu, showActivityMenu, showConnInfo])
 
   // Swap the local video track (camera or screen) across all peers. Pass null to stop video.
   // Add/remove of a track triggers renegotiation (onnegotiationneeded) on each connection.
@@ -5122,14 +5441,11 @@ export default function App() {
     const ls = localStreamRef.current
     if (!ls) return
     const old = ls.getVideoTracks()[0]
-    if (sfuRef.current) {
-      // SFU mode: one video producer — replaceTrack for swaps (camera↔screen), close for off.
-      sfuRef.current.setVideoTrack(newTrack || null).catch((err) => console.warn('SFU video update failed', err))
-      if (old && old !== newTrack) { old.stop(); ls.removeTrack(old) }
-      if (newTrack && !ls.getVideoTracks().includes(newTrack)) ls.addTrack(newTrack)
-      setLocalStream(new MediaStream(ls.getTracks()))
-      return
-    }
+    // Both kinds of listener, always: in SFU mode there can be mesh participants on direct
+    // connections as well, and they must get the camera or screen too.
+    // Through the voice server: one video producer — replaceTrack for swaps (camera↔screen), close for off.
+    if (sfuRef.current) sfuRef.current.setVideoTrack(newTrack || null).catch((err) => console.warn('SFU video update failed', err))
+    // Direct connections: drop the old track's sender, add the new track (each renegotiates).
     if (old) {
       Object.values(peersRef.current).forEach(({ pc }) => {
         const sender = pc.getSenders().find((s) => s.track === old)
@@ -5138,15 +5454,16 @@ export default function App() {
       if (old !== newTrack) { old.stop(); ls.removeTrack(old) }
     }
     if (newTrack) {
-      ls.addTrack(newTrack)
+      if (!ls.getVideoTracks().includes(newTrack)) ls.addTrack(newTrack)
       Object.values(peersRef.current).forEach(({ pc }) => pc.addTrack(newTrack, ls))
     }
     setLocalStream(new MediaStream(ls.getTracks()))
   }
 
-  // Cap the outgoing video bitrate on every peer's video sender (used for screen-share quality).
+  // Cap the outgoing video bitrate (used for screen-share quality): on the voice server's video
+  // producer and on every direct connection's video sender.
   const applyVideoBitrate = (bitrate) => {
-    if (sfuRef.current) { sfuRef.current.setVideoBitrate(bitrate); return }
+    if (sfuRef.current) sfuRef.current.setVideoBitrate(bitrate)
     Object.values(peersRef.current).forEach(({ pc }) => {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video')
       if (!sender) return
@@ -5596,6 +5913,9 @@ export default function App() {
       const nt = s.getAudioTracks()[0]
       if (!nt) return
       nt.enabled = !micMuted && (!pttEnabled || pttHeld) // honor mute and push-to-talk
+      // The new microphone goes to both kinds of listener. The voice server's producer was left on
+      // the old (now stopped) track before, so in SFU mode a device change meant silence.
+      sfuRef.current?.replaceAudioTrack(nt).catch((err) => console.warn('SFU microphone switch failed', err))
       Object.values(peersRef.current).forEach(({ pc }) => {
         const sender = pc.getSenders().find((x) => x.track && x.track.kind === 'audio')
         if (sender) sender.replaceTrack(nt).catch(() => {})
@@ -5620,10 +5940,22 @@ export default function App() {
     // Never let a bad emit block the local teardown — always tear the call down.
     const chId = typeof voiceChannelId === 'string' ? voiceChannelId : 'voice1'
     try { socket?.emit('voice:leave', { serverId: voiceServerIdRef.current, channelId: chId }) } catch (err) { console.warn('voice:leave emit failed', err) }
+    // No longer this call: whatever startVoice is still waiting on finds that out and stops.
+    voiceCallRef.current = null
+    voiceRoomRef.current = null
+    voiceJoinedRef.current?.(false)
     try { sfuRef.current?.close() } catch (err) { /* already closed */ }
     sfuRef.current = null
     Object.keys(peersRef.current).forEach(removePeer)
     peersRef.current = {}
+    voicePeersRef.current = {}
+    sfuStreamsRef.current = {}
+    directFailedRef.current = {}
+    voiceStatsRef.current = { server: null, direct: {}, previous: {} }
+    setMyVoiceMode(null, null)
+    setShowConnInfo(false)
+    setConnReport(null)
+    setConnHealth('ok')
     setRemoteStreams({})
     try { effectsRef.current?.stop() } catch (e) {}
     effectsRef.current = null
@@ -5649,6 +5981,7 @@ export default function App() {
   }
   inVoiceRef.current = inVoice
   leaveVoiceRef.current = leaveVoice
+  peerNamesRef.current = peerNames
 
   const handleSignOut = () => {
     if (socket) {
@@ -7705,6 +8038,27 @@ export default function App() {
                       )}
                     </div>
                     <div className="voice-controlbar" role="toolbar" aria-label="Call controls">
+                      {/* Connection indicator: a fixed-size dot that says whether everyone is
+                          reachable, and opens the details. Its size never changes with what it
+                          shows, and the details are a popover, so nothing in the call moves. */}
+                      <div className="voice-ctrl-wrap" ref={connMenuRef}>
+                        {showConnInfo && (
+                          <div className="voice-audio-menu voice-conn-menu" role="dialog" aria-label="Connection details">
+                            <VoiceConnectionPanel report={connReport || buildVoiceReport()} />
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          className={`voice-conn-btn ${connHealth}`}
+                          onClick={() => setShowConnInfo((v) => !v)}
+                          title={`Connection: ${voiceConn.mode === 'sfu' ? 'through the voice server' : 'directly to each person'}${connHealth === 'problem' ? ' (someone cannot be reached)' : connHealth === 'connecting' ? ' (still connecting)' : ''}`}
+                          aria-label="Connection details"
+                          aria-haspopup="dialog"
+                          aria-expanded={showConnInfo}
+                        >
+                          <span className="voice-conn-dot" aria-hidden="true" />
+                        </button>
+                      </div>
                       <div className="voice-ctrl-wrap" ref={effectsMenuRef}>
                         {showEffectsMenu && (
                           <div className="voice-effects-menu" role="menu" aria-label="Webcam effects">
@@ -7907,6 +8261,15 @@ export default function App() {
                                 <div className="voice-effects-hint">Hold the key to talk. Works while this window is focused; a browser can't see keys pressed in another app.</div>
                               </>
                             )}
+                            <div className="voice-effects-section">📶 Connection</div>
+                            <button type="button" role="menuitemcheckbox" aria-checked={directOnly} className={`voice-quality-opt voice-toggle-opt voice-toggle-wrap${directOnly ? ' active' : ''}`} onClick={toggleDirectOnly}>
+                              <span>Direct connection only (skip the voice server)</span><span className="voice-toggle-state">{directOnly ? 'On' : 'Off'}</span>
+                            </button>
+                            <div className="voice-effects-hint">
+                              {!directOnly && voiceConn.fallback?.code === 'user-choice'
+                                ? 'Off from your next call: this one stays on direct connections.'
+                                : 'For when the voice server cannot be reached from your network. Everyone else is unaffected.'}
+                            </div>
                             <div className="voice-effects-hint">🔒 Your mic &amp; speakers are only accessed while you're in a call.</div>
                           </div>
                         )}
@@ -8280,6 +8643,8 @@ export default function App() {
                       onSelectDevice={preJoinSelectMic}
                     />
                   )}
+                  {/* The other half of "will my call work": not the mic, the network. */}
+                  <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} variant="link" />
                 </div>
                 {supportsSpeakerSelect && (
                   <div className="prejoin-group">
@@ -9259,6 +9624,9 @@ export default function App() {
               selectedDeviceId={selectedMicId}
               onSelectDevice={(id) => { setSelectedMicId(id); loadAudioDevices() }}
             />
+            {/* Whether this network can carry a call, and by which route — without joining one. */}
+            <p className="profile-hint">Check that calls from this network can reach the voice server, and what they fall back to if not.</p>
+            <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} />
 
             {/* Desktop notifications */}
             <h3 className="profile-settings-section-title">🔔 Notifications</h3>

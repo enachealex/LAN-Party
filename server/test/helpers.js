@@ -36,7 +36,10 @@ async function startServer(opts = {}) {
   hookCleanup();
   const dataDir = opts.dataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'lanparty-test-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
-    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', ...(opts.env || {}) },
+    // SFU_ADDRESS_CHECK=0: the server asks an outside service for its public address when it
+    // announces one, and a test run must not depend on the network (or on what the developer's own
+    // shell has in SFU_ANNOUNCED_IPS). A test of that check turns it back on with a local stand-in.
+    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', SFU_ADDRESS_CHECK: '0', ...(opts.env || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   running.add(child);
@@ -82,6 +85,27 @@ async function startServer(opts = {}) {
       try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
     },
   };
+}
+
+// Environment for a server whose SFU a test really uses. Every server otherwise binds the default
+// media port, and with test files running side by side all but the first fail to and quietly turn
+// their SFU off — fine for tests that only need a server, fatal for one that asserts on a transport.
+// One loopback address, so there is exactly one port (the i-th announced address takes port + i).
+async function sfuEnv() {
+  const net = require('node:net');
+  const dgram = require('node:dgram');
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const tcp = net.createServer();
+    await new Promise((resolve, reject) => { tcp.once('error', reject); tcp.listen(0, '0.0.0.0', () => resolve(undefined)); });
+    const { port } = /** @type {import('node:net').AddressInfo} */ (tcp.address());
+    // The same number has to be free for UDP as well: the SFU binds both.
+    const udp = dgram.createSocket('udp4');
+    const udpFree = await new Promise((resolve) => { udp.once('error', () => resolve(false)); udp.bind(port, '0.0.0.0', () => resolve(true)); });
+    await new Promise((resolve) => { try { udp.close(() => resolve(undefined)); } catch (_) { resolve(undefined); } });
+    await new Promise((resolve) => tcp.close(() => resolve(undefined)));
+    if (udpFree) return { SFU_PORT: String(port), SFU_ANNOUNCED_IPS: '127.0.0.1' };
+  }
+  throw new Error('no free port for the SFU');
 }
 
 // Minimal API client: returns { status, data } and never throws on non-2xx.
@@ -130,4 +154,4 @@ async function dbAll(dataDir, sql, params = []) {
   }
 }
 
-module.exports = { startServer, apiFor, makeUser, dbAll, PASSWORD };
+module.exports = { startServer, sfuEnv, apiFor, makeUser, dbAll, PASSWORD };
