@@ -347,12 +347,27 @@ async function main() {
   // max-age shorter than its configured browser TTL up to that TTL (4 hours), so browsers could go
   // on running a stale SDK for hours. no-cache carries no lifetime for it to raise.
   const SDK_FILE = path.join(__dirname, 'sdk', 'lanparty.js');
+  const SDK_HEADERS_VERSION = 'sdk2';
+  let sdkEtagCache = null; // { mtimeMs, etag }: rehashed only when the file changes (it does not, between deploys)
+  const sdkEtag = () => {
+    const { mtimeMs } = fs.statSync(SDK_FILE);
+    if (!sdkEtagCache || sdkEtagCache.mtimeMs !== mtimeMs) {
+      const digest = crypto.createHash('sha256').update(fs.readFileSync(SDK_FILE)).digest('hex').slice(0, 20);
+      sdkEtagCache = { mtimeMs, etag: `W/"${SDK_HEADERS_VERSION}-${digest}"` };
+    }
+    return sdkEtagCache.etag;
+  };
   app.get('/sdk/lanparty.js', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'no-cache');
-    res.type('application/javascript').sendFile(SDK_FILE);
+    // Our own validator, and the only one. The CDN keeps a stored copy's old headers for as long as
+    // its revalidation is answered 'not modified', so a header change (like the line above) never
+    // reached a copy cached before it. An ETag made from the content plus a version for these headers
+    // makes every earlier validator stale; bump SDK_HEADERS_VERSION when the headers here change.
+    res.setHeader('ETag', sdkEtag());
+    res.type('application/javascript').sendFile(SDK_FILE, { lastModified: false });
   });
   // Terminal for the same reason as the mounts above: a mistyped SDK path must 404, not hand a
   // <script> tag the SPA shell with a 200.

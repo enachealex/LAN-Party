@@ -725,6 +725,18 @@ describe('app activity (sockets)', () => {
       }).on('error', reject);
     });
     assert.deepEqual(again, { status: 304, cacheControl: 'no-cache', size: 0 });
+    // A validator from before these headers existed (the static server's size-mtime form, or a date)
+    // must not be answered "not modified": the CDN would keep serving its stored copy with the old
+    // cache lifetime. The ETag carries a version for that, and there is no Last-Modified to match.
+    assert.match(etag, /^W\/"sdk\d+-[0-9a-f]{20}"$/);
+    assert.equal(res.headers.get('last-modified'), null);
+    const stale = await new Promise((resolve, reject) => {
+      http.get(base + '/sdk/lanparty.js', { headers: { 'If-None-Match': 'W/"551a-1a1d8acb2b7"', 'If-Modified-Since': new Date().toUTCString() } }, (r) => {
+        r.resume();
+        r.on('end', () => resolve({ status: r.statusCode, cacheControl: r.headers['cache-control'] }));
+      }).on('error', reject);
+    });
+    assert.deepEqual(stale, { status: 200, cacheControl: 'no-cache' });
     const body = await res.text();
     assert.match(body, /LANParty/);
     assert.doesNotMatch(body, /<!doctype html>/i);
