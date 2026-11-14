@@ -11,6 +11,7 @@
 //
 // WHEN IT IS BUMPED. Whenever someone stops being entitled to rooms in the server, and by hand:
 //   - a member is removed (kick)                       DELETE /servers/:id/members/:username
+//   - a member is banned (the kick's own clean-up)     POST /servers/:id/bans/:username
 //   - a member leaves                                  POST /servers/:id/leave
 //   - an admin is demoted and a private channel goes with the role
 //                                                      PATCH /servers/:id/members/:username

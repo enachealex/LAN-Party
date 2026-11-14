@@ -123,6 +123,10 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
         await db.run('DELETE FROM server_emojis WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_invites WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_removed WHERE server_id = ?', s.id);
+        // The moderation records of a server go with the server (services/moderation.js).
+        await db.run('DELETE FROM server_bans WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_timeouts WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_audit WHERE server_id = ?', s.id);
         await db.run('DELETE FROM servers WHERE id = ?', s.id);
       }
       await db.run('DELETE FROM server_members WHERE username = ?', username);
@@ -138,6 +142,14 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       // A kick is about a person, not a name: whoever registers the freed username next must not
       // inherit it.
       await db.run('DELETE FROM server_removed WHERE username = ?', username);
+      // The same goes for a ban and a timeout: they were placed on this person, and the next
+      // holder of the name starts without them. Audit entries that name the account are kept;
+      // they are a record of what happened in servers that still exist.
+      await db.run('DELETE FROM server_bans WHERE username = ?', username);
+      await db.run('DELETE FROM server_timeouts WHERE username = ?', username);
+      // Blocks they placed and blocks placed on them. User ids are never reused, but there is
+      // nobody left for either kind to be about.
+      await db.run('DELETE FROM user_blocks WHERE blocker_id = ? OR blocked_id = ?', userId, userId);
       await db.run('DELETE FROM apps WHERE created_by = ?', username);
       await db.run('DELETE FROM gifs WHERE created_by = ?', username);
       await db.run('DELETE FROM sounds WHERE created_by = ?', username);

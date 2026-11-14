@@ -79,8 +79,17 @@ function createMessages({ db }) {
     }
   }
 
-  function mapMessageRow(row, forUsername) {
+  /**
+   * A stored row as the client renders it, for one reader.
+   * `blockedAuthors` is who that reader has blocked (services/blocks.js blockedBy): a message from
+   * one of them carries `blocked: true`, which is all the server does about it. It is still sent,
+   * so that the conversation around it makes sense, and the client shows it collapsed. The flag is
+   * the reader's own and must never be put on a payload that goes to anyone else.
+   * @param {any} row @param {string | null} [forUsername] @param {Set<string> | null} [blockedAuthors]
+   */
+  function mapMessageRow(row, forUsername, blockedAuthors) {
     return {
+      ...(blockedAuthors && blockedAuthors.has(row.author) ? { blocked: true } : {}),
       id: row.id,
       author: row.author,
       text: row.text || '',

@@ -377,6 +377,64 @@ const MIGRATIONS = [
       await addColumn(db, 'servers', 'app_room_epoch', 'INTEGER NOT NULL DEFAULT 0');
     },
   },
+  {
+    // Blocking between two accounts, and per-server moderation (services/blocks.js,
+    // services/moderation.js). Four new tables and nothing else: no existing row is read or changed.
+    //
+    // user_blocks is keyed by user id, like friendships, so a rename needs no cascade. One row per
+    // direction: A blocking B says nothing about B blocking A.
+    //
+    // server_bans, server_timeouts and server_audit are keyed by username, like server_members and
+    // server_removed, so a rename has to carry them (POST /user/username). How a ban differs from
+    // server_removed (0009), which a kick writes:
+    //   server_removed  "staff took them out"; no invite LINK admits them, but staff adding them
+    //                   by username clears it.
+    //   server_bans     "they may not come back"; no link and no invite by username admits them
+    //                   until the row is deleted (unban). It can exist for someone who was never a
+    //                   member.
+    //
+    // A timeout is in force while `until` is in the future; nothing has to run when it ends.
+    // server_audit.target is only ever a username (or NULL): everything else about an entry is in
+    // `detail` (JSON), which is what lets a rename rewrite actor and target without touching a
+    // channel that happens to share someone's name. Message text is never written to it.
+    name: '0014_blocks_and_moderation',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS user_blocks (
+        blocker_id INTEGER NOT NULL,
+        blocked_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (blocker_id, blocked_id)
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON user_blocks (blocked_id)');
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_bans (
+        server_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        banned_by TEXT,
+        reason TEXT,
+        banned_at INTEGER NOT NULL,
+        PRIMARY KEY (server_id, username)
+      )`);
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_timeouts (
+        server_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        until INTEGER NOT NULL,
+        timed_out_by TEXT,
+        reason TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (server_id, username)
+      )`);
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        server_id TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        actor TEXT,
+        action TEXT NOT NULL,
+        target TEXT,
+        detail TEXT
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_server_audit_server ON server_audit (server_id, id)');
+    },
+  },
 ];
 
 /**

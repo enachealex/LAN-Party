@@ -4,10 +4,15 @@
 // normal routes right now. Search reads across every conversation at once, so it is the easiest
 // place in the server to leak one. That is why it never decides access for itself. It first works
 // out which conversations the caller may open, using the same checks the routes that open them use
-// (roleOf / canAccessChannel / visibleChannelsFor for channels, canDirectMessage for DMs, a
+// (roleOf / canAccessChannel / visibleChannelsFor for channels, mayReadDirectMessages for DMs, a
 // group_members row for groups), and only then matches text inside that set. Asking for one
 // conversation by id and not being allowed in is a refusal, never an empty list that looks like
 // "no matches".
+//
+// One thing is narrower than what the caller could open: messages WRITTEN BY someone the caller
+// has blocked are never results, in any kind of conversation (services/blocks.js). They are still
+// in the history, collapsed; search is not a way to have them put in front of you. This only ever
+// removes results for the person who placed the block, so it tells the blocked person nothing.
 //
 // Cost: the match is a LIKE, which has to read every message in the conversations searched. Fine at
 // this app's size, and bounded two ways: every query carries a LIMIT, and the route is rate limited.
@@ -62,7 +67,13 @@ function afterCursor(cursor, rank, tsCol, idCol) {
 }
 
 /** @param {Record<string, any>} deps */
-function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChannel, visibleChannelsFor, getUserByUsername, canDirectMessage, parseAttachment }) {
+function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChannel, visibleChannelsFor, getUserByUsername, mayReadDirectMessages, parseAttachment }) {
+  // "Not written by someone the caller has blocked". Each takes one parameter, the caller's user id.
+  const NOT_BLOCKED = {
+    channel: `m.author NOT IN (SELECT bu.username FROM user_blocks b JOIN users bu ON bu.id = b.blocked_id WHERE b.blocker_id = ?)`,
+    dm: 'dm.sender_id NOT IN (SELECT blocked_id FROM user_blocks WHERE blocker_id = ?)',
+    group: 'gm.sender_id NOT IN (SELECT blocked_id FROM user_blocks WHERE blocker_id = ?)',
+  };
   const fail = (status, error) => ({ status, error });
   const one = (value) => (typeof value === 'string' ? value : '');
 
@@ -120,7 +131,7 @@ function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChanne
       if (!withName) return fail(400, 'with is required for scope=dm');
       const peer = await getUserByUsername(withName);
       if (!peer) return fail(404, 'User not found');
-      if (!(await canDirectMessage(me.id, me.username, peer.id, peer.username))) {
+      if (!(await mayReadDirectMessages(me.id, me.username, peer.id, peer.username))) {
         return fail(403, 'You can only message friends or people you share a server with');
       }
       return { peers: [peer] };
@@ -135,7 +146,7 @@ function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChanne
     );
     const peers = [];
     for (const p of everyone) {
-      if (await canDirectMessage(me.id, me.username, p.id, p.username)) peers.push(p);
+      if (await mayReadDirectMessages(me.id, me.username, p.id, p.username)) peers.push(p);
     }
     return { peers };
   }
@@ -158,7 +169,7 @@ function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChanne
 
   // --- The matching itself. Each takes limit + 1 so the caller can tell whether more exist. ---
 
-  async function searchChannels(servers, pattern, cursor, take) {
+  async function searchChannels(servers, me, pattern, cursor, take) {
     const searched = servers.filter((s) => s.channels.length);
     if (!searched.length) return [];
     const after = afterCursor(cursor, KIND_RANK.channel, 'm.ts', 'm.id');
@@ -179,9 +190,9 @@ function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChanne
         `SELECT m.id, m.author, m.text, m.ts, m.attachment_json, m.server_id, m.channel_id
            FROM messages m
           WHERE (${batch.map((b) => `(m.server_id = ? AND m.channel_id IN (${placeholders(b.ids.length)}))`).join(' OR ')})
-            AND m.text LIKE ? ESCAPE '\\'${after.sql}
+            AND m.text LIKE ? ESCAPE '\\' AND ${NOT_BLOCKED.channel}${after.sql}
           ORDER BY m.ts DESC, m.id DESC LIMIT ?`,
-        ...batch.flatMap((b) => [b.id, ...b.ids]), pattern, ...after.params, take
+        ...batch.flatMap((b) => [b.id, ...b.ids]), pattern, me.id, ...after.params, take
       ));
     }
     // Each batch brought its own newest `take`; the newest `take` overall are among them.
@@ -205,24 +216,24 @@ function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChanne
       `SELECT dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, s.username AS author, dm.sender_id, dm.recipient_id
          FROM direct_messages dm JOIN users s ON s.id = dm.sender_id
         WHERE ((dm.sender_id = ? AND dm.recipient_id IN (${marks})) OR (dm.recipient_id = ? AND dm.sender_id IN (${marks})))
-          AND dm.body LIKE ? ESCAPE '\\'${after.sql}
+          AND dm.body LIKE ? ESCAPE '\\' AND ${NOT_BLOCKED.dm}${after.sql}
         ORDER BY dm.created_at DESC, dm.id DESC LIMIT ?`,
-      me.id, ...ids, me.id, ...ids, pattern, ...after.params, take
+      me.id, ...ids, me.id, ...ids, pattern, me.id, ...after.params, take
     );
     const nameOf = new Map(peers.map((p) => [p.id, p.username]));
     return rows.map((r) => result('dm', r, { peer: nameOf.get(r.sender_id === me.id ? r.recipient_id : r.sender_id) }));
   }
 
-  async function searchGroups(groups, pattern, cursor, take) {
+  async function searchGroups(groups, me, pattern, cursor, take) {
     if (!groups.length) return [];
     const after = afterCursor(cursor, KIND_RANK.group, 'gm.created_at', 'gm.id');
     const rows = await db.all(
       `SELECT gm.id, gm.body AS text, gm.created_at AS ts, gm.attachment_json, u.username AS author, gm.group_id
          FROM group_messages gm JOIN users u ON u.id = gm.sender_id
         WHERE gm.group_id IN (${placeholders(groups.length)})
-          AND gm.body LIKE ? ESCAPE '\\'${after.sql}
+          AND gm.body LIKE ? ESCAPE '\\' AND ${NOT_BLOCKED.group}${after.sql}
         ORDER BY gm.created_at DESC, gm.id DESC LIMIT ?`,
-      ...groups.map((g) => g.id), pattern, ...after.params, take
+      ...groups.map((g) => g.id), pattern, me.id, ...after.params, take
     );
     const nameOf = new Map(groups.map((g) => [g.id, g.name || '']));
     return rows.map((r) => result('group', r, { groupId: r.group_id, groupName: nameOf.get(r.group_id) }));
@@ -277,9 +288,9 @@ function registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChanne
     const pattern = likePattern(q);
     const take = limit + 1;
     const found = [
-      ...(await searchChannels(channels.servers, pattern, cursor, take)),
+      ...(await searchChannels(channels.servers, me, pattern, cursor, take)),
       ...(await searchDms(dms.peers, me, pattern, cursor, take)),
-      ...(await searchGroups(groups.groups, pattern, cursor, take)),
+      ...(await searchGroups(groups.groups, me, pattern, cursor, take)),
     ];
     // Each kind arrived newest-first on its own; this is the merge. The order has to be the one
     // afterCursor assumes.

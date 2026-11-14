@@ -4,6 +4,7 @@
 const { mentionedUsernames } = require('../services/push');
 const { parsePageQuery, fetchPage, channelHistory } = require('../services/history');
 const { rateLimit } = require('../rateLimit');
+const { AUDIT } = require('../services/moderation');
 
 // Resetting app rooms ends every app running in the server and orphans what apps stored for its
 // channels, so it is not something to do in a loop. Counted per account (the route knows who is
@@ -15,7 +16,19 @@ const APP_ROOMS_RESET_LIMIT = {
 };
 
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks }) {
+  // The audit log (services/moderation.js): who did what in a server. Written after the action
+  // itself, never before; it does nothing for the commons and never fails the request.
+  const audit = moderation.audit;
+
+  // "Not written by someone this user has blocked", for a query over `messages m`. One parameter:
+  // the reader's username.
+  const NOT_BLOCKED_AUTHOR = `m.author NOT IN (
+         SELECT bu.username FROM user_blocks b
+           JOIN users me ON me.id = b.blocker_id
+           JOIN users bu ON bu.id = b.blocked_id
+          WHERE me.username = ?)`;
+
   // The rail shows only the servers the user owns or has been invited to. New users start with an
   // empty rail (no server is auto-joined at registration) and land on the home view.
   app.get('/servers', authMiddleware, async (req, res) => {
@@ -32,13 +45,15 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
   // user can see are included (private channels never leak counts to plain members).
   app.get('/unreads', authMiddleware, async (req, res) => {
     const me = req.user.username;
+    // Messages from someone the caller has blocked are not counted, here or among the mentions
+    // below: a blocked person must not be able to light up a badge (services/blocks.js).
     const counts = await db.all(
       `SELECT m.server_id, m.channel_id, COUNT(*) AS n
        FROM messages m
        LEFT JOIN channel_reads r ON r.username = ? AND r.server_id = m.server_id AND r.channel_id = m.channel_id
-       WHERE m.ts > COALESCE(r.last_read_ts, 0) AND m.author != ?
+       WHERE m.ts > COALESCE(r.last_read_ts, 0) AND m.author != ? AND ${NOT_BLOCKED_AUTHOR}
        GROUP BY m.server_id, m.channel_id`,
-      me, me
+      me, me, me
     );
     if (!counts.length) return res.json({ unreads: {}, mentions: {} });
     // Roles for my servers, from membership rows (no implicit public server anymore).
@@ -62,8 +77,8 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
       `SELECT m.server_id, m.channel_id, m.text
        FROM messages m
        LEFT JOIN channel_reads r ON r.username = ? AND r.server_id = m.server_id AND r.channel_id = m.channel_id
-       WHERE m.ts > COALESCE(r.last_read_ts, 0) AND m.author != ? AND m.text LIKE '%@' || ? || '%'`,
-      me, me, me
+       WHERE m.ts > COALESCE(r.last_read_ts, 0) AND m.author != ? AND m.text LIKE '%@' || ? || '%' AND ${NOT_BLOCKED_AUTHOR}`,
+      me, me, me, me
     );
     const mentions = {};
     for (const row of candidates) {
@@ -114,6 +129,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
       }
     }
     await broadcastServerState(serverId);
+    await audit(serverId, req.user.username, AUDIT.channelCreated, null, { channelId: chId, name, type, privacy });
     return res.json({ channel: { id: chId, name, type, privacy } });
   });
 
@@ -132,8 +148,18 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const page = parsePageQuery(req.query);
     if ('error' in page) return res.status(400).json({ error: page.error });
     const { rows, hasMore, hasMoreAfter } = await fetchPage(db, channelHistory(serverId, channelId), page);
-    return res.json({ messages: rows.map((m) => mapMessageRow(m, req.user.username)), hasMore, hasMoreAfter });
+    // Messages from people the reader has blocked stay in the page, marked, so the client can
+    // collapse them: taking them out would leave everyone else's replies answering nothing.
+    const blocked = await blocks.blockedBy(req.user.username);
+    return res.json({ messages: rows.map((m) => mapMessageRow(m, req.user.username, blocked)), hasMore, hasMoreAfter });
   });
+
+  // Which channel an audit entry is about: its id, and its name as it was at the time (the log
+  // has to stay readable after the channel is renamed or deleted).
+  async function channelDetail(serverId, channelId) {
+    const ch = await db.get('SELECT name FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+    return { channelId, channel: ch ? ch.name : null };
+  }
 
   // Read / manage a private channel's access list (owner/admins only). Public channels have none.
   app.get('/servers/:serverId/channels/:channelId/members', authMiddleware, async (req, res) => {
@@ -148,9 +174,10 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const u = String((req.body || {}).username || '').trim();
     if (!u) return res.status(400).json({ error: 'Username required' });
     if (!(await isMember(serverId, u))) return res.status(400).json({ error: `${u} isn't a member of this server` });
-    await db.run('INSERT OR IGNORE INTO channel_members (server_id, channel_id, username) VALUES (?, ?, ?)', serverId, channelId, u);
+    const granted = await db.run('INSERT OR IGNORE INTO channel_members (server_id, channel_id, username) VALUES (?, ?, ?)', serverId, channelId, u);
     await broadcastServerState(serverId);
     io.to(`user:${u}`).emit('servers:updated'); // nudge the newly-granted user to refresh
+    if (granted.changes > 0) await audit(serverId, req.user.username, AUDIT.accessGranted, u, await channelDetail(serverId, channelId));
     return res.json({ success: true });
   });
   app.delete('/servers/:serverId/channels/:channelId/members/:username', authMiddleware, async (req, res) => {
@@ -163,8 +190,10 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     // channel with or without one.
     if (removed.changes > 0 && !isStaffRole(await roleOf(serverId, username))) await appRooms.rotate(serverId);
     // ...and if they are sitting in that channel's voice room right now, they are taken out of it.
-    if (removed.changes > 0) await enforceVoiceAccess(username, serverId);
+    // The same for a socket that has the channel open as text: it stops receiving its messages.
+    if (removed.changes > 0) { await enforceVoiceAccess(username, serverId); await enforceTextAccess(username, serverId); }
     await broadcastServerState(serverId);
+    if (removed.changes > 0) await audit(serverId, req.user.username, AUDIT.accessRemoved, username, await channelDetail(serverId, channelId));
     return res.json({ success: true });
   });
 
@@ -195,6 +224,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     await db.run('UPDATE servers SET name = ? WHERE id = ?', name, serverId);
     io.emit('servers:updated');
     await pushServerState(serverId);
+    if (name !== srv.name) await audit(serverId, req.user.username, AUDIT.serverRenamed, null, { from: srv.name, to: name });
     return res.json({ server: { id: serverId, name } });
   });
 
@@ -213,6 +243,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (srv.icon_url && srv.icon_url !== saved.url) removeTileIconFile(srv.icon_url);
     io.emit('servers:updated'); // every member's rail re-reads the list
     await pushServerState(serverId);
+    await audit(serverId, req.user.username, AUDIT.serverIcon, null, { change: 'set' });
     return res.json({ success: true, url: saved.url });
   });
 
@@ -226,6 +257,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (srv.icon_url) removeTileIconFile(srv.icon_url);
     io.emit('servers:updated');
     await pushServerState(serverId);
+    if (srv.icon_url) await audit(serverId, req.user.username, AUDIT.serverIcon, null, { change: 'cleared' });
     return res.json({ success: true });
   });
 
@@ -244,6 +276,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     // A link to a server that no longer exists must stop resolving, not sit there as a dead row.
     await db.run('DELETE FROM server_invites WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_removed WHERE server_id = ?', serverId);
+    await moderation.forgetServer(serverId); // its bans, timeouts and audit log go with it
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
     // Nobody is a member any more, and there is no epoch left to bump (services/appRooms.js): the
@@ -257,20 +290,21 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
   // Rename a channel (owner/admin).
   app.patch('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
-    const ch = await db.get('SELECT id FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+    const ch = await db.get('SELECT id, name FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
     if (!ch) return res.status(404).json({ error: 'Channel not found' });
     if (!(await canManageChannels(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can rename channels' });
     const name = String((req.body || {}).name || '').trim().slice(0, 30);
     if (!name) return res.status(400).json({ error: 'Channel name required' });
     await db.run('UPDATE channels SET name = ? WHERE id = ?', name, channelId);
     await pushServerState(serverId);
+    if (name !== ch.name) await audit(serverId, req.user.username, AUDIT.channelRenamed, null, { channelId, from: ch.name, to: name });
     return res.json({ channel: { id: channelId, name } });
   });
 
   // Delete a channel (owner/admin). A server always keeps at least one text channel.
   app.delete('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
-    const ch = await db.get('SELECT id, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+    const ch = await db.get('SELECT id, name, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
     if (!ch) return res.status(404).json({ error: 'Channel not found' });
     if (!(await canManageChannels(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can delete channels' });
     if (ch.type === 'text') {
@@ -281,6 +315,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channels WHERE id = ?', channelId);
     await pushServerState(serverId);
+    await audit(serverId, req.user.username, AUDIT.channelDeleted, null, { channelId, name: ch.name, type: ch.type });
     return res.json({ success: true });
   });
 
@@ -309,6 +344,9 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const user = await db.get('SELECT username FROM users WHERE username = ?', target);
     if (!user) return res.status(404).json({ error: `No user named "${target}"` });
     if (await isMember(serverId, target)) return res.status(400).json({ error: `${target} is already a member` });
+    // A ban is not lifted by inviting: that is the difference between it and a kick, which the
+    // lines below do undo. Staff are told why, since they can read the ban list anyway.
+    if (await moderation.banOf(serverId, target)) return res.status(403).json({ error: `${target} is banned from this server. Unban them first.` });
     await db.run('INSERT INTO server_members (server_id, username, role) VALUES (?, ?, ?)', serverId, target, 'member');
     // Staff asking for someone by name is the way back in after a kick, so it lifts the block that
     // keeps a removed person from rejoining through an invite link.
@@ -316,6 +354,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     io.to(`user:${target}`).emit('servers:updated');
     io.to(`user:${target}`).emit('server:invited', { serverId, name: srv.name, by: req.user.username });
     await broadcastServerState(serverId);
+    await audit(serverId, req.user.username, AUDIT.invited, target);
     return res.json({ success: true });
   });
 
@@ -331,6 +370,16 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const targetRole = await roleOf(serverId, target);
     if (!targetRole) return res.status(404).json({ error: 'Not a member' });
     if (myRole === 'admin' && targetRole === 'admin') return res.status(403).json({ error: "Admins can't remove other admins" });
+    await removeMemberFromServer(serverId, target, req.user.username);
+    await audit(serverId, req.user.username, AUDIT.kick, target);
+    return res.json({ success: true });
+  });
+
+  // Take a member out of a server: everything a kick does, in the order it has to happen. A ban
+  // (routes/moderation.js) runs this too, so the two can never drift apart; `banned` only changes
+  // what the removed person's own client is told. A kick is "removed, and staff may invite them
+  // back"; what makes a ban hold beyond that is its own row (services/moderation.js).
+  async function removeMemberFromServer(serverId, target, by, { banned = false } = {}) {
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, target);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, target);
     // A kick has to hold against invite links too. Remembering who was removed is what stops them
@@ -338,20 +387,21 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     // they minted stops them handing the server out to others.
     await db.run(
       'INSERT OR REPLACE INTO server_removed (server_id, username, removed_by, removed_at) VALUES (?, ?, ?, ?)',
-      serverId, target, req.user.username, Date.now()
+      serverId, target, by, Date.now()
     );
     await revokeInvitesBy(serverId, target);
     // And against the apps they joined here: they still hold those channels' room keys, which is
     // all an app's own server asks for. New keys for the whole server (services/appRooms.js).
     // After the rows above are gone, so that they cannot be handed one of the new keys.
     await appRooms.rotate(serverId);
-    // Out of the server means out of its calls, now — not whenever they next hang up.
+    // Out of the server means out of its calls, now — not whenever they next hang up. And out of
+    // its text channels: a socket that still had one open would go on receiving every message.
     await enforceVoiceAccess(target, serverId);
+    await enforceTextAccess(target, serverId);
     io.to(`user:${target}`).emit('servers:updated');
-    io.to(`user:${target}`).emit('server:removed', { serverId });
+    io.to(`user:${target}`).emit('server:removed', banned ? { serverId, banned: true } : { serverId });
     await broadcastServerState(serverId);
-    return res.json({ success: true });
-  });
+  }
 
   // Change a member's role: owner promotes/demotes between admin and member.
   app.patch('/servers/:serverId/members/:username', authMiddleware, async (req, res) => {
@@ -379,9 +429,11 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
       );
       if (lost) await appRooms.rotate(serverId);
       await enforceVoiceAccess(target, serverId);
+      await enforceTextAccess(target, serverId);
     }
     io.to(`user:${target}`).emit('servers:updated');
     await broadcastServerState(serverId);
+    if (before !== role) await audit(serverId, req.user.username, AUDIT.role, target, { from: before, to: role });
     return res.json({ success: true, role });
   });
 
@@ -403,9 +455,11 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     // same: they walk out holding room keys, so the server gets new ones (services/appRooms.js).
     await appRooms.rotate(serverId);
     await enforceVoiceAccess(me, serverId);
+    await enforceTextAccess(me, serverId);
     io.to(`user:${me}`).emit('servers:updated');
     io.to(`user:${me}`).emit('server:removed', { serverId });
     await broadcastServerState(serverId);
+    await audit(serverId, me, AUDIT.left);
     return res.json({ success: true });
   });
 
@@ -421,8 +475,11 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (!srv) return res.status(404).json({ error: 'Server not found' });
     if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can reset app rooms' });
     const epoch = await appRooms.rotate(serverId);
+    await audit(serverId, req.user.username, AUDIT.appRoomsReset);
     return res.json({ success: true, epoch });
   });
+
+  return { removeMemberFromServer };
 }
 
 module.exports = { registerServerRoutes };

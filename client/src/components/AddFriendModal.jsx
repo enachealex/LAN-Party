@@ -11,6 +11,7 @@ export default function AddFriendModal({
   userExists,
   userChecking,
   isSelf,
+  blocked = false, // the name typed is someone you have blocked: the server refuses the request until you unblock them
 }) {
   const [debounced, setDebounced] = useState(username)
 
@@ -25,8 +26,8 @@ export default function AddFriendModal({
   }, [open])
 
   const showField = debounced.trim().length > 0
-  const showOk = showField && !userChecking && userExists === true && !isSelf
-  const showErr = showField && !userChecking && (userExists === false || isSelf)
+  const showOk = showField && !userChecking && userExists === true && !isSelf && !blocked
+  const showErr = showField && !userChecking && (userExists === false || isSelf || blocked)
 
   return (
     <>
@@ -79,6 +80,9 @@ export default function AddFriendModal({
           )}
           {userExists === false && showField && !userChecking && !isSelf && (
             <div className="field-error-message">No user found with that username</div>
+          )}
+          {blocked && showField && !userChecking && userExists !== false && !isSelf && (
+            <div className="field-error-message">You blocked this person. Unblock them in Settings → Messages → Blocked people first.</div>
           )}
           {error && <div className="auth-error">{error}</div>}
           <div className="add-friend-actions">

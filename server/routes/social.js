@@ -2,10 +2,20 @@
 // decline / cancel / incoming / outgoing), and 1:1 DMs (conversations, thread,
 // read, send, delete). Leans on shared helpers (friend-graph, DM-unread, presence broadcasts) that
 // also serve the socket layer, so they are injected rather than moved.
+//
+// Blocking (services/blocks.js) shows up here in three places, and in each the person who was
+// blocked must get the answer they would get without the block, or the one a stranger gets:
+// - sending a message is refused by canDirectMessage with its usual "friends or shared server"
+//   answer, whichever of the two placed the block;
+// - reading an existing conversation is unchanged (mayReadDirectMessages);
+// - a friend request from the blocked person is accepted and then WITHHELD: stored with status
+//   'withheld', shown to its sender as pending like any other, and never shown, counted or pushed
+//   to the person who blocked them. Refusing it would be the tell, since nothing else ever refuses
+//   a friend request. It is dropped if the block is lifted (blocks.unblock).
 const { parsePageQuery, fetchPage } = require('../services/history');
 
 /** @param {Record<string, any>} deps */
-function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push }) {
+function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks }) {
   app.post('/user/presence', authMiddleware, async (req, res) => {
     const status = normalizePresence(req.body?.status);
     const username = req.user.username;
@@ -73,11 +83,12 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
   app.get('/friends/requests/outgoing', authMiddleware, async (req, res) => {
     const me = await getUserByUsername(req.user.username);
     if (!me) return res.status(404).json({ error: 'User not found' });
+    // A withheld request (see the header) is listed like a pending one: to its sender it is one.
     const rows = await db.all(
       `SELECT fr.id, u.username AS toUsername, fr.created_at AS createdAt
        FROM friend_requests fr
        JOIN users u ON u.id = fr.to_user_id
-       WHERE fr.from_user_id = ? AND fr.status = 'pending'
+       WHERE fr.from_user_id = ? AND fr.status IN ('pending', 'withheld')
        ORDER BY fr.created_at DESC`,
       me.id
     );
@@ -98,10 +109,12 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     if (!me) return res.status(404).json({ error: 'User not found' });
     const fr = await db.get('SELECT * FROM friend_requests WHERE id = ?', requestId);
     if (!fr || fr.from_user_id !== me.id) return res.status(404).json({ error: 'Request not found' });
-    if (fr.status !== 'pending') return res.status(400).json({ error: 'Request is not pending' });
+    // A withheld request cancels like a pending one. The person it was for never had it, so
+    // there is nothing to tell them.
+    if (fr.status !== 'pending' && fr.status !== 'withheld') return res.status(400).json({ error: 'Request is not pending' });
     await db.run('UPDATE friend_requests SET status = ? WHERE id = ?', 'cancelled', requestId);
     const target = await db.get('SELECT username FROM users WHERE id = ?', fr.to_user_id);
-    if (target) await emitPendingUpdate(target.username);
+    if (target && fr.status === 'pending') await emitPendingUpdate(target.username);
     return res.json({ success: true });
   });
 
@@ -113,24 +126,45 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     const target = await getUserByUsername(targetUsername);
     if (!target) return res.status(404).json({ error: 'User not found' });
     if (target.id === me.id) return res.status(400).json({ error: 'You cannot add yourself' });
+    // The caller's own block: no secret to them, so it is said plainly. They unblock first.
+    if (await blocks.hasBlocked(me.id, target.id)) {
+      return res.status(403).json({ error: `You have blocked ${target.username}. Unblock them before sending a friend request.` });
+    }
     if (await areFriends(me.id, target.id)) {
       return res.status(409).json({ error: 'Already friends' });
     }
-    if (await hasPendingRequestBetween(me.id, target.id)) {
+    // A request of the caller's own that is being withheld counts as pending, as it does everywhere
+    // else they can see it.
+    const withheldAlready = await db.get(
+      "SELECT 1 AS one FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = 'withheld'",
+      me.id, target.id
+    );
+    if (withheldAlready || await hasPendingRequestBetween(me.id, target.id)) {
       return res.status(409).json({ error: 'Friend request already pending' });
     }
+    // Blocked by the person they are asking: the request is taken and withheld (see the header).
+    const withheld = await blocks.hasBlocked(target.id, me.id);
     const createdAt = Date.now();
+    // friend_requests holds one row per direction, so an earlier request the same way that was
+    // declined or cancelled is replaced. Inserting beside it failed on the UNIQUE constraint, and
+    // that failure was an unhandled rejection: asking someone a second time took the server down.
+    await db.run(
+      "DELETE FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status NOT IN ('pending', 'withheld')",
+      me.id, target.id
+    );
     await db.run(
       'INSERT INTO friend_requests (from_user_id, to_user_id, status, created_at) VALUES (?, ?, ?, ?)',
       me.id,
       target.id,
-      'pending',
+      withheld ? 'withheld' : 'pending',
       createdAt
     );
-    await emitPendingUpdate(target.username);
-    // A request is the one thing here that is useless until its recipient sees it, and someone with
-    // the app closed otherwise finds out days later. Not awaited: it never fails the request.
-    push.notifyFriendRequest({ from: me.username, to: target.username });
+    if (!withheld) {
+      await emitPendingUpdate(target.username);
+      // A request is the one thing here that is useless until its recipient sees it, and someone with
+      // the app closed otherwise finds out days later. Not awaited: it never fails the request.
+      push.notifyFriendRequest({ from: me.username, to: target.username });
+    }
     return res.json({ success: true });
   });
 
@@ -259,7 +293,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     const peer = await getUserByUsername(req.params.username);
     if (!peer) return res.status(404).json({ error: 'User not found' });
     // Friends, or people you share a server with — the member list offers a private message.
-    if (!(await canDirectMessage(me.id, me.username, peer.id, peer.username))) {
+    // Reading is not stopped by a block: the conversation stays where it was for both of them, and
+    // only new messages are refused (POST /messages/send).
+    if (!(await mayReadDirectMessages(me.id, me.username, peer.id, peer.username))) {
       return res.status(403).json({ error: 'You can only message friends or people you share a server with' });
     }
     // Before markRead, so a request that is going to be refused changes nothing.
@@ -284,8 +320,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
       idCol: 'dm.id',
     }, page);
     const summary = await getDmUnreadSummary(me.id);
+    const blocked = await blocks.blockedBy(me.username);
     return res.json({
-      messages: rows.map((r) => mapMessageRow(r, me.username)),
+      messages: rows.map((r) => mapMessageRow(r, me.username, blocked)),
       hasMore,
       hasMoreAfter,
       totalUnread: summary.totalUnread,
@@ -374,7 +411,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     const recipient = await db.get('SELECT username FROM users WHERE id = ?', dm.recipient_id);
     const payload = { id, text: body, editedAt };
     io.to(`user:${me.username}`).emit('dm:message-edited', payload);
-    if (recipient) io.to(`user:${recipient.username}`).emit('dm:message-edited', payload);
+    // With a block between the two, nothing new is delivered to the other side, and rewritten
+    // words are new. The edit itself goes through as always: its author sees no difference.
+    if (recipient && !(await blocks.between(me.id, dm.recipient_id))) io.to(`user:${recipient.username}`).emit('dm:message-edited', payload);
     return res.json({ success: true, ...payload });
   });
 

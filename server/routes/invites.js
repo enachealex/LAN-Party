@@ -17,8 +17,13 @@
 //   routes/servers.js) is refused by every link to that server until staff add them back by
 //   username, and gets the same answer as for a dead code. The links a person minted are revoked
 //   when they stop being staff there (kicked, demoted, left); that happens in routes/servers.js too.
+// - A link does not get round a ban either (server_bans, services/moderation.js). The difference
+//   from a kick is on the other side: staff adding a kicked person by username lets them back in,
+//   while a banned person stays out until the ban itself is lifted. To the person holding the link
+//   both look the same, and the same as a dead code.
 const crypto = require('crypto');
 const { rateLimit } = require('../rateLimit');
+const { AUDIT } = require('../services/moderation');
 
 // 12 random bytes -> 16 base64url characters. Well past the point where guessing is hopeless, and
 // still short enough to paste into a chat without it wrapping.
@@ -42,7 +47,7 @@ const ACCEPT_LIMIT = { id: 'invite-accept', windowMs: 5 * 60_000, max: 60 };
 const ACTIVE = 'revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) AND (max_uses IS NULL OR uses < max_uses)';
 
 /** @param {Record<string, any>} deps */
-function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput }) {
+function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput, moderation }) {
   const newCode = () => crypto.randomBytes(CODE_BYTES).toString('base64url');
 
   // The one response for every unusable code. Same status and same body whatever the reason.
@@ -102,6 +107,8 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
       'INSERT INTO server_invites (code, server_id, created_by, created_at, expires_at, max_uses, uses) VALUES (?, ?, ?, ?, ?, ?, 0)',
       row.code, srv.id, row.created_by, row.created_at, row.expires_at, row.max_uses
     );
+    // The limits, never the code: the code is the credential, and the log is read by every admin.
+    await moderation.audit(srv.id, req.user.username, AUDIT.inviteCreated, null, { expiresAt: row.expires_at, maxUses: row.max_uses });
     return res.json({ invite: shape(row) });
   });
 
@@ -124,10 +131,11 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
     const srv = await staffServer(req, res, 'revoke invite links');
     if (!srv) return undefined;
     const code = String(req.params.code || '');
-    const row = await db.get('SELECT code FROM server_invites WHERE code = ? AND server_id = ?', code, srv.id);
+    const row = await db.get('SELECT code, created_by FROM server_invites WHERE code = ? AND server_id = ?', code, srv.id);
     if (!row) return res.status(404).json({ error: 'Invite link not found' });
     // Revoking twice keeps the first timestamp, and still answers success.
-    await db.run('UPDATE server_invites SET revoked_at = ? WHERE code = ? AND server_id = ? AND revoked_at IS NULL', Date.now(), code, srv.id);
+    const revoked = await db.run('UPDATE server_invites SET revoked_at = ? WHERE code = ? AND server_id = ? AND revoked_at IS NULL', Date.now(), code, srv.id);
+    if (revoked.changes > 0) await moderation.audit(srv.id, req.user.username, AUDIT.inviteRevoked, null, { createdBy: row.created_by });
     return res.json({ success: true });
   });
 
@@ -171,6 +179,9 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
       // Removed by staff: no link lets them back in, and the link is not charged for the attempt.
       // Before the claim below, so a refused person cannot burn the uses of a limited link either.
       if (await db.get('SELECT 1 FROM server_removed WHERE server_id = ? AND username = ?', srv.id, me)) return null;
+      // Banned: the same refusal, for the same reason and at the same point. Checked on its own
+      // because a ban can be on someone who was never a member, and so never "removed".
+      if (await moderation.banOf(srv.id, me)) return null;
       // The check and the increment are ONE statement, so two people racing for the last use cannot
       // both get it: SQLite applies the first, and the second no longer matches `uses < max_uses`.
       const claim = await db.run(`UPDATE server_invites SET uses = uses + 1 WHERE code = ? AND ${ACTIVE}`, code, Date.now());
@@ -191,6 +202,7 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
       // and everyone already in it sees the roster grow.
       io.to(`user:${me}`).emit('servers:updated');
       await broadcastServerState(outcome.srv.id);
+      await moderation.audit(outcome.srv.id, me, AUDIT.joined, null, { via: 'link' });
     }
     const { srv } = outcome;
     return res.json({ success: true, alreadyMember: outcome.alreadyMember, server: { id: srv.id, name: srv.name, iconUrl: srv.icon_url || null } });

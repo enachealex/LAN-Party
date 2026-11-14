@@ -4,7 +4,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { open } = require('sqlite');
 const sqlite3 = require('sqlite3');
-const { migrate, MIGRATIONS } = require('../db/schema');
+const { migrate, MIGRATIONS, seedDemo } = require('../db/schema');
 const { addColumn, runMigrations } = require('../db/migrate');
 
 const freshDb = () => open({ filename: ':memory:', driver: sqlite3.Database });
@@ -53,6 +53,73 @@ describe('schema migrations', () => {
     assert.deepEqual(ran, MIGRATIONS.map((m) => m.name), 'baseline re-recorded');
     // Data survived (CREATE IF NOT EXISTS / addColumn skipped, didn't drop anything).
     assert.ok(await db.get("SELECT id FROM servers WHERE id = 'demo'"), 'demo still present');
+    await db.close();
+  });
+
+  test('0014 (blocks and moderation) adds its four tables and leaves every existing row as it was', async () => {
+    // A database as production has it the moment before this migration: everything up to 0013
+    // applied and recorded, with data in the tables the new features sit next to.
+    const db = await freshDb();
+    const upTo = MIGRATIONS.findIndex((m) => m.name === '0014_blocks_and_moderation');
+    assert.ok(upTo > 0, 'the migration exists, after the ones already shipped');
+    assert.equal(MIGRATIONS[upTo - 1].name, '0013_app_room_epoch', 'appended directly after 0013');
+    await runMigrations(db, MIGRATIONS.slice(0, upTo));
+    await seedDemo(db);
+    await db.run("INSERT INTO users (username, email, password_hash, settings, presence_status) VALUES ('ann', 'ann@example.com', 'hash', '{\"profile\":{}}', 'away')");
+    await db.run("INSERT INTO users (username, email, password_hash, settings) VALUES ('ben', 'ben@example.com', 'hash', '{}')");
+    await db.run("INSERT INTO servers (id, name, owner, icon_url, app_room_epoch) VALUES ('srv-1', 'Crew', 'ann', '/tile-icons/x.png', 3)");
+    await db.run("INSERT INTO channels (id, server_id, name, type, privacy) VALUES ('ch-1', 'srv-1', 'general', 'text', 'private')");
+    await db.run("INSERT INTO server_members (server_id, username, role) VALUES ('srv-1', 'ann', 'owner'), ('srv-1', 'ben', 'member')");
+    await db.run("INSERT INTO channel_members (server_id, channel_id, username) VALUES ('srv-1', 'ch-1', 'ben')");
+    await db.run("INSERT INTO server_removed (server_id, username, removed_by, removed_at) VALUES ('srv-1', 'cat', 'ann', 1700000000000)");
+    await db.run("INSERT INTO server_invites (code, server_id, created_by, created_at, uses) VALUES ('abcdefghijkl', 'srv-1', 'ann', 1700000000000, 2)");
+    await db.run("INSERT INTO messages (server_id, channel_id, author, text, ts, pinned_at, pinned_by, edited_at) VALUES ('srv-1', 'ch-1', 'ben', 'hello', 1700000000001, 1700000000002, 'ann', 1700000000003)");
+    await db.run("INSERT INTO friendships (user_id, friend_user_id, created_at) VALUES (1, 2, 1700000000000), (2, 1, 1700000000000)");
+    await db.run("INSERT INTO friend_requests (from_user_id, to_user_id, status, created_at) VALUES (1, 2, 'accepted', 1700000000000)");
+    await db.run("INSERT INTO direct_messages (sender_id, recipient_id, body, created_at) VALUES (1, 2, 'psst', 1700000000000)");
+    await db.run("INSERT INTO group_chats (id, name, owner_id, created_at) VALUES ('grp-1', 'Trio', 1, 1700000000000)");
+    await db.run("INSERT INTO group_members (group_id, user_id, joined_at, last_read_at) VALUES ('grp-1', 1, 1700000000000, 5), ('grp-1', 2, 1700000000001, 6)");
+    await db.run("INSERT INTO group_messages (group_id, sender_id, body, created_at) VALUES ('grp-1', 2, 'in the group', 1700000000000)");
+
+    const tables = (await db.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations' ORDER BY name")).map((r) => r.name);
+    const snapshot = async () => {
+      const out = {};
+      for (const t of tables) out[t] = { columns: await columnNames(db, t), rows: await db.all(`SELECT * FROM ${t} ORDER BY rowid`) };
+      return out;
+    };
+    const before = await snapshot();
+    assert.equal(before.messages.rows.length, 1);
+
+    await migrate(db); // the boot that picks 0014 up
+    assert.deepEqual(await snapshot(), before, 'no existing table gained, lost or changed anything');
+
+    const applied = (await db.all('SELECT name FROM schema_migrations')).map((r) => r.name);
+    assert.ok(applied.includes('0014_blocks_and_moderation'));
+    const NEW = {
+      user_blocks: ['blocker_id', 'blocked_id', 'created_at'],
+      server_bans: ['server_id', 'username', 'banned_by', 'reason', 'banned_at'],
+      server_timeouts: ['server_id', 'username', 'until', 'timed_out_by', 'reason', 'created_at'],
+      server_audit: ['id', 'server_id', 'ts', 'actor', 'action', 'target', 'detail'],
+    };
+    for (const [table, columns] of Object.entries(NEW)) {
+      assert.ok(!tables.includes(table), `${table} is new`);
+      assert.deepEqual(await columnNames(db, table), columns);
+      assert.equal((await db.get(`SELECT COUNT(*) AS n FROM ${table}`)).n, 0, `${table} starts empty`);
+    }
+    // One block per pair and per direction, one ban and one timeout per person per server.
+    await db.run('INSERT INTO user_blocks (blocker_id, blocked_id, created_at) VALUES (1, 2, 1)');
+    await assert.rejects(() => db.run('INSERT INTO user_blocks (blocker_id, blocked_id, created_at) VALUES (1, 2, 2)'));
+    await db.run('INSERT INTO user_blocks (blocker_id, blocked_id, created_at) VALUES (2, 1, 1)');
+    await db.run("INSERT INTO server_bans (server_id, username, banned_at) VALUES ('srv-1', 'cat', 1)");
+    await assert.rejects(() => db.run("INSERT INTO server_bans (server_id, username, banned_at) VALUES ('srv-1', 'cat', 2)"));
+    await db.run("INSERT INTO server_timeouts (server_id, username, until, created_at) VALUES ('srv-1', 'ben', 9, 1)");
+    await assert.rejects(() => db.run("INSERT INTO server_timeouts (server_id, username, until, created_at) VALUES ('srv-1', 'ben', 10, 2)"));
+
+    // Running it again (a database that lost its migration record) changes nothing either.
+    await db.exec('DROP TABLE schema_migrations');
+    await migrate(db);
+    assert.deepEqual(await snapshot(), before);
+    assert.equal((await db.get('SELECT COUNT(*) AS n FROM user_blocks')).n, 2, 'and keeps what the new tables hold');
     await db.close();
   });
 

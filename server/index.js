@@ -23,6 +23,10 @@ const { createSfu } = require('./services/sfu');
 const { createAddressMonitor, fetchPublicAddress } = require('./services/sfuAddress');
 const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./services/push');
 const { createInstanceOwners } = require('./services/instanceOwners');
+const { createBlocks } = require('./services/blocks');
+const { createModeration } = require('./services/moderation');
+const { registerBlockRoutes } = require('./routes/blocks');
+const { registerModerationRoutes } = require('./routes/moderation');
 const { registerMediaRoutes } = require('./routes/media');
 const { registerAuthRoutes } = require('./routes/auth');
 const { registerSocialRoutes } = require('./routes/social');
@@ -547,6 +551,12 @@ async function main() {
   // module is not installed on this host.
   const push = createPush({ db, dataDir: DATA_DIR, clientOrigin: CLIENT_ORIGIN });
 
+  // Blocking between two accounts (services/blocks.js) and per-server bans, timeouts and the audit
+  // log (services/moderation.js). Both are consulted from the socket handlers below as well as
+  // from their routes: every rule they describe is enforced here, never left to the client.
+  const blocks = createBlocks({ db });
+  const moderation = createModeration({ db, commonsId: DEMO_ID });
+
   // Return deduped members for a server: prefer username when available, keep latest connection per key
   function getMembersForServer(serverId) {
     const raw = Object.keys(clients).filter(id => clients[id].serverId === serverId).map(id => ({ id, name: clients[id].name, username: clients[id].username }));
@@ -660,10 +670,15 @@ async function main() {
    * counts: the member list offers a private message, and demanding a friend request first would make
    * that a dead menu item. Server membership is itself deliberate — you are added by an owner or
    * admin — so it is a meaningful association rather than "any account can message any account".
+   *
+   * This is the rule without blocking, and it is what decides whether an existing conversation may
+   * still be READ: a block closes a conversation to new messages, it does not take the old ones
+   * away from either side (mayReadDirectMessages). Whether the two may CONTACT each other now is
+   * canDirectMessage, below.
    * @param {number} meId @param {string} meUsername @param {number} peerId @param {string} peerUsername
    * @returns {Promise<boolean>}
    */
-  async function canDirectMessage(meId, meUsername, peerId, peerUsername) {
+  async function sharesFriendshipOrServer(meId, meUsername, peerId, peerUsername) {
     if (await areFriends(meId, peerId)) return true;
     const shared = await db.get(
       `SELECT 1 FROM server_members mine
@@ -674,6 +689,39 @@ async function main() {
       peerUsername
     );
     return !!shared;
+  }
+
+  /**
+   * May these two contact each other right now: send a direct message, show "typing", ring, be
+   * added to a group chat by the other? The rule above, and no block between them in EITHER
+   * direction (the person who blocked has to unblock before reaching out again).
+   *
+   * A block makes this false in exactly the way a stranger makes it false, and every caller
+   * answers a false the way it always has ("You can only message friends or people you share a
+   * server with"). That is deliberate: the blocked person must not be able to tell a block from
+   * simply not being reachable, so no caller may branch on WHY this said no.
+   * @param {number} meId @param {string} meUsername @param {number} peerId @param {string} peerUsername
+   * @returns {Promise<boolean>}
+   */
+  async function canDirectMessage(meId, meUsername, peerId, peerUsername) {
+    // Both questions are always asked, blocked or not, so a refusal does the same work (and takes
+    // the same time) whichever of them caused it.
+    const blocked = await blocks.between(meId, peerId);
+    const reachable = await sharesFriendshipOrServer(meId, meUsername, peerId, peerUsername);
+    return reachable && !blocked;
+  }
+
+  /**
+   * May `me` open the conversation with `peer` to read it? Whoever could before a block still can:
+   * the rule without blocking, so that the blocked person sees no change at all. On top of that,
+   * the person who placed a block keeps their side of the conversation even when the block was the
+   * last thing connecting them (it ends the friendship): their own block is no secret to them.
+   * @param {number} meId @param {string} meUsername @param {number} peerId @param {string} peerUsername
+   * @returns {Promise<boolean>}
+   */
+  async function mayReadDirectMessages(meId, meUsername, peerId, peerUsername) {
+    if (await sharesFriendshipOrServer(meId, meUsername, peerId, peerUsername)) return true;
+    return blocks.hasBlocked(meId, peerId);
   }
 
   async function hasPendingRequestBetween(userIdA, userIdB) {
@@ -1058,6 +1106,17 @@ async function main() {
       // in through an invite link. (The new name was just checked to be free, and deleting an account
       // clears its rows, so nothing can clash.)
       await db.run('UPDATE server_removed SET username = ? WHERE username = ?', newUsername, oldUsername);
+      // A ban and a timeout follow the person for the same reason: a new name must not be a way
+      // back into a server, or out of a timeout. So do the records of who placed them, and the
+      // audit log's actor and target (which are only ever usernames), so the log goes on naming
+      // the account it was about rather than a name someone else may hold later.
+      // Blocks are keyed by user id and need nothing.
+      await db.run('UPDATE server_bans SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_bans SET banned_by = ? WHERE banned_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_timeouts SET username = ? WHERE username = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_timeouts SET timed_out_by = ? WHERE timed_out_by = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_audit SET actor = ? WHERE actor = ?', newUsername, oldUsername);
+      await db.run('UPDATE server_audit SET target = ? WHERE target = ?', newUsername, oldUsername);
       await db.run('UPDATE push_subscriptions SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE apps SET created_by = ? WHERE created_by = ?', newUsername, oldUsername);
       await db.run('UPDATE apps SET reviewed_by = ? WHERE reviewed_by = ?', newUsername, oldUsername);
@@ -1132,7 +1191,13 @@ async function main() {
          LEFT JOIN users u ON u.username = sm.username WHERE sm.server_id = ?`,
         serverId
       );
-      roster = rows.map((r) => ({ username: r.username, name: r.username, role: r.role, online: onlineUsers.has(r.username), profile: displayProfileFromSettings(r.settings) }));
+      // Who is timed out right now, and until when: everyone's member list marks them. Only the
+      // moment it ends, not the reason, which is between staff and the person (and the audit log).
+      const timedOut = await moderation.timeoutsIn(serverId);
+      roster = rows.map((r) => ({
+        username: r.username, name: r.username, role: r.role, online: onlineUsers.has(r.username), profile: displayProfileFromSettings(r.settings),
+        ...(timedOut.has(r.username) ? { timeoutUntil: timedOut.get(r.username) } : {}),
+      }));
     }
     roster.sort((a, b) => roleRank(a.role) - roleRank(b.role) || (b.online - a.online) || String(a.name).localeCompare(String(b.name)));
     return roster;
@@ -1182,14 +1247,21 @@ async function main() {
       serverName: srv?.name, channelName: ch?.name,
       preview: String(text || '').slice(0, 120), mentions,
     };
-    if (serverId === DEMO_ID) { io.emit('unread:bump', payload); return; } // public commons: everyone's a member
+    // Nobody who has blocked the author is nudged: no badge, no mention count, no notification
+    // (the client raises all three from this event). Their unread totals leave the author's
+    // messages out as well (GET /unreads), so the two agree after a reload.
+    const blockers = await blocks.blockersOf(author);
+    if (serverId === DEMO_ID) { // public commons: everyone's a member
+      io.except([...blockers].map((name) => `user:${name}`)).emit('unread:bump', payload);
+      return;
+    }
     // For a private channel, only staff + explicitly-granted members should be nudged.
     const granted = privacy === 'private'
       ? new Set((await db.all('SELECT username FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId)).map((r) => r.username))
       : null;
     const members = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
     for (const m of members) {
-      if (m.username === author) continue;
+      if (m.username === author || blockers.has(m.username)) continue;
       if (privacy === 'private' && !isStaffRole(m.role) && !granted.has(m.username)) continue;
       io.to(`user:${m.username}`).emit('unread:bump', payload);
     }
@@ -1204,10 +1276,12 @@ async function main() {
     const candidates = mentionedUsernames(text).filter((name) => name !== sender).slice(0, MAX_MENTION_TARGETS * 2);
     const to = [];
     let senderRow = null;
+    // A mention from someone you have blocked does not reach your phone.
+    const blockers = candidates.length ? await blocks.blockersOf(sender) : new Set();
     for (const name of candidates) {
       if (to.length >= MAX_MENTION_TARGETS) break;
       const user = await getUserByUsername(name);
-      if (!user || to.includes(user.username)) continue;
+      if (!user || to.includes(user.username) || blockers.has(user.username)) continue;
       const role = await roleOf(serverId, user.username);
       if (!(await canAccessChannel(serverId, channelId, user.username, privacy, role))) continue;
       // The public commons counts every account as a member, so "can open the channel" is no filter
@@ -1239,15 +1313,24 @@ async function main() {
       const username = clients[sid]?.username;
       const role = await roleOf(serverId, username);
       const channels = await visibleChannelsFor(serverId, allChannels, username, role);
-      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, iconUrl: srv.icon_url || null, channels }, members: roster, myRole: role });
+      // myTimeout: this person's own timeout here, with its reason, or null. It is how a client
+      // that was not connected when the timeout was placed (or that has just switched to this
+      // server) learns of it. `now` is this server's clock, so that a client whose own clock is
+      // off still counts down the right length of time for it and for the roster's markers.
+      const myTimeout = await moderation.timeoutOf(serverId, username);
+      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, iconUrl: srv.icon_url || null, channels }, members: roster, myRole: role, myTimeout, now: Date.now() });
     }
   }
 
   // Servers / channels / membership (routes/servers.js).
-  registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess });
+  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks });
 
   // Shareable invite links (routes/invites.js).
-  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput });
+  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput, moderation });
+
+  // Bans, timeouts and the audit log (routes/moderation.js). A ban removes a member with the kick
+  // route's own clean-up, which is why that is handed over from registerServerRoutes.
+  registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, moderation, removeMemberFromServer, broadcastServerState, enforceVoiceAccess });
 
   // Web Push subscriptions (routes/push.js).
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
@@ -1259,14 +1342,16 @@ async function main() {
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins });
 
   // Presence / friends / direct messages (routes/social.js).
-  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push });
-  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push });
+  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks });
+  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks });
+  // Blocking another account (routes/blocks.js).
+  registerBlockRoutes({ app, db, io, authMiddleware, getUserByUsername, blocks, emitFriendsListUpdate, emitPendingUpdate, emitDmUnreadUpdate });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
   registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
 
   // Message search across channels, DMs and groups (routes/search.js).
-  registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChannel, visibleChannelsFor, getUserByUsername, canDirectMessage, parseAttachment });
+  registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChannel, visibleChannelsFor, getUserByUsername, mayReadDirectMessages, parseAttachment });
 
   app.post('/files/upload', authMiddleware, (req, res) => {
     upload.single('file')(req, res, (err) => {
@@ -1391,13 +1476,14 @@ async function main() {
         DEMO_ID, me, DEMO_ID
       );
       const result = {};
+      const blocked = await blocks.blockedBy(me); // marked, like every other history the caller is sent
       for (const s of rows) {
         const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
         const channels = await visibleChannelsFor(s.id, allChannels, me, s.role);
         const messagesByChannel = {};
         for (const ch of channels) {
           const page = await fetchPage(db, channelHistory(s.id, ch.id), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
-          messagesByChannel[ch.id] = page.rows.map((m) => mapMessageRow(m, me));
+          messagesByChannel[ch.id] = page.rows.map((m) => mapMessageRow(m, me, blocked));
         }
         result[s.id] = { id: s.id, name: s.name, channels, messages: messagesByChannel };
       }
@@ -1485,19 +1571,28 @@ async function main() {
   // Can this account be in that voice room? Membership of the server, and — outside the commons,
   // where a room is just a name — a channel that exists and that they may open. A private voice
   // channel used to be reachable by any member who knew its id: the join only asked about the server.
+  // And not while they are timed out in that server (services/moderation.js): a timeout takes
+  // every voice room of the server away for as long as it lasts, and gives them back by itself.
   async function mayBeInVoice(username, serverId, channelId) {
     if (typeof serverId !== 'string' || typeof channelId !== 'string') return false;
     const role = await roleOf(serverId, username);
     if (!role) return false;
     if (serverId === DEMO_ID) return true;
+    if (await moderation.timeoutOf(serverId, username)) return false;
     const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
     return !!ch && canAccessChannel(serverId, channelId, username, ch.privacy, role);
   }
+  // What a client is told when it is refused a voice room or taken out of one. `reason` is there
+  // only for a timeout, so the client can say that rather than "you no longer have access".
+  async function voiceRemovedPayload(username, serverId, channelId) {
+    const timeout = await moderation.timeoutOf(serverId, username);
+    return timeout ? { serverId, channelId, reason: 'timeout', until: timeout.until } : { serverId, channelId };
+  }
 
-  // Someone just lost access here (kicked, left, taken off a private channel's list, demoted).
-  // Their sockets are still sitting in the voice rooms they had joined, hearing the call: the
-  // membership check happens at the door, not afterwards. So after access is taken away, go
-  // through the rooms they are in and take them out of every one they may no longer be in.
+  // Someone just lost access here (kicked, left, taken off a private channel's list, demoted,
+  // timed out). Their sockets are still sitting in the voice rooms they had joined, hearing the
+  // call: the membership check happens at the door, not afterwards. So after access is taken away,
+  // go through the rooms they are in and take them out of every one they may no longer be in.
   async function enforceVoiceAccess(username, serverId) {
     const prefix = `voice:${serverId}:`;
     for (const [room, members] of [...io.sockets.adapter.rooms]) {
@@ -1506,11 +1601,33 @@ async function main() {
       if (mine.length === 0) continue;
       const channelId = room.slice(prefix.length);
       if (await mayBeInVoice(username, serverId, channelId)) continue;
+      const told = await voiceRemovedPayload(username, serverId, channelId);
       for (const id of mine) {
         const sock = io.sockets.sockets.get(id);
         if (!sock) continue;
         dropFromVoiceRoom(sock, room);
-        sock.emit('voice:removed', { serverId, channelId }); // the client hangs up its side
+        sock.emit('voice:removed', told); // the client hangs up its side
+      }
+    }
+  }
+
+  // The same for the TEXT rooms. A socket joins `server:<id>` and one `channel:<id>:<channel>` when
+  // its user opens them, and nothing took it out again when that user was kicked, banned, left, or
+  // lost a private channel: it went on receiving every new message until it happened to reconnect.
+  // For a ban in particular that is not "out". Asked of the database per room, like the voice
+  // version, so it removes exactly the rooms this person may no longer be in and no others.
+  async function enforceTextAccess(username, serverId) {
+    const role = await roleOf(serverId, username);
+    const serverRoom = `server:${serverId}`;
+    const prefix = `channel:${serverId}:`;
+    for (const sock of io.sockets.sockets.values()) {
+      if (sock.data?.username !== username) continue;
+      for (const room of [...sock.rooms]) {
+        if (room === serverRoom) { if (!role) sock.leave(room); continue; }
+        if (!room.startsWith(prefix)) continue;
+        const channelId = room.slice(prefix.length);
+        const ch = role ? await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId) : null;
+        if (!ch || !(await canAccessChannel(serverId, channelId, username, ch.privacy, role))) sock.leave(room);
       }
     }
   }
@@ -1548,6 +1665,14 @@ async function main() {
     // roleOf() already returns null for a missing username and 'member' for the public commons, so it
     // is exactly the right check.
     const mayUseVoice = async (serverId) => !!(await roleOf(serverId, socketUser));
+
+    // This person's timeout in that server, if one is in force (services/moderation.js). While it
+    // is, they can read and nothing else: every handler below that writes to a server, or acts in
+    // one of its voice rooms, asks this first. Asked of the database each time, so a timeout
+    // starts and ends for a socket that is already connected without anything being told to it.
+    const timedOutIn = (serverId) => moderation.timeoutOf(serverId, socketUser);
+    // Taking part in a voice room's activity: a member, and not timed out.
+    const mayActInVoice = async (serverId) => (await mayUseVoice(serverId)) && !(await timedOutIn(serverId));
 
     // voice:join handlers of this socket that have not yet decided (joined, or refused). The SFU
     // handlers wait for these before they ask which room the socket is in; see bindSocket.
@@ -1601,7 +1726,8 @@ async function main() {
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
         // Only the newest page: the rest is fetched as the reader scrolls back (GET .../messages?before=).
         const page = await fetchPage(db, channelHistory(serverId, firstText.id), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
-        socket.emit('messages:init', { serverId, channelId: firstText.id, messages: page.rows.map((m) => mapMessageRow(m, socketUser)), hasMore: page.hasMore });
+        const blocked = await blocks.blockedBy(socketUser); // their messages arrive marked, not missing
+        socket.emit('messages:init', { serverId, channelId: firstText.id, messages: page.rows.map((m) => mapMessageRow(m, socketUser, blocked)), hasMore: page.hasMore });
         await markChannelRead(socketUser, serverId, firstText.id); // history was just shown
       } else {
         socket.emit('messages:init', { serverId, channelId: null, messages: [], hasMore: false });
@@ -1621,7 +1747,8 @@ async function main() {
       socket.emit('channel:joined', { serverId, channelId });
       if (ch.type === 'text') {
         const page = await fetchPage(db, channelHistory(serverId, channelId), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
-        socket.emit('messages:init', { serverId, channelId, messages: page.rows.map((m) => mapMessageRow(m, socketUser)), hasMore: page.hasMore });
+        const blocked = await blocks.blockedBy(socketUser);
+        socket.emit('messages:init', { serverId, channelId, messages: page.rows.map((m) => mapMessageRow(m, socketUser, blocked)), hasMore: page.hasMore });
         socket.emit('pins:updated', { serverId, channelId, pins: await channelPins(serverId, channelId, socketUser) });
       }
       await markChannelRead(socketUser, serverId, channelId);
@@ -1655,9 +1782,13 @@ async function main() {
           if (!ch) return;
           const role = await roleOf(serverId, socketUser);
           if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, role))) return;
+          // Timed out here: they cannot send, so they are not "typing" either.
+          if (await timedOutIn(serverId)) return;
           // The channel room holds exactly the sockets with that channel open: the only people for
-          // whom "someone is typing here" means anything.
-          socket.to(`channel:${serverId}:${channelId}`).emit('typing', { scope: 'channel', serverId, channelId, from: socketUser });
+          // whom "someone is typing here" means anything. Less anyone who has blocked the typist.
+          const blockers = await blocks.blockersOf(socketUser);
+          socket.to(`channel:${serverId}:${channelId}`).except([...blockers].map((name) => `user:${name}`))
+            .emit('typing', { scope: 'channel', serverId, channelId, from: socketUser });
         } else if (payload.scope === 'dm') {
           const me = await getUserByUsername(socketUser);
           const peer = await getUserByUsername(String(payload.to || ''));
@@ -1680,6 +1811,10 @@ async function main() {
       if (!ch) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'unknown-channel' }); return; }
       const myRole = await roleOf(serverId, socketUser);
       if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'no-access' }); return; }
+      // Timed out in this server: refused here, whatever the client let through. The text goes
+      // back with the refusal like any other, so what they typed is not lost.
+      const timeout = await timedOutIn(serverId);
+      if (timeout) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'timed-out', until: timeout.until }); return; }
       const author = clients[socket.id]?.name || 'Anon';
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);
@@ -1689,7 +1824,20 @@ async function main() {
       await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null, cleanQuotes ? JSON.stringify(cleanQuotes) : null);
       const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE rowid = last_insert_rowid()');
       // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
-      io.to(`channel:${serverId}:${channelId}`).emit('message', { ...mapMessageRow(msgRow), serverId, channelId });
+      // Anyone in the channel who has blocked the author gets their own copy, marked `blocked`, so
+      // their client shows it collapsed and stays quiet about it; everyone else gets the plain one.
+      // Two sends rather than one because the mark is per reader, and must not reach the rest.
+      const live = { ...mapMessageRow(msgRow), serverId, channelId };
+      const channelRoom = `channel:${serverId}:${channelId}`;
+      const blockers = await blocks.blockersOf(author);
+      if (blockers.size === 0) {
+        io.to(channelRoom).emit('message', live);
+      } else {
+        for (const id of io.sockets.adapter.rooms.get(channelRoom) || []) {
+          const reader = io.sockets.sockets.get(id)?.data?.username;
+          io.to(id).emit('message', reader && blockers.has(reader) ? { ...live, blocked: true } : live);
+        }
+      }
       // Not awaited: the message is stored and on everyone's screen, and nothing about pushing it to
       // a closed app is allowed to hold up or fail the send.
       pushMentions({ serverId, channelId, privacy: ch.privacy, sender: socketUser, text: body, attachment: fileAttachment })
@@ -1725,6 +1873,8 @@ async function main() {
       const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", row.channel_id, row.server_id);
       const myRole = await roleOf(row.server_id, socketUser);
       if (!ch || !(await canAccessChannel(row.server_id, row.channel_id, socketUser, ch.privacy, myRole))) return reply({ ok: false, error: 'no-access' });
+      // An edit puts new words in the channel, which is what a timeout takes away.
+      if (await timedOutIn(row.server_id)) return reply({ ok: false, error: 'timed-out' });
       const editedAt = Date.now();
       await db.run('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?', body, editedAt, id);
       const room = `channel:${row.server_id}:${row.channel_id}`;
@@ -1743,6 +1893,7 @@ async function main() {
       if (!ch) return null;
       const myRole = await roleOf(row.server_id, socketUser);
       if (!(await canAccessChannel(row.server_id, row.channel_id, socketUser, ch.privacy, myRole))) return null;
+      if (await timedOutIn(row.server_id)) return null; // timed out: no pinning or unpinning
       return row;
     };
     socket.on('message:pin', async ({ id } = {}) => {
@@ -1783,11 +1934,21 @@ async function main() {
         const otherId = dm.sender_id === me.id ? dm.recipient_id : dm.sender_id;
         const other = await db.get('SELECT username FROM users WHERE id = ?', otherId);
         io.to(`user:${socketUser}`).emit('reaction:updated', { scope: 'dm', messageId, reactions: raw });
-        if (other) io.to(`user:${other.username}`).emit('reaction:updated', { scope: 'dm', messageId, reactions: raw });
+        // With a block between the two, nothing new arrives on the other side of the
+        // conversation, a reaction included. It is still stored and still shown to whoever
+        // reacted, exactly as before: to them nothing looks different.
+        if (other && !(await blocks.between(me.id, otherId))) io.to(`user:${other.username}`).emit('reaction:updated', { scope: 'dm', messageId, reactions: raw });
         return;
       }
       const row = await db.get('SELECT server_id, channel_id FROM messages WHERE id = ?', messageId);
       if (!row) return;
+      // Reacting is taking part, so it is held to what sending is: a channel this person may open
+      // (it used to ask nothing, so anyone who knew a message id could react to it), in a server
+      // they are not timed out in.
+      const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", row.channel_id, row.server_id);
+      const myRole = await roleOf(row.server_id, socketUser);
+      if (!ch || !(await canAccessChannel(row.server_id, row.channel_id, socketUser, ch.privacy, myRole))) return;
+      if (await timedOutIn(row.server_id)) return;
       const raw = await toggleReaction('messages', messageId, socketUser, emoji);
       if (raw == null) return;
       io.to(`channel:${row.server_id}:${row.channel_id}`).emit('reaction:updated', { scope: 'channel', messageId, reactions: raw });
@@ -1795,14 +1956,18 @@ async function main() {
 
     // Soundboard is voice-only: relay a play trigger to everyone else IN THE VOICE ROOM so all
     // call participants hear it too.
+    // Only from inside that room: it used to relay for any socket that named one, which would let
+    // someone who had been taken out of a call (kicked, timed out) go on playing sounds into it.
     socket.on('soundboard:play', ({ serverId = 'demo', channelId = 'voice1', soundId, url, name, emoji } = {}) => {
       if (typeof url !== 'string' || !url.startsWith('/sounds/')) return;
+      if (!socket.rooms.has(`voice:${serverId}:${channelId}`)) return;
       const by = clients[socket.id]?.name || 'Anon';
       socket.to(`voice:${serverId}:${channelId}`).emit('soundboard:play', { soundId, url, name, emoji, by });
     });
 
     // Stop the currently-playing soundboard clip for others in the voice room.
     socket.on('soundboard:stop', ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
+      if (!socket.rooms.has(`voice:${serverId}:${channelId}`)) return;
       socket.to(`voice:${serverId}:${channelId}`).emit('soundboard:stop');
     });
 
@@ -1866,6 +2031,8 @@ async function main() {
       const role = await roleOf(serverId, socketUser);
       if (!role) return false;
       if (serverId === DEMO_ID) return true;
+      // Timed out: no starting or joining an app here, for as long as it lasts.
+      if (await timedOutIn(serverId)) return false;
       const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
       return !!ch && canAccessChannel(serverId, channelId, socketUser, ch.privacy, role);
     };
@@ -1930,7 +2097,7 @@ async function main() {
         return;
       }
       if (!ACTIVITY_TYPES.includes(type)) return;
-      if (!(await mayUseVoice(serverId))) return;
+      if (!(await mayActInVoice(serverId))) return;
       if (outsideAppRoom(room)) return;
       activities[room] = { type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon' };
       broadcastActivity(room, activities[room]);
@@ -1978,7 +2145,7 @@ async function main() {
         }
         return reply({ ok: true, rev: act.state.rev });
       }
-      if (!(await mayUseVoice(serverId))) return;
+      if (!(await mayActInVoice(serverId))) return;
       const act = activities[room];
       if (!act || !event || typeof event !== 'object') return;
       // An app may have become the activity while the membership query ran; its events never go
@@ -1988,7 +2155,7 @@ async function main() {
       broadcastActivity(room, act);
     });
     socket.on('activity:stop', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
-      if (!(await mayUseVoice(serverId))) return;
+      if (!(await mayActInVoice(serverId))) return;
       const room = `voice:${serverId}:${channelId}`;
       if (outsideAppRoom(room)) return;
       delete activities[room];
@@ -2043,7 +2210,8 @@ async function main() {
       try {
         if (!(await mayUseVoice(serverId))) { socket.emit('server:denied', { serverId }); return; }
         // A member, but not of this channel (or it does not exist): refused at the door.
-        if (!(await mayBeInVoice(socketUser, serverId, channelId))) { socket.emit('voice:removed', { serverId, channelId }); return; }
+        // Or timed out in this server: refused the same way, with the reason so the client can say so.
+        if (!(await mayBeInVoice(socketUser, serverId, channelId))) { socket.emit('voice:removed', await voiceRemovedPayload(socketUser, serverId, channelId)); return; }
         // An older client that gives up on the SFU says so by joining the room it is already in
         // (that made the server send it the roster again, which it then called directly). Its
         // producers are still registered here, sending nothing; closing them is what lets everyone
@@ -2119,10 +2287,27 @@ async function main() {
     // Invite/accept/decline/cancel/end route by user room or peer socket id; call:signal relays
     // WebRTC offers/answers/ICE by socket id (like voice:signal, but on a separate channel so it
     // never collides with server-voice-channel signaling).
-    socket.on('call:invite', ({ to, video } = {}) => {
+    // Is there a block between this socket's user and that username, either way round? Unknown
+    // names and lookup failures count as "no": they are dealt with by what follows the check.
+    const blockBetweenMeAnd = async (username) => {
+      try {
+        const me = await getUserByUsername(socketUser);
+        const peer = await getUserByUsername(String(username));
+        return !!me && !!peer && await blocks.between(me.id, peer.id);
+      } catch (err) {
+        console.warn('block lookup failed:', err && err.message);
+        return false;
+      }
+    };
+    socket.on('call:invite', async ({ to, video } = {}) => {
       if (!socketUser || !to) return;
+      // A block between the two, in either direction, and the call never rings. The caller is told
+      // what they are told when the other person is not online, and nothing else: it must not be
+      // possible to tell a block from an absence. The lookup runs before the "are they online"
+      // check for every call, blocked or not, so the two answers also take the same time.
+      const blocked = await blockBetweenMeAnd(to);
       const room = io.sockets.adapter.rooms.get(`user:${to}`);
-      if (!room || room.size === 0) { socket.emit('call:unavailable', { to }); return; }
+      if (blocked || !room || room.size === 0) { socket.emit('call:unavailable', { to }); return; }
       io.to(`user:${to}`).emit('call:incoming', { from: socketUser, fromSocket: socket.id, video: !!video });
     });
     socket.on('call:accept', ({ to } = {}) => { // to = caller's socket id
@@ -2135,8 +2320,12 @@ async function main() {
       if (to) io.to(to).emit('call:declined', { from: socketUser });
       socket.to(`user:${socketUser}`).emit('call:handled');
     });
-    socket.on('call:cancel', ({ to } = {}) => { // to = callee username (caller hangs up before answer)
-      if (to) io.to(`user:${to}`).emit('call:canceled', { from: socketUser });
+    socket.on('call:cancel', async ({ to } = {}) => { // to = callee username (caller hangs up before answer)
+      if (!to) return;
+      // Addressed by username like an invite, so it is held to the same rule: a call that was
+      // never allowed to ring has nothing to cancel on the other side.
+      if (socketUser && await blockBetweenMeAnd(to)) return;
+      io.to(`user:${to}`).emit('call:canceled', { from: socketUser });
     });
     socket.on('call:end', ({ to } = {}) => { // to = peer socket id (during a connected call)
       if (to) io.to(to).emit('call:ended', { from: socketUser });

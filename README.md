@@ -16,6 +16,14 @@ Trusted Web Activity APK for Android.
   saved and shown to everyone.
 - **Friends, DMs and group chats**: friend requests, presence, direct messages and server-backed
   group chats (rename, add people, leave), with your own sections in the conversation list.
+- **Blocking**: block anyone from their profile, a member list or a DM. They can no longer message
+  you, call you, send you a friend request or add you to a group chat (nor you them, until you
+  unblock), and they are not told. In servers and group chats you share, their messages are
+  collapsed behind "Show", never notify you and stay out of your search results.
+- **Moderation** (owner and admins, per server): **time out** a member for a while (they can read
+  but not write, react or join voice), **kick** (out now; an admin can invite them back) or **ban**
+  (out until unbanned: no invite link or invite by name works), plus a ban list and an **audit
+  log** of who did what. An admin can only act on plain members; the owner on anyone else.
 - **Voice & video**: SFU calls that scale past a handful of people, a pre-join screen with camera
   preview and background blur/covers (processed on your device), mic/speaker pickers, deafen.
 - **Go Live + Discover**: share your screen at a chosen quality; everyone can find live streams in

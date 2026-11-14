@@ -39,6 +39,15 @@ import PrivateMessageModal from './components/PrivateMessageModal'
 import InviteLinkSection from './components/InviteLinkSection'
 import InviteJoinDialog, { InviteJoinNotice, useInviteJoin } from './components/InviteJoin'
 import SearchPanel from './components/SearchPanel'
+import FloatingMenu from './components/FloatingMenu'
+import BlockedMessage from './components/BlockedMessage'
+import MemberActionItems from './components/MemberActionItems'
+import ModerationDialog from './components/ModerationDialog'
+import ServerBansModal from './components/ServerBansModal'
+import AuditLogModal from './components/AuditLogModal'
+import BlockedPeopleSection from './components/BlockedPeopleSection'
+import { TimeoutNotice, BlockedNotice } from './components/ComposerNotice'
+import { useExpiry, formatMoment, formatDuration as formatMinutes } from './moderation'
 import { syncPush, stopPush, pushSupported, pushCovers, windowFocused, useNotificationTarget } from './push'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
@@ -1150,6 +1159,22 @@ export default function App() {
   const tileFileInputRef = useRef(null)
   const tileTargetRef = useRef(null) // survives the trip out to the OS file dialog and back
   const [memberMenu, setMemberMenu] = useState(null) // right-click manage menu: { x, y, username, name, role }
+  // ---- Blocking and server moderation. The server enforces all of it; this is what it told us. ----
+  // People the signed-in user has blocked: [{ username, userId, blockedAt }] from GET /blocks.
+  const [blockedPeople, setBlockedPeople] = useState([])
+  const blockedNames = useMemo(() => new Set(blockedPeople.map((p) => p.username)), [blockedPeople])
+  // Timeouts this user is under, by server id: { until, reason, by }, with `until` moved onto this
+  // device's clock when it arrived (the server sends its own "now" alongside).
+  const [myTimeouts, setMyTimeouts] = useState({})
+  const [moderationRequest, setModerationRequest] = useState(null) // { kind: 'timeout' | 'ban', username, serverId, serverName } | null
+  const [bansModal, setBansModal] = useState(null)   // { serverId, serverName } | null
+  const [auditModal, setAuditModal] = useState(null) // { serverId, serverName } | null
+  // "Now", refreshed whenever a timeout on screen runs out: one of mine, or one marked in the
+  // member list. A timeout ends by the clock, so nothing arrives from the server to say it is over.
+  const moderationNow = useExpiry([
+    ...Object.values(myTimeouts).map((t) => t.until),
+    ...(serverState?.members || []).map((m) => m.timeoutUntil || 0),
+  ])
   const [deferredPrompt, setDeferredPrompt] = useState(null)
   const [showInstallPanel, setShowInstallPanel] = useState(false)
   // Hide browser "Download App" / PWA install UI when already running inside the Electron desktop shell.
@@ -1434,7 +1459,7 @@ export default function App() {
     setMemberMenu({
       x: Math.min(e.clientX, window.innerWidth - 190),
       y: Math.min(e.clientY, window.innerHeight - 120),
-      username: member.username, name: member.name, role, canManage,
+      username: member.username, name: member.name, role, canManage, timedOut: Boolean(member.timeoutUntil),
     })
   }
   // Private message composer, opened from a member's right-click menu in a server or group chat.
@@ -1595,6 +1620,10 @@ export default function App() {
   // Socket handlers are bound once per connection, so they read the group list through a ref.
   const groupChatsRef = useRef([])
   useEffect(() => { groupChatsRef.current = groupChats }, [groupChats])
+  // The socket listeners are set up once per connection; they read the rail through this to name a
+  // server in a toast (a timeout, a ban).
+  const serversListRef = useRef([])
+  useEffect(() => { serversListRef.current = serversList }, [serversList])
 
   // Mirror call state for socket callbacks + tick the in-call timer once connected.
   useEffect(() => { callRef.current = call }, [call])
@@ -2094,6 +2123,21 @@ export default function App() {
       console.warn('loadFriendsData failed', err)
     }
     return loadedFriends
+  }
+
+  // Who this account has blocked. The list is the server's; it is refetched whenever the server
+  // says it changed (another window or device), and after every block or unblock here.
+  const loadBlocks = async (authToken) => {
+    const t = authToken || token || localStorage.getItem('lanparty_token')
+    if (!t) return
+    try {
+      const res = await fetch(`${SERVER_URL}/blocks`, { headers: { Authorization: `Bearer ${t}` } })
+      if (!res.ok) return
+      const data = await res.json()
+      setBlockedPeople(Array.isArray(data.blocks) ? data.blocks : [])
+    } catch (err) {
+      console.warn('loadBlocks failed', err)
+    }
   }
 
   const restoreSavedView = ({ username, friendsList = [], conversations = [], groups = [], authToken } = {}) => {
@@ -3334,6 +3378,7 @@ export default function App() {
         loadMessagesData(authToken),
         loadServers(),
         loadUnreads(),
+        loadBlocks(authToken),
       ]).then(() => {
         markBoot('sync', 'done')
         setBootDone(true)
@@ -3350,6 +3395,8 @@ export default function App() {
     s.on('friend:presence-updated', ({ username, status }) => {
       applyFriendPresence(username, status)
     })
+    // My block list changed, here or in another window. Only ever sent to the person who blocks.
+    s.on('blocks:updated', () => loadBlocks(authToken))
     s.on('dm:unread-updated', ({ totalUnread, byPeer }) => {
       applyUnreadState(totalUnread, byPeer || [])
       setDmConversations((prev) =>
@@ -3396,12 +3443,47 @@ export default function App() {
           else map.set(key, m)
         }
       }
-      const members = Array.from(map.values())
+      // Timeouts come with the server's own clock (`now`). Moving each end time onto this device's
+      // clock here means everything that shows or counts one down can compare it with Date.now().
+      const skew = typeof data.now === 'number' ? Date.now() - data.now : 0
+      const members = Array.from(map.values()).map((m) => (m.timeoutUntil ? { ...m, timeoutUntil: m.timeoutUntil + skew } : m))
       setServerState({ server: data.server, members, myRole: data.myRole || 'member' })
+      // My own timeout in this server, or none: the state is sent again whenever it changes.
+      const sid = data.server?.id
+      if (sid) {
+        setMyTimeouts((prev) => {
+          const next = { ...prev }
+          if (data.myTimeout) next[sid] = { until: data.myTimeout.until + skew, reason: data.myTimeout.reason || null, by: data.myTimeout.by || null }
+          else delete next[sid]
+          return next
+        })
+      }
+    })
+    // Timed out in a server (or the timeout was lifted early). Sent to every window of mine, in
+    // whatever server it is looking at, so the banner is there before I try to type.
+    s.on('server:timeout', ({ serverId, until, reason, by, now } = {}) => {
+      if (!serverId || typeof until !== 'number') return
+      const local = until + (typeof now === 'number' ? Date.now() - now : 0)
+      setMyTimeouts((prev) => ({ ...prev, [serverId]: { until: local, reason: reason || null, by: by || null } }))
+      const srvName = serversListRef.current.find((srv) => srv.id === serverId)?.name || 'a server'
+      setToast(`You were timed out in ${srvName} until ${formatMoment(local)}${reason ? ` — ${reason}` : ''}`)
+      // The server has already taken this socket out of that server's call; hang up our side.
+      if (inVoiceRef.current && voiceServerIdRef.current === serverId) leaveVoiceRef.current()
+    })
+    s.on('server:timeout-lifted', ({ serverId } = {}) => {
+      if (!serverId) return
+      setMyTimeouts((prev) => { const next = { ...prev }; delete next[serverId]; return next })
+      const srvName = serversListRef.current.find((srv) => srv.id === serverId)?.name || 'a server'
+      setToast(`Your time out in ${srvName} was lifted`)
     })
     // Membership events: added to / removed from / kicked out of a server.
     s.on('server:invited', ({ name: srvName } = {}) => { loadServers(); if (srvName) setToast(`You were added to ${srvName}`) })
-    s.on('server:removed', ({ serverId } = {}) => {
+    s.on('server:removed', ({ serverId, banned } = {}) => {
+      // A ban says so: unlike being removed, no invite will work until an admin lifts it.
+      if (banned) {
+        const srvName = serversListRef.current.find((srv) => srv.id === serverId)?.name
+        setToast(srvName ? `You were banned from ${srvName}` : 'You were banned from a server')
+      }
       loadServers()
       if (selectedServerIdRef.current === serverId) setSelectedServerId('home')
       // Out of the server means out of its call. The server has already taken this socket out of
@@ -3409,10 +3491,13 @@ export default function App() {
       if (inVoiceRef.current && voiceServerIdRef.current === serverId) leaveVoiceRef.current()
     })
     // Taken out of one voice channel (access to it was removed), or refused at its door.
-    s.on('voice:removed', ({ serverId } = {}) => {
+    s.on('voice:removed', ({ serverId, reason, until } = {}) => {
       if (inVoiceRef.current && voiceServerIdRef.current === serverId) {
         leaveVoiceRef.current()
-        setToast('You no longer have access to that voice channel')
+        // A timeout has its own words: the channel is still theirs, just not yet.
+        setToast(reason === 'timeout'
+          ? `You are timed out in this server${typeof until === 'number' ? ` until ${formatMoment(until)}` : ''}, so you can’t be in voice`
+          : 'You no longer have access to that voice channel')
       }
     })
     // Community app review (server/routes/library.js). Each carries { id, name, status } and
@@ -3504,7 +3589,17 @@ export default function App() {
     })
     // A channel send was rejected (stale server/channel pairing — e.g. mid-resync). Surface it,
     // put the text back so nothing is lost, and re-join the current view to resync rooms.
-    s.on('message:error', ({ text: failedText } = {}) => {
+    s.on('message:error', ({ text: failedText, reason, serverId, until } = {}) => {
+      // Refused because I am timed out there. Nothing is out of step, so there is nothing to resync:
+      // remember the timeout (the banner replaces the message box) and say why it did not send.
+      if (reason === 'timed-out') {
+        if (serverId && typeof until === 'number') {
+          setMyTimeouts((prev) => (prev[serverId] ? prev : { ...prev, [serverId]: { until, reason: null, by: null } }))
+        }
+        setToast(`You are timed out here${typeof until === 'number' ? ` until ${formatMoment(until)}` : ''} — that message was not sent`)
+        if (failedText) setText((cur) => cur || failedText) // kept for when the message box comes back
+        return
+      }
       setToast("Couldn't send — resynced with the server. Please try again.")
       if (failedText) setText((cur) => cur || failedText)
       const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
@@ -3528,7 +3623,8 @@ export default function App() {
           s.emit('channel:read', { serverId: msg.serverId, channelId: msg.channelId })
         }
       }
-      if (msg && msg.author && msg.author !== userName) playUiSound('receive')
+      // A message the server marked `blocked` (I blocked its author) is shown collapsed and makes no sound.
+      if (msg && msg.author && msg.author !== userName && !msg.blocked) playUiSound('receive')
       // Their message has arrived, so they are no longer "typing" it.
       if (msg && msg.author) clearTyping(`channel:${msg.serverId}:${msg.channelId}`, msg.author)
       // Looking at an older stretch of this channel: the message waits for "Jump to present".
@@ -3681,10 +3777,15 @@ export default function App() {
     s.on('group:message', ({ groupId, message } = {}) => {
       if (!groupId || !message) return
       appendHomeMessage(groupId, message)
-      updateGroupConversationPreview(groupId, message)
+      // Not the list's preview line when it is from someone I blocked (the server's own summary of
+      // the group leaves it out too).
+      if (!message.blocked) updateGroupConversationPreview(groupId, message)
       if (message.author) clearTyping(`group:${groupId}`, message.author)
       const me = localStorage.getItem('lanparty_user') || userName
       if (message.author === me) return
+      // From someone I blocked: it is in the conversation (collapsed), and that is all. No sound, no
+      // badge, no notification. The server leaves it out of the group's unread count as well.
+      if (message.blocked) return
       const reading = isOpenGroup(groupId) && !document.hidden
       playUiSound(reading ? 'receive' : 'notify')
       // Open on an older stretch: held back and not shown, so it is unread until they come back.
@@ -4213,10 +4314,102 @@ export default function App() {
     if (!res.ok) { alert((await res.json()).error || 'Could not leave'); return }
     if (selectedServerId === serverId) setSelectedServerId('home')
   }
+  // Kick: out now, and an admin can simply invite them back. Asked in-app (window.confirm does
+  // nothing in the desktop app), and worded so the difference from a ban is in front of whoever clicks.
   const kickMember = async (username) => {
-    if (!window.confirm(`Remove ${username} from this server?`)) return
-    const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/members/${encodeURIComponent(username)}`, { method: 'DELETE' })
-    if (!res.ok) alert((await res.json()).error || 'Could not remove member')
+    const sid = currentServerId() // read before the question: the answer is about this server
+    const ok = await askConfirm({
+      title: `Remove ${username} from this server?`,
+      message: 'They are taken out now and no invite link will let them back in, but you or another admin can invite them again by name whenever you like. To keep someone out until you decide otherwise, ban them instead.',
+      submitLabel: 'Remove',
+    })
+    if (!ok) return
+    try {
+      const res = await authedFetch(`/servers/${encodeURIComponent(sid)}/members/${encodeURIComponent(username)}`, { method: 'DELETE' })
+      if (res.ok) setToast(`Removed ${username} from the server`)
+      else setToast((await res.json().catch(() => ({}))).error || 'Could not remove member')
+    } catch (_) {
+      setToast('Could not reach the server')
+    }
+  }
+
+  // ---- Moderation: time out and ban (owner/admins). The dialog collects the choice; the server
+  // decides whether this person may make it. ----
+  const openModeration = (kind, username) => {
+    const sid = currentServerId()
+    if (!username || !sid || sid === 'demo') return
+    setModerationRequest({ kind, username, serverId: sid, serverName: serversList.find((s) => s.id === sid)?.name || serverState?.server?.name || 'this server' })
+  }
+  // Called by the dialog. Resolves to an error to show there, or null once it is done.
+  const submitModeration = async ({ minutes, reason }) => {
+    const req = moderationRequest
+    if (!req) return null
+    const base = `/servers/${encodeURIComponent(req.serverId)}`
+    try {
+      const res = req.kind === 'ban'
+        ? await authedFetch(`${base}/bans/${encodeURIComponent(req.username)}`, { method: 'POST', body: JSON.stringify(reason ? { reason } : {}) })
+        : await authedFetch(`${base}/timeouts/${encodeURIComponent(req.username)}`, { method: 'POST', body: JSON.stringify({ minutes, ...(reason ? { reason } : {}) }) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) return data.error || (req.kind === 'ban' ? 'Could not ban them' : 'Could not time them out')
+      setToast(req.kind === 'ban' ? `${req.username} is banned from ${req.serverName}` : `${req.username} is timed out for ${formatMinutes(minutes)}`)
+      return null
+    } catch (_) {
+      return 'Could not reach the server'
+    }
+  }
+  const liftMemberTimeout = async (username) => {
+    try {
+      const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/timeouts/${encodeURIComponent(username)}`, { method: 'DELETE' })
+      // 404 is "not timed out": it ran out, or someone else lifted it, which is what was wanted.
+      if (res.ok || res.status === 404) setToast(`${username} is no longer timed out`)
+      else setToast((await res.json().catch(() => ({}))).error || 'Could not remove the time out')
+    } catch (_) {
+      setToast('Could not reach the server')
+    }
+  }
+
+  // ---- Blocking another account. Everything it does is done by the server; here it is asked for,
+  // and the list is refetched so the screen reflects it. ----
+  const blockUser = async (username) => {
+    if (!username || username === name) return
+    const ok = await askConfirm({
+      title: `Block ${username}?`,
+      message: `${username} won’t be able to message you, call you, send you a friend request or add you to a group chat, and you won’t be able to do those to them until you unblock them. If you are friends, that ends. In servers and group chats you share, their messages are collapsed and never notify you. They are not told you blocked them. You can undo this in Settings → Messages → Blocked people.`,
+      submitLabel: 'Block',
+    })
+    if (!ok) return
+    try {
+      const res = await authedFetch(`/blocks/${encodeURIComponent(username)}`, { method: 'POST' })
+      if (!res.ok) { setToast((await res.json().catch(() => ({}))).error || `Could not block ${username}`); return }
+      setToast(`Blocked ${username}`)
+      await loadBlocks()
+    } catch (_) {
+      setToast('Could not reach the server')
+    }
+  }
+  const unblockUser = async (username) => {
+    if (!username) return
+    try {
+      const res = await authedFetch(`/blocks/${encodeURIComponent(username)}`, { method: 'DELETE' })
+      if (!res.ok) { setToast((await res.json().catch(() => ({}))).error || `Could not unblock ${username}`); return }
+      setToast(`Unblocked ${username}`)
+      // What is already on screen was marked by the server when it was fetched; with the block gone
+      // those marks are stale, so they come off rather than waiting for the next reload.
+      const unmark = (m) => (m.blocked && m.author === username ? { ...m, blocked: false } : m)
+      setMessages((prev) => prev.map(unmark))
+      setHomeMessages((prev) => Object.fromEntries(Object.entries(prev).map(([key, list]) => [key, list.map(unmark)])))
+      await loadBlocks()
+    } catch (_) {
+      setToast('Could not reach the server')
+    }
+  }
+  // Settings → Blocked people → Messages: the conversation with someone blocked stays readable.
+  const openBlockedConversation = (person) => {
+    if (!person?.userId) return
+    setShowSettingsPanel(false)
+    setSelectedServerId('home')
+    setLeftNav('messages')
+    openPeerChat('dm', { id: person.userId, name: person.username, peerUsername: person.username })
   }
   const setMemberRole = async (username, role) => {
     const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/members/${encodeURIComponent(username)}`, { method: 'PATCH', body: JSON.stringify({ role }) })
@@ -6148,8 +6341,15 @@ export default function App() {
       role: member.role || (member.username === serverState?.server?.owner ? 'owner' : 'member'),
       online: member.online !== false,
       isYou: member.id === socket?.id || member.username === name || memberName === name,
+      // Timed out in this server right now (the list marks them, and staff get "Remove time out").
+      timeoutUntil: member.timeoutUntil && member.timeoutUntil > moderationNow ? member.timeoutUntil : null,
     }
   })
+  // Is this a message to collapse? The server marks the ones written by someone I had blocked when
+  // it sent them (`blocked`); the block list covers what was already on screen when I blocked them.
+  const isBlockedMessage = (m) => Boolean(m && m.author && m.author !== name && (m.blocked || blockedNames.has(m.author)))
+  // My own timeout in the server on screen, while it lasts: what puts the banner where the message box is.
+  const activeTimeout = !isHomeView && myTimeouts[selectedServerId]?.until > moderationNow ? myTimeouts[selectedServerId] : null
   const membersPanelUsers = isHomeView ? groupParticipants : serverMembers
 
   // Clears the composer's media slot — an attached file or a staged GIF. Called on chat/channel
@@ -6198,7 +6398,10 @@ export default function App() {
     }
     friends.forEach(add)
     dmConversations.forEach(add)
-    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name))
+    // Nobody I have blocked is offered: the server would refuse a chat or a group with them anyway.
+    return Array.from(map.values())
+      .filter((user) => !blockedNames.has(user.peerUsername))
+      .sort((a, b) => a.name.localeCompare(b.name))
   })()
 
   const pickedNewChatUsers = () => newChatSelectedIds
@@ -6651,7 +6854,7 @@ export default function App() {
       .filter((c) => c.type === 'text')
       .map((c) => ({ kind: 'channel', serverId: currentServerId(), channelId: c.id, label: `# ${c.name}` }))
     const dms = (dmConversations || [])
-      .filter((c) => c.peerUsername || c.name)
+      .filter((c) => (c.peerUsername || c.name) && !blockedNames.has(c.peerUsername || c.name)) // a blocked person cannot be sent anything
       .map((c) => ({ kind: 'dm', peerUsername: c.peerUsername || c.name, label: `@ ${c.peerUsername || c.name}` }))
     return { chans, dms }
   }
@@ -7424,6 +7627,15 @@ export default function App() {
   const searchGroupLabel = (groupId) => groupChats.find((g) => String(g.id) === String(groupId))?.name || ''
 
   const renderComposer = (placeholder, onSend) => {
+    // Two cases where the server would refuse whatever was typed, so the message box gives way to
+    // a notice saying so: a direct conversation with someone I blocked, and a server I am timed
+    // out in. Both come from the server (the block list; the timeout it reported).
+    if (showHomeChat && homeChat && homeChat.type !== 'group' && blockedNames.has(homeChat.peerUsername || homeChat.name)) {
+      return <BlockedNotice username={homeChat.peerUsername || homeChat.name} onUnblock={unblockUser} />
+    }
+    if (!showHomeChat && activeTimeout) {
+      return <TimeoutNotice timeout={activeTimeout} serverName={serverName} />
+    }
     const canSend = Boolean(text.trim() || pendingFile || composerStack.length) && !uploadingFile
     // A stack has its own delivery path: everything in it is already hosted, so there is nothing to
     // upload and the whole thing goes as one body. Routing Enter and Send through here keeps them in
@@ -7822,6 +8034,14 @@ export default function App() {
         onLeaveServer={leaveServer}
         onKickMember={kickMember}
         onSetMemberRole={setMemberRole}
+        onTimeoutMember={(username) => openModeration('timeout', username)}
+        onLiftMemberTimeout={liftMemberTimeout}
+        onBanMember={(username) => openModeration('ban', username)}
+        onBlockUser={blockUser}
+        onUnblockUser={unblockUser}
+        blockedNames={blockedNames}
+        onOpenBans={(serverId, serverName2) => setBansModal({ serverId, serverName: serverName2 || 'this server' })}
+        onOpenAuditLog={(serverId, serverName2) => setAuditModal({ serverId, serverName: serverName2 || 'this server' })}
         channelUnreads={channelUnreads[selectedServerId] || {}}
         serverUnreadTotals={serverUnreadTotals}
         channelMentions={channelMentions[selectedServerId] || {}}
@@ -7875,10 +8095,17 @@ export default function App() {
                         }
                       }}>Download App</button>
                     )}
-                    {showHomeChat && homeChat?.peerUsername && !call && (
+                    {showHomeChat && homeChat?.peerUsername && !call && !blockedNames.has(homeChat.peerUsername) && (
                       <button className="call-btn" title={`Call ${homeChat.peerUsername}`} onClick={() => startCall(homeChat.peerUsername, false)}>
                         <span aria-hidden>📞</span> Call
                       </button>
+                    )}
+                    {/* A direct conversation: block or unblock the person it is with. */}
+                    {showHomeChat && homeChat?.type !== 'group' && homeChat?.peerUsername && homeChat.peerUsername !== name && (
+                      blockedNames.has(homeChat.peerUsername)
+                        ? <button type="button" className="members-btn topbar-block-btn" onClick={() => unblockUser(homeChat.peerUsername)}>Unblock</button>
+                        // The word gives way to the icon on a phone, where this bar has no room to spare.
+                        : <button type="button" className="members-btn topbar-block-btn" title={`Block ${homeChat.peerUsername}`} aria-label={`Block ${homeChat.peerUsername}`} onClick={() => blockUser(homeChat.peerUsername)}><span aria-hidden="true">🙅</span><span className="topbar-block-label"> Block</span></button>
                     )}
                     {/* Group DMs only — see showMembersButton. Servers use the side panel's tab. */}
                     {showMembersButton && (
@@ -7900,26 +8127,35 @@ export default function App() {
                   </div>
                 ) : (<>
                   {renderHistoryStart()}
-                  {homeChatMessages.map((m, i) => (
-                    <ChatMessage
-                      key={m.id ?? `${m.ts}-${i}`}
-                      message={m}
-                      currentUser={name}
-                      onReact={reactToHomeMessage}
-                      onEdit={editHomeMessage}
-                      onDelete={deleteHomeMessage}
-                      onCollab={startCollab}
-                      activeReactionMessageId={activeReactionMessageId}
-                      setActiveReactionMessageId={setActiveReactionMessageId}
-                      quickReactions={quickReactions}
-                      skinTones={emojiSkinTones}
-                      onReply={quoteMessage}
-                      onOpenMedia={(attachment) => openLightbox(homeChatMessages, attachment)}
-                      emojiMap={emojiMap}
-                      onSaveEmoji={saveCustomEmojiFromChat}
-                      onForward={openForward}
-                    />
-                  ))}
+                  {homeChatMessages.map((m, i) => {
+                    const key = m.id ?? `${m.ts}-${i}`
+                    const message = (
+                      <ChatMessage
+                        key={key}
+                        message={m}
+                        currentUser={name}
+                        onReact={reactToHomeMessage}
+                        onEdit={editHomeMessage}
+                        onDelete={deleteHomeMessage}
+                        onCollab={startCollab}
+                        activeReactionMessageId={activeReactionMessageId}
+                        setActiveReactionMessageId={setActiveReactionMessageId}
+                        quickReactions={quickReactions}
+                        skinTones={emojiSkinTones}
+                        onReply={quoteMessage}
+                        onOpenMedia={(attachment) => openLightbox(homeChatMessages, attachment)}
+                        emojiMap={emojiMap}
+                        onSaveEmoji={saveCustomEmojiFromChat}
+                        onForward={openForward}
+                      />
+                    )
+                    // In a group, a message from someone I blocked is collapsed behind "Show". Not in
+                    // a direct conversation with them: there every message would be, and the notice
+                    // where the message box was already says who this is.
+                    return homeChat.type === 'group' && isBlockedMessage(m)
+                      ? <BlockedMessage key={key} author={m.author} messageId={m.id}>{message}</BlockedMessage>
+                      : message
+                  })}
                   {renderHistoryEnd()}
                 </>)}
               </div>
@@ -7967,29 +8203,36 @@ export default function App() {
                   </div>
                 ) : (<>
                   {renderHistoryStart()}
-                  {messages.map((m, i) => (
-                    <ChatMessage
-                      key={m.id ?? `${m.ts}-${i}`}
-                      message={m}
-                      currentUser={name}
-                      onReact={reactToChannelMessage}
-                      onEdit={editChannelMessage}
-                      onDelete={deleteChannelMessage}
-                      onCollab={startCollab}
-                      activeReactionMessageId={activeReactionMessageId}
-                      setActiveReactionMessageId={setActiveReactionMessageId}
-                      quickReactions={quickReactions}
-                      skinTones={emojiSkinTones}
-                      onReply={quoteMessage}
-                      onOpenMedia={(attachment) => openLightbox(messages, attachment)}
-                      emojiMap={emojiMap}
-                      onSaveEmoji={saveCustomEmojiFromChat}
-                      onForward={openForward}
-                      onPin={pinMessage}
-                      onUnpin={unpinMessage}
-                      isPinned={pinnedIdSet.has(m.id)}
-                    />
-                  ))}
+                  {messages.map((m, i) => {
+                    const key = m.id ?? `${m.ts}-${i}`
+                    const message = (
+                      <ChatMessage
+                        key={key}
+                        message={m}
+                        currentUser={name}
+                        onReact={reactToChannelMessage}
+                        onEdit={editChannelMessage}
+                        onDelete={deleteChannelMessage}
+                        onCollab={startCollab}
+                        activeReactionMessageId={activeReactionMessageId}
+                        setActiveReactionMessageId={setActiveReactionMessageId}
+                        quickReactions={quickReactions}
+                        skinTones={emojiSkinTones}
+                        onReply={quoteMessage}
+                        onOpenMedia={(attachment) => openLightbox(messages, attachment)}
+                        emojiMap={emojiMap}
+                        onSaveEmoji={saveCustomEmojiFromChat}
+                        onForward={openForward}
+                        onPin={pinMessage}
+                        onUnpin={unpinMessage}
+                        isPinned={pinnedIdSet.has(m.id)}
+                      />
+                    )
+                    // From someone I blocked: collapsed behind "Show", one message at a time.
+                    return isBlockedMessage(m)
+                      ? <BlockedMessage key={key} author={m.author} messageId={m.id}>{message}</BlockedMessage>
+                      : message
+                  })}
                   {renderHistoryEnd()}
                 </>)}
               </div>
@@ -8003,7 +8246,10 @@ export default function App() {
             <div className={`voice-panel${inVoice ? ' in-call' : ''}`}>
               {!inVoice ? (
                 <div className="voice-join-wrap">
-                  <button onClick={() => openPreJoin(activeChannel)} className="voice-btn">Join Voice</button>
+                  {/* Timed out here: the server would refuse the join, so say why instead of offering it. */}
+                  {activeTimeout
+                    ? <TimeoutNotice timeout={activeTimeout} serverName={serverName} />
+                    : <button onClick={() => openPreJoin(activeChannel)} className="voice-btn">Join Voice</button>}
                 </div>
               ) : (() => {
                 // Everyone in the room (from the server roster), whether or not their stream has
@@ -8343,10 +8589,34 @@ export default function App() {
                     )}
                   </div>
                 )}
+                {/* Block or unblock, for anyone but yourself. The card closes first, so the question
+                    that follows is not asked from underneath it. */}
+                {profileCard.username && profileCard.username !== name && (
+                  <div className="profilecard-actions">
+                    {blockedNames.has(profileCard.username) ? (
+                      <>
+                        <span className="profilecard-blocked">You blocked {profileCard.username}</span>
+                        <button type="button" className="feedback-btn ghost" onClick={() => unblockUser(profileCard.username)}>Unblock</button>
+                      </>
+                    ) : (
+                      <button type="button" className="feedback-btn ghost profilecard-block" onClick={() => { const who = profileCard.username; setProfileCard(null); blockUser(who) }}>Block</button>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </div>
         </div>
+      )}
+      {/* Moderation dialogs (owner/admins): time out or ban a member, the ban list, the audit log. */}
+      {moderationRequest && (
+        <ModerationDialog request={moderationRequest} onSubmit={submitModeration} onClose={() => setModerationRequest(null)} />
+      )}
+      {bansModal && (
+        <ServerBansModal serverId={bansModal.serverId} serverName={bansModal.serverName} authedFetch={authedFetch} onClose={() => setBansModal(null)} />
+      )}
+      {auditModal && (
+        <AuditLogModal serverId={auditModal.serverId} serverName={auditModal.serverName} authedFetch={authedFetch} onClose={() => setAuditModal(null)} />
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
       {/* Only shown when the update could not simply be applied: mid-call, mid-sentence, and so on. */}
@@ -8706,6 +8976,7 @@ export default function App() {
         userExists={addFriendUserExists}
         userChecking={addFriendUserChecking}
         isSelf={addFriendIsSelf}
+        blocked={blockedNames.has(addFriendUsername.trim())}
       />
 
       <div className={`auth-overlay ${showNewChatModal ? 'open' : ''}`} onClick={closeNewChatModal} />
@@ -8766,6 +9037,7 @@ export default function App() {
                     >
                       {(!isHomeView || activeGroupChat) && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
                       <span className="members-panel-name">{member.name}{member.isYou ? ' (you)' : ''}</span>
+                      {member.timeoutUntil && <span className="dc-member-timeout" title={`Timed out until ${formatMoment(member.timeoutUntil)}`} aria-label={`Timed out until ${formatMoment(member.timeoutUntil)}`}>⏳</span>}
                       {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
                       {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
                     </button>
@@ -8786,9 +9058,13 @@ export default function App() {
       {memberMenu && createPortal(
         <>
           <div className="dc-ctx-backdrop" onClick={() => setMemberMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMemberMenu(null) }} />
-          <div className="dc-ctx-menu" style={{ left: memberMenu.x, top: memberMenu.y }} role="menu">
+          {/* FloatingMenu keeps it inside the window: with the moderation entries it is tall enough
+              to run off the bottom when opened low down. */}
+          <FloatingMenu x={memberMenu.x} y={memberMenu.y} className="dc-ctx-menu">
             <div className="dc-ctx-title">{memberMenu.name}{memberMenu.role !== 'member' ? ` · ${memberMenu.role}` : ''}</div>
-            <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); openPrivateMessage({ username: memberMenu.username, name: memberMenu.name }) }}>✉️ Private message</button>
+            {!blockedNames.has(memberMenu.username) && (
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); openPrivateMessage({ username: memberMenu.username, name: memberMenu.name }) }}>✉️ Private message</button>
+            )}
             {/* Manage entries are staff-only; the menu itself now opens for every member. */}
             {memberMenu.canManage && serverState?.myRole === 'owner' && memberMenu.role === 'member' && (
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'admin') }}>🛡️ Make admin</button>
@@ -8802,7 +9078,20 @@ export default function App() {
             {activeGroupChat && activeGroupChat.ownerUsername === name && memberMenu.username !== name && (
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { const groupId = activeGroupChat.id; setMemberMenu(null); removeFromGroup(groupId, memberMenu.username) }}>🚫 Remove from group</button>
             )}
-          </div>
+            {/* Time out / Ban for staff in a server (never in a group chat), and Block for anyone. */}
+            <MemberActionItems
+              username={memberMenu.username}
+              canModerate={Boolean(memberMenu.canManage)}
+              timedOut={Boolean(memberMenu.timedOut)}
+              blocked={blockedNames.has(memberMenu.username)}
+              onDone={() => setMemberMenu(null)}
+              onTimeout={(username) => openModeration('timeout', username)}
+              onLiftTimeout={liftMemberTimeout}
+              onBan={(username) => openModeration('ban', username)}
+              onBlock={blockUser}
+              onUnblock={unblockUser}
+            />
+          </FloatingMenu>
         </>,
         document.body
       )}
@@ -9837,6 +10126,9 @@ export default function App() {
               />
             )}
           </section>
+          )}
+          {settingsTab === 'messages' && (
+            <BlockedPeopleSection blocked={blockedPeople} onUnblock={unblockUser} onOpenMessages={openBlockedConversation} />
           )}
           {settingsTab === 'feedback' && (
           <section className="profile-settings-section">

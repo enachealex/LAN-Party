@@ -140,6 +140,22 @@ async function makeUser(call, username) {
   return res.data.token;
 }
 
+// The same, for a suite that needs more accounts on one server than one address may register:
+// /auth/register allows ten an hour per caller, and the limiter reads the caller from the forwarded
+// header, so each account here signs up from an address of its own (203.0.113.0/24 is reserved for
+// documentation, so these can never be anyone's real one).
+let nextCaller = 0;
+async function makeUserFromOwnAddress(base, username) {
+  nextCaller = (nextCaller % 250) + 1;
+  const headers = { 'Content-Type': 'application/json', 'X-Forwarded-For': `203.0.113.${nextCaller}` };
+  const post = (route, body) => fetch(base + route, { method: 'POST', headers, body: JSON.stringify(body) });
+  await post('/auth/register', { username, email: `${username}@example.com`, password: PASSWORD, passwordConfirm: PASSWORD });
+  const res = await post('/auth/login', { username, password: PASSWORD });
+  const data = await res.json().catch(() => null);
+  if (!data || !data.token) throw new Error(`login failed for ${username}: ${res.status} ${JSON.stringify(data)}`);
+  return data.token;
+}
+
 // Read straight from a test server's SQLite file, so tests can assert what was actually persisted
 // (coerced types, truncated fields) rather than only what the API echoed back.
 async function dbAll(dataDir, sql, params = []) {
@@ -154,4 +170,4 @@ async function dbAll(dataDir, sql, params = []) {
   }
 }
 
-module.exports = { startServer, sfuEnv, apiFor, makeUser, dbAll, PASSWORD };
+module.exports = { startServer, sfuEnv, apiFor, makeUser, makeUserFromOwnAddress, dbAll, PASSWORD };

@@ -9,6 +9,10 @@
 //   same gate as /messages/send, so a group can't be used to reach strangers.
 // - Non-members get a 404, never a 403, so a group's existence isn't revealed by guessing ids.
 // - Every change is pushed to each member's `user:<name>` room. Clients never have to poll.
+// - Blocking (services/blocks.js): nobody can add someone they have blocked, or who has blocked
+//   them (canDirectMessage refuses both, with its usual answer). A group two such people are
+//   already in carries on for everyone; the one who blocked gets the other's messages marked
+//   `blocked`, and is not pushed, badged or shown "typing" for them.
 const crypto = require('crypto');
 const { parsePageQuery, fetchPage } = require('../services/history');
 
@@ -16,8 +20,12 @@ const GROUP_MAX_MEMBERS = 25;
 const GROUP_NAME_MAX = 60;
 
 /** @param {Record<string, any>} deps */
-function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push }) {
+function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks }) {
   const newGroupId = () => `grp-${crypto.randomBytes(8).toString('hex')}`;
+
+  // "Not sent by someone this reader has blocked", for a query over `group_messages gm`. One
+  // parameter: the reader's user id.
+  const NOT_BLOCKED_SENDER = 'gm.sender_id NOT IN (SELECT blocked_id FROM user_blocks WHERE blocker_id = ?)';
 
   /** @returns {Promise<{ group_id: string, user_id: number, joined_at: number, last_read_at: number } | undefined>} */
   const membership = (groupId, userId) =>
@@ -34,10 +42,12 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
 
   const memberUsernames = async (groupId) => (await membersOf(groupId)).map((m) => m.username);
 
+  // Messages from someone the reader has blocked do not count as unread: a blocked person must not
+  // be able to raise a badge.
   async function unreadCount(groupId, userId, lastReadAt) {
     const row = await db.get(
-      'SELECT COUNT(*) AS n FROM group_messages WHERE group_id = ? AND created_at > ? AND sender_id != ?',
-      groupId, lastReadAt || 0, userId
+      `SELECT COUNT(*) AS n FROM group_messages gm WHERE gm.group_id = ? AND gm.created_at > ? AND gm.sender_id != ? AND ${NOT_BLOCKED_SENDER}`,
+      groupId, lastReadAt || 0, userId, userId
     );
     return row ? row.n : 0;
   }
@@ -48,12 +58,14 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     if (!group) return null;
     const members = await membersOf(groupId);
     const mem = await membership(groupId, userId);
+    // The preview in the conversation list is the newest message this reader has not blocked the
+    // sender of: the list is on screen all the time, and is not where a blocked person's words go.
     const last = await db.get(
       `SELECT gm.body, gm.attachment_json AS attachmentJson, gm.created_at AS createdAt, u.username AS author
          FROM group_messages gm JOIN users u ON u.id = gm.sender_id
-        WHERE gm.group_id = ?
+        WHERE gm.group_id = ? AND ${NOT_BLOCKED_SENDER}
         ORDER BY gm.created_at DESC, gm.id DESC LIMIT 1`,
-      groupId
+      groupId, userId
     );
     const owner = members.find((m) => m.id === group.owner_id);
     return {
@@ -94,8 +106,9 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
   async function emitTyping(groupId, from) {
     const members = await memberUsernames(groupId);
     if (!members.includes(from)) return;
+    const blockers = await blocks.blockersOf(from); // they are not shown this person typing
     for (const username of members) {
-      if (username !== from) io.to(`user:${username}`).emit('typing', { scope: 'group', groupId, from });
+      if (username !== from && !blockers.has(username)) io.to(`user:${username}`).emit('typing', { scope: 'group', groupId, from });
     }
   }
 
@@ -122,7 +135,8 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
   async function pushToGroup(groupId, from, text, attachment) {
     if (!push.available()) return;
     const group = await db.get('SELECT name FROM group_chats WHERE id = ?', groupId);
-    const to = (await memberUsernames(groupId)).filter((username) => username !== from);
+    const blockers = await blocks.blockersOf(from); // no phone buzzes for someone its owner blocked
+    const to = (await memberUsernames(groupId)).filter((username) => username !== from && !blockers.has(username));
     await push.notifyGroupMessage({ groupId, groupName: group ? group.name : '', from, to, text, attachment });
   }
 
@@ -260,7 +274,8 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     const { rows, hasMore, hasMoreAfter } = await fetchPage(db, {
       columns: MESSAGE_COLUMNS, from: MESSAGE_FROM, where: 'gm.group_id = ?', params: [ctx.groupId], idCol: 'gm.id',
     }, page);
-    return res.json({ messages: rows.map((r) => mapMessageRow(r, ctx.me.username)), hasMore, hasMoreAfter });
+    const blocked = await blocks.blockedBy(ctx.me.username); // marked for the client to collapse, not removed
+    return res.json({ messages: rows.map((r) => mapMessageRow(r, ctx.me.username, blocked)), hasMore, hasMoreAfter });
   });
 
   app.post('/groups/:id/read', authMiddleware, async (req, res) => {
@@ -286,7 +301,12 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     const row = await db.get(`${MESSAGE_SELECT} WHERE gm.id = ?`, result.lastID);
     const message = mapMessageRow(row);
     // Everyone, the sender included: their other windows need it, and the sending tab de-dupes by id.
-    await emitToMembers(ctx.groupId, 'group:message', { groupId: ctx.groupId, message });
+    // A member who has blocked the sender gets their own copy, marked `blocked`: their client shows
+    // it collapsed and raises nothing for it. The mark is theirs alone, so it is added per person.
+    const blockers = await blocks.blockersOf(ctx.me.username);
+    for (const username of await memberUsernames(ctx.groupId)) {
+      io.to(`user:${username}`).emit('group:message', { groupId: ctx.groupId, message: blockers.has(username) ? { ...message, blocked: true } : message });
+    }
     // Everyone else in the group, for those whose app is closed. Not awaited: the message is stored
     // and emitted, and pushing must never delay or fail the send.
     pushToGroup(ctx.groupId, ctx.me.username, body, attachment).catch(() => {});

@@ -1,7 +1,9 @@
 import React, { useRef, useState, useCallback, useEffect } from 'react'
 import longPressProps from '../longPress'
-import { createPortal } from 'react-dom'
 import HomeLeftPanel from './HomeLeftPanel'
+import FloatingMenu from './FloatingMenu'
+import MemberActionItems from './MemberActionItems'
+import { formatMoment } from '../moderation'
 import ProfileAvatar from './ProfileAvatar'
 import { nameStyleToCss } from '../profileData'
 
@@ -233,6 +235,15 @@ export default function AppLeftPane({
   onChangeTileImage,      // (target) => void, where target is { kind: 'home' } | { kind: 'server', id, name }
   onResetTileImage,
   onPrivateMessage,       // ({ username, name }) => void — opens the compose modal
+  // Moderation and blocking. Each handler asks first (or opens a dialog); the server decides.
+  onTimeoutMember,        // (username) => void — owner/admins: opens the "Time out…" dialog
+  onLiftMemberTimeout,    // (username) => void
+  onBanMember,            // (username) => void — opens the "Ban…" dialog
+  onBlockUser,            // (username) => void
+  onUnblockUser,          // (username) => void
+  blockedNames = new Set(), // usernames the signed-in person has blocked
+  onOpenBans,             // (serverId, serverName) => void — owner/admins
+  onOpenAuditLog,         // (serverId, serverName) => void — owner/admins
 }) {
   const isStaff = myRole === 'owner' || myRole === 'admin'
   const showMembersTab = paneTab === 'members'
@@ -434,7 +445,7 @@ export default function AppLeftPane({
                         // member but yourself — it used to open only for staff, which would have left
                         // ordinary members with no way to reach it. The manage entries stay gated.
                         const hasMenu = Boolean(m.username) && !m.isYou
-                        const openMemberMenu = (e) => openCtxMenu(e, { kind: 'member', id: m.id, name: m.name, username: m.username, role, canManage })
+                        const openMemberMenu = (e) => openCtxMenu(e, { kind: 'member', id: m.id, name: m.name, username: m.username, role, canManage, timedOut: Boolean(m.timeoutUntil) })
                         return (
                           <li key={m.id}>
                             <button
@@ -447,6 +458,8 @@ export default function AppLeftPane({
                             >
                               <span className={`dc-member-dot ${m.online === false ? 'offline' : ''}`} />
                               <span className="dc-member-name">{m.name}{m.isYou ? ' (you)' : ''}</span>
+                              {/* Timed out here: shown to everyone, and gone the moment it ends. */}
+                              {m.timeoutUntil && <span className="dc-member-timeout" title={`Timed out until ${formatMoment(m.timeoutUntil)}`} aria-label={`Timed out until ${formatMoment(m.timeoutUntil)}`}>⏳</span>}
                               {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
                               {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
                             </button>
@@ -607,8 +620,10 @@ export default function AppLeftPane({
       )}
 
       {/* Right-click menu for servers / channels / members (portaled above everything). */}
-      {ctxMenu && createPortal(
-        <div ref={ctxMenuRef} className="dc-ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }} role="menu">
+      {/* FloatingMenu measures itself and moves back inside the window: these menus are tall enough
+          now (moderation entries) that opening one near the bottom edge would otherwise cut it off. */}
+      {ctxMenu && (
+        <FloatingMenu x={ctxMenu.x} y={ctxMenu.y} className="dc-ctx-menu" menuRef={ctxMenuRef}>
           {ctxMenu.kind === 'server' && (() => {
             const role = ctxMenu.role || 'member'
             const staff = role === 'owner' || role === 'admin'
@@ -631,7 +646,11 @@ export default function AppLeftPane({
               // New room ids for every app in this server's voice channels. The "…" is a promise
               // that nothing happens yet: App asks first, and says what it ends.
               items.push(
-                <button key="app-rooms" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetAppRooms?.(ctxMenu.id, ctxMenu.name) }}>🔄 Reset app rooms…</button>
+                <button key="app-rooms" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetAppRooms?.(ctxMenu.id, ctxMenu.name) }}>🔄 Reset app rooms…</button>,
+                // Moderation records, for owner/admins. Each opens a dialog; the server refuses
+                // both to anyone else, whatever this menu shows.
+                <button key="bans" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onOpenBans?.(ctxMenu.id, ctxMenu.name) }}>⛔ Bans</button>,
+                <button key="audit" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onOpenAuditLog?.(ctxMenu.id, ctxMenu.name) }}>📜 Audit log</button>
               )
             }
             if (role !== 'owner' && !isDemo) {
@@ -679,7 +698,10 @@ export default function AppLeftPane({
           {ctxMenu.kind === 'member' && (
             <>
               <div className="dc-ctx-title">{ctxMenu.name}{ctxMenu.role !== 'member' ? ` · ${ctxMenu.role}` : ''}</div>
-              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onPrivateMessage?.({ username: ctxMenu.username, name: ctxMenu.name }) }}>✉️ Private message</button>
+              {/* Not offered for someone you blocked: the server would refuse the message. */}
+              {!blockedNames.has(ctxMenu.username) && (
+                <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onPrivateMessage?.({ username: ctxMenu.username, name: ctxMenu.name }) }}>✉️ Private message</button>
+              )}
               {/* Only the owner hands out or takes back admin; admins can kick but not promote. */}
               {ctxMenu.canManage && myRole === 'owner' && ctxMenu.role === 'member' && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'admin') }}>🛡️ Make admin</button>
@@ -690,11 +712,23 @@ export default function AppLeftPane({
               {ctxMenu.canManage && (
                 <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onKickMember?.(ctxMenu.username) }}>🚫 Remove from server</button>
               )}
+              {/* Time out / Ban (staff, same rule as the entry above) and Block (anyone). */}
+              <MemberActionItems
+                username={ctxMenu.username}
+                canModerate={Boolean(ctxMenu.canManage)}
+                timedOut={Boolean(ctxMenu.timedOut)}
+                blocked={blockedNames.has(ctxMenu.username)}
+                onDone={() => setCtxMenu(null)}
+                onTimeout={onTimeoutMember}
+                onLiftTimeout={onLiftMemberTimeout}
+                onBan={onBanMember}
+                onBlock={onBlockUser}
+                onUnblock={onUnblockUser}
+              />
             </>
           )}
 
-        </div>,
-        document.body
+        </FloatingMenu>
       )}
     </aside>
   )
