@@ -319,7 +319,7 @@ describe('announced public address check', () => {
 
   test('what counts as a public address', () => {
     for (const a of ['203.0.113.7', '8.8.8.8', '2001:db8::1', 'voice.example.test']) assert.equal(isPublicAddress(a), true, a);
-    for (const a of ['10.0.0.5', '192.168.1.33', '172.16.4.1', '172.31.255.1', '127.0.0.1', '169.254.3.3', '100.112.51.64', '::1', 'fe80::1', 'fd00::5', '']) assert.equal(isPublicAddress(a), false, a);
+    for (const a of ['10.0.0.5', '192.168.1.33', '172.16.4.1', '172.31.255.1', '127.0.0.1', '169.254.3.3', '100.64.0.1', '::1', 'fe80::1', 'fd00::5', '']) assert.equal(isPublicAddress(a), false, a);
     assert.equal(isPublicAddress('172.32.0.1'), true);
   });
 
