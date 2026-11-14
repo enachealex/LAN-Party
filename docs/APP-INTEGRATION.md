@@ -217,7 +217,7 @@ other if you build HTML out of what they send.
 A plain script, no build step, served by every LAN Party server at that path. It defines one
 global, `LANParty`.
 
-It is served with `Cache-Control: no-cache`: a browser may keep a copy, but checks it with the
+It is served with `Cache-Control: private, no-cache`: a browser may keep a copy, but checks it with the
 server every time before using it (a `304` with no body when nothing changed). So an uploaded app
 gets a corrected SDK the next time it loads, with no cache lifetime to wait out.
 

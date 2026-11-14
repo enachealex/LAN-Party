@@ -712,7 +712,7 @@ describe('app activity (sockets)', () => {
     assert.equal(res.headers.get('access-control-allow-origin'), '*');
     // Always checked with the server before use, and never given a lifetime: a proxy in front of
     // the server (Cloudflare) raises a short max-age to hours, and a stale SDK would run that long.
-    assert.equal(res.headers.get('cache-control'), 'no-cache');
+    assert.equal(res.headers.get('cache-control'), 'private, no-cache');
     const etag = res.headers.get('etag');
     assert.ok(etag, 'an ETag, so that check costs a 304 and no body');
     // Asked the way a browser revalidates its copy. Not with fetch(): given an If-None-Match it
@@ -724,7 +724,7 @@ describe('app activity (sockets)', () => {
         r.on('end', () => resolve({ status: r.statusCode, cacheControl: r.headers['cache-control'], size }));
       }).on('error', reject);
     });
-    assert.deepEqual(again, { status: 304, cacheControl: 'no-cache', size: 0 });
+    assert.deepEqual(again, { status: 304, cacheControl: 'private, no-cache', size: 0 });
     // A validator from before these headers existed (the static server's size-mtime form, or a date)
     // must not be answered "not modified": the CDN would keep serving its stored copy with the old
     // cache lifetime. The ETag carries a version for that, and there is no Last-Modified to match.
@@ -736,7 +736,7 @@ describe('app activity (sockets)', () => {
         r.on('end', () => resolve({ status: r.statusCode, cacheControl: r.headers['cache-control'] }));
       }).on('error', reject);
     });
-    assert.deepEqual(stale, { status: 200, cacheControl: 'no-cache' });
+    assert.deepEqual(stale, { status: 200, cacheControl: 'private, no-cache' });
     const body = await res.text();
     assert.match(body, /LANParty/);
     assert.doesNotMatch(body, /<!doctype html>/i);
