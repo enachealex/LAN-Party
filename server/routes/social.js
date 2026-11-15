@@ -15,7 +15,7 @@
 const { parsePageQuery, fetchPage } = require('../services/history');
 
 /** @param {Record<string, any>} deps */
-function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor }) {
+function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor, requireVerified }) {
   // A direct message's link preview changed (attached once its page was fetched, or taken off): to
   // both people, like an edit. With a block between the two, only its author is told, for the reason
   // an edit is not delivered either: nothing new arrives on the other side.
@@ -134,7 +134,9 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     return res.json({ success: true });
   });
 
-  app.post('/friends/request', authMiddleware, async (req, res) => {
+  // requireVerified: an account that has not confirmed its email cannot send friend requests
+  // (services/emailVerification.js).
+  app.post('/friends/request', authMiddleware, requireVerified, async (req, res) => {
     const targetUsername = (req.body?.username || '').trim();
     if (!targetUsername) return res.status(400).json({ error: 'Missing username' });
     const me = await getUserByUsername(req.user.username);
@@ -364,7 +366,8 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     return res.json({ success: true, totalUnread: summary.totalUnread });
   });
 
-  app.post('/messages/send', authMiddleware, async (req, res) => {
+  // requireVerified: nor direct messages.
+  app.post('/messages/send', authMiddleware, requireVerified, async (req, res) => {
     const toUsername = (req.body?.toUsername || req.body?.username || '').trim();
     const body = (req.body?.text || req.body?.body || '').trim();
     const attachment = normalizeAttachment(req.body?.attachment);

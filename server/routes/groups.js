@@ -20,7 +20,7 @@ const GROUP_MAX_MEMBERS = 25;
 const GROUP_NAME_MAX = 60;
 
 /** @param {Record<string, any>} deps */
-function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor }) {
+function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor, requireVerified }) {
   const newGroupId = () => `grp-${crypto.randomBytes(8).toString('hex')}`;
 
   // "Not sent by someone this reader has blocked", for a query over `group_messages gm`. One
@@ -198,7 +198,9 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     return res.json({ groups });
   });
 
-  app.post('/groups', authMiddleware, async (req, res) => {
+  // requireVerified on the three routes that reach other people: starting a group, adding people
+  // to one, and posting in one (services/emailVerification.js).
+  app.post('/groups', authMiddleware, requireVerified, async (req, res) => {
     const me = await getUserByUsername(req.user.username);
     if (!me) return res.status(404).json({ error: 'User not found' });
     const resolved = await resolveInvitees(me, req.body?.members);
@@ -235,7 +237,7 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     return res.json({ group: await groupSummary(ctx.groupId, ctx.me.id) });
   });
 
-  app.post('/groups/:id/members', authMiddleware, async (req, res) => {
+  app.post('/groups/:id/members', authMiddleware, requireVerified, async (req, res) => {
     const ctx = await requireMember(req, res);
     if (!ctx) return;
     const current = await membersOf(ctx.groupId);
@@ -289,7 +291,7 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     return res.json({ success: true });
   });
 
-  app.post('/groups/:id/messages', authMiddleware, async (req, res) => {
+  app.post('/groups/:id/messages', authMiddleware, requireVerified, async (req, res) => {
     const ctx = await requireMember(req, res);
     if (!ctx) return;
     const body = typeof req.body?.text === 'string' ? req.body.text.trim() : '';

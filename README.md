@@ -48,6 +48,14 @@ Trusted Web Activity APK for Android.
 - **Apps directory**: links or uploaded web-app bundles, hosted by LAN Party. An uploaded app can
   be started as a Thing To Do in a voice channel and share state through a small SDK:
   [docs/APP-INTEGRATION.md](docs/APP-INTEGRATION.md).
+- **Two-step sign-in** (optional, per account): a 6-digit code from any authenticator app (TOTP)
+  after the password, ten single-use recovery codes, set up from Settings > Security with a QR code
+  drawn in the page. A password reset does not get around it; an instance owner can clear it for
+  someone who is locked out.
+- **Email verification**: a new account confirms its address from an emailed link before it can
+  post in the public server, send direct messages or friend requests, create invites, upload files
+  or make calls. Only asked when the instance has email set up; accounts that already existed are
+  not asked.
 - **Feedback** tab that files tickets in Vaultline, and **Vault Player** single sign-on.
 
 ## Run locally

@@ -181,7 +181,7 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 
 | Var / file | Purpose |
 |---|---|
-| `JWT_SECRET` | Required. Signs logins; rotating it logs everyone out. |
+| `JWT_SECRET` | Required. Signs logins; rotating it logs everyone out. It is also what the two-step sign-in secrets are encrypted under, so rotating it locks out every account that has two-step sign-in on: see "Two-step sign-in" below before you do. |
 | `PORT`, `DATA_DIR`, `CLIENT_DIST`, `CLIENT_ORIGIN` | `5280`, `/mnt/data/lan-party/data`, `/srv/apps/lan-party/client/dist`, `https://lanparty.thejumpvault.com` |
 | `INSTANCE_OWNERS` | Optional. Comma-separated usernames who run the instance; today that means approving uploaded apps for the public app directory. When set and non-empty it replaces the default, which is the oldest account (lowest `users.id`). **The accounts must already exist**, spelled exactly as registered (case matters): a listed name that no account has makes nobody an owner and is logged as a warning at every boot. A listed name is reserved in any capitalisation — it cannot be registered or renamed into — and the list does not follow a rename, so a listed account cannot change its username until this variable is changed (then restart). |
 | `PUBLIC_APP_URL` | Public base URL for links the server hands out, e.g. feedback screenshots in Vaultline tickets |
@@ -193,11 +193,66 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `TENOR_API_KEY` / `tenor.key` | GIF search |
 | `YOUTUBE_API_KEY` / `youtube.key` | Watch Together search |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI` / `spotify.key` | Spotify |
-| `smtp.key` | Transactional email (shared Gmail SMTP) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_SECURE` / `smtp.key` | Transactional email (shared Gmail SMTP). Whether this is set also decides whether new accounts must verify their email: see "Email verification" below. |
 | `vaultline.key` | Feedback → Vaultline, over loopback `:4100` |
 | `VAULT_SSO_SECRET` (also `/srv/apps/lan-party/vault-sso.key`) | Vault Player SSO; see [docs/VAULT-PLAYER-INTEGRATION.md](docs/VAULT-PLAYER-INTEGRATION.md) |
 
 Music playback also needs `yt-dlp` on the PATH (`/usr/local/bin/yt-dlp` on the host).
+
+## Two-step sign-in
+
+Optional, per account, turned on by each person in Settings > Security. Nothing to configure, and
+no new dependency. After the password, sign-in asks for a code from an authenticator app or one of
+the account's ten recovery codes. Sessions that already exist are not affected when someone turns
+it on.
+
+- **Someone lost their phone AND their recovery codes.** A password reset does not help (by design:
+  a reset link in a stolen mailbox must not be a way in). An **instance owner** (`INSTANCE_OWNERS`,
+  or the oldest account) clears it for them: Settings > Security > "Locked-out accounts", or
+  `POST /admin/users/<username>/2fa/clear` with the owner's session. The person then signs in with
+  their password alone and can set it up again. Make sure the request is really theirs first, by
+  some other channel. Every use is written to the server log:
+  `[2fa] AUDIT: instance owner "<owner>" cleared two-factor for "<username>" (was on)`.
+- **The owner is the one locked out** (or there is no other owner). On the host, with the app
+  running or not, using the `sqlite3` CLI or any SQLite client on `DATA_DIR/data.sqlite`:
+
+  ```sql
+  DELETE FROM user_two_factor           WHERE user_id = (SELECT id FROM users WHERE username = 'NAME');
+  DELETE FROM two_factor_recovery_codes WHERE user_id = (SELECT id FROM users WHERE username = 'NAME');
+  DELETE FROM login_tickets             WHERE user_id = (SELECT id FROM users WHERE username = 'NAME');
+  ```
+
+  Shell access to the host is the trust boundary here, as it is for everything else on it.
+- **What is stored.** `user_two_factor.secret_enc` is the authenticator secret encrypted with
+  AES-256-GCM under a key derived from `JWT_SECRET`; recovery codes are stored only as keyed hashes
+  (`two_factor_recovery_codes`). A copy of the database without `JWT_SECRET` gives up neither.
+- **Rotating `JWT_SECRET`** therefore makes every stored secret unreadable and every recovery code
+  unmatchable: those accounts can no longer pass the second step (the log says
+  `[2fa] the stored secret for user id N could not be decrypted`). If you must rotate, empty the
+  three tables above for everyone (`DELETE FROM user_two_factor;` and so on) as part of the same
+  change and tell people to set it up again.
+- Wrong codes: five in a row pause that account's second step for five minutes. The pause clears by
+  itself; the owner route above also clears it.
+
+## Email verification
+
+A new account is emailed a link (`/app/?verify=...`, good for 24 hours) and, until it is opened,
+can sign in and read but cannot post in the public server, send direct messages or friend requests,
+create invites, upload files, or start or accept calls.
+
+- **It depends on SMTP being configured.** The server only asks for verification when it has a
+  mailer (`SMTP_*` or `server/smtp.key`). The boot log says which:
+  `[email] new accounts must verify their email address` or
+  `[email] no mailer configured: email verification is not required`. With no mailer every account
+  counts as verified, so an instance without email is never locked out of its own features.
+- **Existing accounts are not asked.** The migration that adds `users.email_verified` marks every
+  account that exists at that moment as verified. Accounts that register while there is no mailer
+  are stored as verified too, so setting SMTP up later does not restrict them.
+- If SMTP is configured but **broken** (wrong password, provider outage), new accounts cannot
+  receive their link and stay restricted until it is fixed; they can ask for the email again from
+  the banner or Settings > Security (three an hour per account). To let one through by hand:
+  `UPDATE users SET email_verified = 1 WHERE username = 'NAME';`
+- Links are built from `PUBLIC_APP_URL`, like the password reset link.
 
 ## Push notifications
 

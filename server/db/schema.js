@@ -540,6 +540,61 @@ const MIGRATIONS = [
       await addColumn(db, 'group_messages', 'preview_json', 'TEXT');
     },
   },
+  {
+    // Two-factor login (services/twoFactor.js) and email verification
+    // (services/emailVerification.js).
+    //
+    // users.email_verified   1 = this account has proved its address (or never had to). The column
+    //                        is added with DEFAULT 0, so anything that ever inserts a user without
+    //                        saying so gets the restricted state, and then EVERY ROW THAT EXISTS
+    //                        NOW IS SET TO 1: the accounts that could use the app before this
+    //                        shipped are verified, without being asked. Only when the column was
+    //                        really just added, so a re-run cannot verify anyone who signed up since.
+    //
+    // user_two_factor        one row per account that has two-factor on or is setting it up; no
+    //                        row means off, which is everyone when this runs. secret_enc and
+    //                        pending_enc are the TOTP secret ENCRYPTED (AES-256-GCM, a key derived
+    //                        from the server secret), never the secret itself. enabled_at NULL =
+    //                        not on. pending_* is a setup that has not been confirmed with a code
+    //                        yet. last_step is the newest time-step a code was accepted for, so a
+    //                        code cannot be used twice. failures / locked_until are the wrong
+    //                        answers in a row and the pause they lead to.
+    //
+    // two_factor_recovery_codes  HASHES of the single-use recovery codes (HMAC-SHA256 under a
+    //                        derived key); used_at NULL = still good.
+    //
+    // login_tickets          the sign-in tickets handed out between the password step and the
+    //                        code step. A row is deleted when its ticket is used, has taken too
+    //                        many wrong codes, or has expired; a ticket with no row is dead.
+    name: '0017_two_factor_and_email_verification',
+    up: async (db) => {
+      if (await addColumn(db, 'users', 'email_verified', 'INTEGER NOT NULL DEFAULT 0')) {
+        await db.run('UPDATE users SET email_verified = 1');
+      }
+      await db.exec(`CREATE TABLE IF NOT EXISTS user_two_factor (
+        user_id INTEGER PRIMARY KEY,
+        secret_enc TEXT,
+        enabled_at INTEGER,
+        pending_enc TEXT,
+        pending_expires_at INTEGER,
+        last_step INTEGER NOT NULL DEFAULT 0,
+        failures INTEGER NOT NULL DEFAULT 0,
+        locked_until INTEGER NOT NULL DEFAULT 0
+      )`);
+      await db.exec(`CREATE TABLE IF NOT EXISTS two_factor_recovery_codes (
+        user_id INTEGER NOT NULL,
+        code_hash TEXT NOT NULL,
+        used_at INTEGER,
+        PRIMARY KEY (user_id, code_hash)
+      )`);
+      await db.exec(`CREATE TABLE IF NOT EXISTS login_tickets (
+        jti TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        failures INTEGER NOT NULL DEFAULT 0
+      )`);
+    },
+  },
 ];
 
 /**

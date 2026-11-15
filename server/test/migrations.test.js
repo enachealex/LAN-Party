@@ -213,7 +213,6 @@ describe('schema migrations', () => {
     const upTo = MIGRATIONS.findIndex((m) => m.name === '0016_notification_levels_and_link_previews');
     assert.ok(upTo > 0, 'the migration exists, after the ones already shipped');
     assert.equal(MIGRATIONS[upTo - 1].name, '0015_roles_and_categories', 'appended directly after 0015');
-    assert.equal(upTo, MIGRATIONS.length - 1, 'and it is the one new migration');
     await runMigrations(db, MIGRATIONS.slice(0, upTo));
     await seedDemo(db);
     await db.run("INSERT INTO users (username, email, password_hash, settings) VALUES ('ann', 'ann@example.com', 'hash', '{}'), ('ben', 'ben@example.com', 'hash', '{}'), ('cat', 'cat@example.com', 'hash', '{}')");
@@ -248,7 +247,11 @@ describe('schema migrations', () => {
     assert.equal(before.messages.rows.length, 2);
     for (const t of GAINED) assert.ok(!(await columnNames(db, t)).includes('preview_json'));
 
-    await migrate(db); // the boot that picks 0016 up
+    // The boot that picks 0016 up. Run through 0016 and no further, as the 0015 test above does:
+    // a later migration is free to add a column to a table that was here before it (0017 adds one
+    // to users, and has its own test below).
+    const boot = async () => { await runMigrations(db, MIGRATIONS.slice(0, upTo + 1)); await seedDemo(db); };
+    await boot();
     assert.deepEqual(await snapshot(), before, 'no existing row or column changed');
     for (const t of GAINED) {
       assert.equal((await columnNames(db, t)).at(-1), 'preview_json', `${t} gained exactly this, at the end`);
@@ -289,10 +292,66 @@ describe('schema migrations', () => {
 
     // Running it again (a database that lost its migration record) changes nothing either.
     await db.exec('DROP TABLE schema_migrations');
-    await migrate(db);
+    await boot();
     assert.deepEqual(await snapshot(), before);
     assert.equal((await db.get('SELECT COUNT(*) AS n FROM notification_settings')).n, 4, 'and keeps what the new tables hold');
     assert.equal((await db.get('SELECT COUNT(*) AS n FROM link_previews')).n, 1);
+    await db.close();
+  });
+
+  test('0017 (two-factor and email verification) marks every existing account verified, turns two-factor on for nobody, and changes nothing else', async () => {
+    // A database as production has it the moment before this migration: everything up to 0016
+    // applied and recorded, with accounts, a pending password reset and some messages.
+    const db = await freshDb();
+    const upTo = MIGRATIONS.findIndex((m) => m.name === '0017_two_factor_and_email_verification');
+    assert.ok(upTo > 0, 'the migration exists, after the ones already shipped');
+    assert.equal(MIGRATIONS[upTo - 1].name, '0016_notification_levels_and_link_previews', 'appended directly after 0016');
+    assert.equal(upTo, MIGRATIONS.length - 1, 'and it is the one new migration');
+    await runMigrations(db, MIGRATIONS.slice(0, upTo));
+    await seedDemo(db);
+    await db.run("INSERT INTO users (username, email, password_hash, settings, presence_status) VALUES ('ann', 'ann@example.com', 'hash-a', '{\"profile\":{}}', 'away'), ('ben', 'ben@example.com', 'hash-b', '{}', 'offline'), ('cat', NULL, 'hash-c', NULL, NULL)");
+    await db.run("INSERT INTO auth_tokens (token, user_id, purpose, expires_at) VALUES ('reset-token', 1, 'reset', 1900000000000)");
+    await db.run("INSERT INTO revoked_tokens (token, expires_at) VALUES ('old-session', 1900000000000)");
+    await db.run("INSERT INTO messages (server_id, channel_id, author, text, ts) VALUES ('demo', 'general', 'ann', 'hello', 1700000000000)");
+    await db.run("INSERT INTO direct_messages (sender_id, recipient_id, body, created_at) VALUES (1, 2, 'psst', 1700000000000)");
+    await db.run('INSERT INTO friendships (user_id, friend_user_id, created_at) VALUES (1, 2, 1700000000000), (2, 1, 1700000000000)');
+    assert.equal((await columnNames(db, 'users')).includes('email_verified'), false, 'the column is new');
+
+    const usersBefore = await db.all('SELECT id, username, email, password_hash, settings, presence_status FROM users ORDER BY id');
+    const others = ['auth_tokens', 'revoked_tokens', 'messages', 'direct_messages', 'friendships', 'servers', 'channels'];
+    const snapshot = async () => Object.fromEntries(await Promise.all(others.map(async (t) => [t, await db.all(`SELECT * FROM ${t} ORDER BY rowid`)])));
+    const before = await snapshot();
+
+    assert.deepEqual(await runMigrations(db, MIGRATIONS), ['0017_two_factor_and_email_verification']);
+
+    // Grandfathering: everyone who had an account is verified, whatever their row looked like.
+    assert.deepEqual(await db.all('SELECT username, email_verified FROM users ORDER BY id'), [
+      { username: 'ann', email_verified: 1 }, { username: 'ben', email_verified: 1 }, { username: 'cat', email_verified: 1 },
+    ]);
+    assert.deepEqual(await db.all('SELECT id, username, email, password_hash, settings, presence_status FROM users ORDER BY id'), usersBefore, 'and nothing else about them changed');
+    assert.deepEqual(await snapshot(), before, 'no other table was touched');
+
+    // Two-factor: the tables exist and are empty, so nobody is asked for a code they never set up.
+    for (const table of ['user_two_factor', 'two_factor_recovery_codes', 'login_tickets']) {
+      assert.equal((await db.get(`SELECT COUNT(*) AS n FROM ${table}`)).n, 0, table);
+    }
+    assert.deepEqual(await columnNames(db, 'user_two_factor'), ['user_id', 'secret_enc', 'enabled_at', 'pending_enc', 'pending_expires_at', 'last_step', 'failures', 'locked_until']);
+    assert.deepEqual(await columnNames(db, 'two_factor_recovery_codes'), ['user_id', 'code_hash', 'used_at']);
+    assert.deepEqual(await columnNames(db, 'login_tickets'), ['jti', 'user_id', 'expires_at', 'failures']);
+
+    // An account inserted from now on without saying otherwise is NOT verified: the default fails
+    // closed, and only the registration route (which knows whether there is a mailer) decides.
+    await db.run("INSERT INTO users (username, email, password_hash, settings) VALUES ('dee', 'dee@example.com', 'hash-d', '{}')");
+    assert.equal((await db.get("SELECT email_verified FROM users WHERE username = 'dee'")).email_verified, 0);
+
+    // Running it again (a database that lost its migration record) must not verify dee, who
+    // signed up after the migration: the grandfathering happens once, when the column is added.
+    await db.run("INSERT INTO user_two_factor (user_id, secret_enc, enabled_at) VALUES (1, 'v1.x.y.z', 1700000000000)");
+    await db.exec('DROP TABLE schema_migrations');
+    await migrate(db);
+    assert.equal((await db.get("SELECT email_verified FROM users WHERE username = 'dee'")).email_verified, 0);
+    assert.equal((await db.get("SELECT email_verified FROM users WHERE username = 'ann'")).email_verified, 1);
+    assert.equal((await db.get('SELECT COUNT(*) AS n FROM user_two_factor')).n, 1, 'and keeps what the new tables hold');
     await db.close();
   });
 

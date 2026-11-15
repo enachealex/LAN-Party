@@ -1,14 +1,25 @@
 // Authentication + account lifecycle: register, availability check, login, /auth/me, password
 // reset (forgot/reset), account deactivation (request + confirm) and logout. deleteUserCompletely
 // lives here since deactivation is its only caller.
+//
+// WHERE A SESSION COMES FROM. A session is a JWT signed with JWT_SECRET carrying `username`.
+// Exactly one function in this file signs one (issueSession, below) and it is reached two ways:
+//   POST /auth/login       password correct AND the account has no two-factor. With two-factor on,
+//                          this route answers { twoFactorRequired, ticket } and no session.
+//   POST /auth/login/2fa   a ticket from the step above plus a current code or a recovery code.
+// Nothing else here signs in: registering, resetting a password and confirming an email address
+// all answer { success } and send the person to the sign-in form, so a reset link in a stolen
+// mailbox still stops at the second step. The only other place a session is signed is the rename
+// in index.js (POST /user/username), which re-issues one for the new name to a caller who already
+// holds a session.
 const bcrypt = require('bcryptjs');
 const { rateLimit } = require('../rateLimit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('../email');
 
-/** @param {{ app: any, db: any, authMiddleware: any, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, isInstanceOwner: (username: string) => Promise<boolean>, isReservedOwnerName: (name: unknown) => boolean, appRooms: { rotate: (serverId: string) => Promise<number | null> }, endAppActivitiesInServer: (serverId: string, reason?: string | null) => void }} deps */
-function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer }) {
+/** @param {{ app: any, db: any, authMiddleware: any, twoFactor: ReturnType<typeof import('../services/twoFactor').createTwoFactor>, emailVerification: ReturnType<typeof import('../services/emailVerification').createEmailVerification>, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, isInstanceOwner: (username: string) => Promise<boolean>, isReservedOwnerName: (name: unknown) => boolean, appRooms: { rotate: (serverId: string) => Promise<number | null> }, endAppActivitiesInServer: (serverId: string, reason?: string | null) => void }} deps */
+function registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerification, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer }) {
   app.post('/auth/register', rateLimit({ id: 'register', windowMs: 60 * 60_000, max: 10 }), async (req, res) => {
     const { username, email, password, passwordConfirm } = req.body || {};
     if (!username || !email || !password || !passwordConfirm) return res.status(400).json({ error: 'Missing fields' });
@@ -34,10 +45,15 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       onboardingComplete: false,
     };
     const hash = await bcrypt.hash(password, 10);
-    await db.run('INSERT INTO users (username, email, password_hash, settings) VALUES (?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings));
-    // Fire-and-forget welcome email (never block or fail registration on email).
+    // email_verified: 0 while this instance can email the link, 1 when it cannot (see
+    // services/emailVerification.js: an instance without a mailer never asks).
+    const created = await db.run('INSERT INTO users (username, email, password_hash, settings, email_verified) VALUES (?, ?, ?, ?, ?)', username, email, hash, JSON.stringify(defaultSettings), emailVerification.initialFlag());
+    // Fire-and-forget emails (never block or fail registration on email).
     mailer.sendWelcome(username, email).catch((e) => console.warn('welcome email error', e && e.message));
-    return res.json({ success: true });
+    const verificationSent = emailVerification.required();
+    if (verificationSent) emailVerification.sendLink({ id: created.lastID, username, email }).catch((e) => console.warn('verification email error', e && e.message));
+    // No session: the person signs in next, through the same gate as everyone else.
+    return res.json({ success: true, verificationSent });
   });
 
   app.post('/auth/check-availability', rateLimit({ id: 'availability', windowMs: 5 * 60_000, max: 120 }), async (req, res) => {
@@ -61,18 +77,77 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    const settings = user.settings ? JSON.parse(user.settings) : {};
-    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: remember ? '90d' : '7d' });
-    // instanceOwner tells the client which controls to SHOW (the app review tab). It grants nothing:
-    // every route that acts on it asks isInstanceOwner again with the name from the token.
-    return res.json({ success: true, token, user: { username: user.username, email: user.email, settings, instanceOwner: await isInstanceOwner(user.username) } });
+    // Two-factor on: the password is only half. Hand back a ticket for the second step and NO
+    // session. The ticket is useless anywhere else (services/twoFactor.js).
+    if (await twoFactor.isEnabled(user.id)) {
+      const { ticket, expiresIn } = await twoFactor.issueTicket(user, !!remember);
+      return res.json({ twoFactorRequired: true, ticket, expiresIn });
+    }
+    return res.json(await issueSession(user, !!remember));
   });
+
+  // The second step. Limited by address like the first, and by ACCOUNT as well (read from the
+  // ticket's signature, so it cannot be dodged by changing a forwarded header); wrong codes are
+  // counted against the ticket and the account inside redeemTicket. (A request whose ticket does
+  // not verify has no account to count against; the second limiter then counts its address too,
+  // which is why both allow the same number.)
+  // Answers: 200 the same body as a one-step sign-in; 401 for every failure that is not a pause
+  // (a bad, expired, used or worn-out ticket and a wrong code are deliberately one answer); 429
+  // when the account's second step is paused after too many wrong codes.
+  const FAILED_SECOND_STEP = { error: 'That code did not work, or this sign-in has expired.', code: 'two-factor-failed' };
+  app.post('/auth/login/2fa',
+    rateLimit({ id: 'login-2fa', windowMs: 15 * 60_000, max: 20, message: 'Too many sign-in attempts — wait a few minutes.' }),
+    rateLimit({ id: 'login-2fa-account', windowMs: 15 * 60_000, max: 20, message: 'Too many sign-in attempts — wait a few minutes.', keyOf: (req) => { const t = twoFactor.readTicket((req.body || {}).ticket); return t ? `uid-${t.uid}` : null; } }),
+    async (req, res) => {
+      const { ticket, code, recoveryCode } = req.body || {};
+      if (!ticket || (!code && !recoveryCode)) return res.status(400).json({ error: 'Missing fields' });
+      const result = await twoFactor.redeemTicket(ticket, { code, recoveryCode });
+      if (!result.ok) {
+        if (result.reason === 'locked') {
+          res.setHeader('Retry-After', String(result.retryAfter || 60));
+          return res.status(429).json({ error: 'Too many wrong codes. Sign in again in a few minutes.', code: 'two-factor-locked', retryAfter: result.retryAfter });
+        }
+        return res.status(401).json(FAILED_SECOND_STEP);
+      }
+      const user = await db.get('SELECT * FROM users WHERE id = ?', result.userId);
+      if (!user) return res.status(401).json(FAILED_SECOND_STEP);
+      const body = await issueSession(user, result.remember);
+      // A recovery code is gone once used; say how many are left so the client can nudge.
+      if (result.method === 'recovery') body.recoveryCodesRemaining = (await twoFactor.statusOf(user.id)).recoveryCodesRemaining;
+      return res.json(body);
+    });
+
+  // What the client is told about the signed-in account. emailVerified is the EFFECTIVE answer
+  // (true for everyone on an instance with no mailer); neither flag grants anything by itself.
+  /** @param {any} user a users row @returns {Promise<Record<string, any>>} */
+  async function describeUser(user) {
+    let settings = {};
+    try { settings = JSON.parse(user.settings || '{}') || {}; } catch (_) { settings = {}; }
+    return {
+      username: user.username,
+      email: user.email,
+      settings,
+      // instanceOwner tells the client which controls to SHOW (the app review tab). It grants nothing:
+      // every route that acts on it asks isInstanceOwner again with the name from the token.
+      instanceOwner: await isInstanceOwner(user.username),
+      emailVerified: emailVerification.rowIsVerified(user),
+      twoFactorEnabled: await twoFactor.isEnabled(user.id),
+    };
+  }
+
+  // THE place a sign-in becomes a session. Callers have already checked the password and, when the
+  // account has it, the second factor.
+  /** @param {any} user a users row @param {boolean} remember @returns {Promise<Record<string, any>>} */
+  async function issueSession(user, remember) {
+    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: remember ? '90d' : '7d' });
+    return { success: true, token, user: await describeUser(user) };
+  }
 
   app.get('/auth/me', authMiddleware, async (req, res) => {
     const username = req.user.username;
-    const user = await db.get('SELECT username, email, settings FROM users WHERE username = ?', username);
+    const user = await db.get('SELECT id, username, email, settings, email_verified FROM users WHERE username = ?', username);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    return res.json({ success: true, user: { username: user.username, email: user.email, settings: JSON.parse(user.settings || '{}'), instanceOwner: await isInstanceOwner(user.username) } });
+    return res.json({ success: true, user: await describeUser(user) });
   });
 
   const newAuthToken = () => crypto.randomBytes(24).toString('base64url');
@@ -102,6 +177,9 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
     if (!user || user.email !== email) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
     await db.run('UPDATE users SET password_hash = ? WHERE id = ?', await bcrypt.hash(password, 10), user.id);
     await db.run('DELETE FROM auth_tokens WHERE token = ?', token);
+    // Deliberately no session and no change to two-factor: the new password is the first step
+    // only, and an account with two-factor on still needs its code to sign in. Someone who has
+    // lost the authenticator AND the recovery codes asks an instance owner (routes/security.js).
     return res.json({ success: true });
   });
 
@@ -183,6 +261,10 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       await db.run("DELETE FROM notification_settings WHERE scope = 'dm' AND target = ?", String(userId));
       await db.run("DELETE FROM notification_settings WHERE scope = 'group' AND target NOT IN (SELECT id FROM group_chats)");
       await db.run('DELETE FROM auth_tokens WHERE user_id = ?', userId);
+      // Two-factor: the encrypted secret, the recovery code hashes and any ticket still out.
+      await db.run('DELETE FROM user_two_factor WHERE user_id = ?', userId);
+      await db.run('DELETE FROM two_factor_recovery_codes WHERE user_id = ?', userId);
+      await db.run('DELETE FROM login_tickets WHERE user_id = ?', userId);
       // Their browsers stop being notified. Left behind, the rows would deliver to whoever registers
       // the freed username next.
       await db.run('DELETE FROM push_subscriptions WHERE username = ?', username);

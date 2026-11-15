@@ -49,7 +49,7 @@ const ACCEPT_LIMIT = { id: 'invite-accept', windowMs: 5 * 60_000, max: 60 };
 const ACTIVE = 'revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) AND (max_uses IS NULL OR uses < max_uses)';
 
 /** @param {Record<string, any>} deps */
-function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation }) {
+function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation, requireVerified }) {
   const { isMember } = permissions;
   const newCode = () => crypto.randomBytes(CODE_BYTES).toString('base64url');
 
@@ -90,7 +90,7 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permission
   }
 
   // Mint a link (the invite permission).
-  app.post('/servers/:serverId/invites', rateLimit({ id: 'invite-create', windowMs: 10 * 60_000, max: 120 }), authMiddleware, async (req, res) => {
+  app.post('/servers/:serverId/invites', rateLimit({ id: 'invite-create', windowMs: 10 * 60_000, max: 120 }), authMiddleware, requireVerified, async (req, res) => {
     const srv = await staffServer(req, res, 'create invite links');
     if (!srv) return undefined;
     const input = validate(inviteLinkInput, req.body || {});

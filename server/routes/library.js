@@ -8,7 +8,7 @@ const { extractBundle } = require('../services/appBundles');
 const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl } = require('../services/hostedApps');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [] }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [], requireVerified }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -513,7 +513,9 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   });
 
   // Add a GIF to the shared library (multipart upload -> persistent /gifs storage).
-  app.post('/gifs', authMiddleware, (req, res) => {
+  // requireVerified (here and on /sounds): the libraries are shared with everyone, so adding to
+  // them waits for a confirmed email. Checked before the upload is read.
+  app.post('/gifs', authMiddleware, requireVerified, (req, res) => {
     gifUpload.single('file')(req, res, async (err) => {
       if (err) {
         if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is larger than 100 MB' });
@@ -566,7 +568,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   });
 
   // Add a soundboard clip (multipart upload -> persistent /sounds storage).
-  app.post('/sounds', authMiddleware, (req, res) => {
+  app.post('/sounds', authMiddleware, requireVerified, (req, res) => {
     soundUpload.single('file')(req, res, async (err) => {
       if (err) {
         if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is larger than 100 MB' });

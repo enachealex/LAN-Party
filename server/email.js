@@ -2,6 +2,15 @@
 // Uses the same SMTP account as Retroboard (vaultjump.noreply@gmail.com). Credentials come from
 // SMTP_* env vars, or a gitignored JSON key file (server/smtp.key) alongside the other *.key files:
 //   { "host": "...", "port": 587, "user": "...", "pass": "...", "from": "LAN Party <...>", "secure": false }
+//
+// EMAIL_TRANSPORT is the test seam, and it wins over everything above:
+//   'off'            no mailer, whatever SMTP_* or smtp.key say. The test harness sets this, so a
+//                    test run on a machine that has real credentials still cannot send anything.
+//   a module path    a module exporting { sendMail(message) } to use in place of SMTP
+//                    (test/fixtures/fakeMailer.js writes each message to a file instead).
+// Whether a mailer exists is not only about sending: with none, new accounts are not asked to
+// verify their address (services/emailVerification.js), so nobody is locked out of an instance
+// that cannot email them.
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
@@ -21,8 +30,26 @@ function loadConfig() {
 
 let transporter = null;
 let fromAddr = '';
+let seamFailed = false;
 function getTransporter() {
   if (transporter) return transporter;
+  const seam = process.env.EMAIL_TRANSPORT;
+  if (seam === 'off') return null;
+  if (seam) {
+    // A stand-in that cannot be loaded leaves the mailer off; it never falls through to real SMTP.
+    if (seamFailed) return null;
+    try {
+      const stand = require(path.resolve(seam));
+      if (!stand || typeof stand.sendMail !== 'function') throw new Error('it does not export sendMail');
+      transporter = stand;
+      fromAddr = `${APP_NAME} <test@localhost>`;
+      return transporter;
+    } catch (err) {
+      seamFailed = true; // said once, not on every request that asks whether there is a mailer
+      console.warn('[email] EMAIL_TRANSPORT could not be loaded: email is off.', err && err.message);
+      return null;
+    }
+  }
   const cfg = loadConfig();
   if (!cfg.host || !cfg.user || !cfg.pass) return null;
   const port = parseInt(cfg.port || '587', 10);
@@ -68,6 +95,16 @@ function sendPasswordReset(username, to, token) {
     <p style="color:#9a8078;font-size:13px;margin:0;">Or enter this code in the app: <b style="color:#e9ddd6;">${esc(token)}</b>. Didn't request this? Ignore this email.</p>`));
 }
 
+// The link opens the app, which confirms the token (POST /auth/verify-email). It signs nobody in.
+function sendVerifyEmail(username, to, token) {
+  const link = `${APP_URL}/app/?verify=${encodeURIComponent(token)}`;
+  return send(to, `Confirm your email for ${APP_NAME}`, wrap(`
+    <h1 style="margin:0 0 12px;color:#f0a070;font-size:22px;">Confirm your email</h1>
+    <p style="line-height:1.6;margin:0 0 16px;">Hi ${esc(username)}, confirm this address to finish setting up your ${APP_NAME} account. Until then you can look around, but not post, message, call or upload. This link expires in 24 hours.</p>
+    <p style="margin:0 0 20px;">${btn(link, 'Confirm email')}</p>
+    <p style="color:#9a8078;font-size:13px;margin:0;">If you didn't create this account, you can ignore this email.</p>`));
+}
+
 function sendDeactivationConfirm(username, to, token) {
   const link = `${APP_URL}/app/?deactivate=${encodeURIComponent(token)}&email=${encodeURIComponent(to)}`;
   return send(to, `Confirm your ${APP_NAME} account deactivation`, wrap(`
@@ -90,4 +127,4 @@ async function verify() {
   try { await t.verify(); return { ok: true, from: fromAddr }; } catch (e) { return { ok: false, reason: e.message }; }
 }
 
-module.exports = { sendWelcome, sendPasswordReset, sendDeactivationConfirm, sendDeactivationDone, verify, isConfigured: () => !!getTransporter() };
+module.exports = { sendWelcome, sendVerifyEmail, sendPasswordReset, sendDeactivationConfirm, sendDeactivationDone, verify, isConfigured: () => !!getTransporter() };

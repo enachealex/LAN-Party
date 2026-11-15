@@ -17,7 +17,7 @@ const APP_ROOMS_RESET_LIMIT = {
 };
 
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks, notificationSettings }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks, notificationSettings, requireVerified }) {
   const { roleOf, isMember, can, canAccessChannel, visibleChannelsFor } = permissions;
   // The commons is open (anyone may add a public channel there); elsewhere it is manage_channels.
   const canManageChannels = permissions.mayManageChannels;
@@ -399,7 +399,9 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
   });
 
   // Invite a user by username (the invite permission) → they become a member; their rail refreshes.
-  app.post('/servers/:serverId/invite', authMiddleware, async (req, res) => {
+  // requireVerified: pulling someone into a server is not for an account that has not confirmed
+  // its email (services/emailVerification.js).
+  app.post('/servers/:serverId/invite', authMiddleware, requireVerified, async (req, res) => {
     const serverId = req.params.serverId;
     if (serverId === DEMO_ID) return res.status(400).json({ error: 'Everyone is already in the public server' });
     const srv = await db.get('SELECT id, name FROM servers WHERE id = ?', serverId);

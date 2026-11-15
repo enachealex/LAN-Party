@@ -50,6 +50,9 @@ import { effectivePermissions, memberActionsFor, NO_MEMBER_ACTIONS, roleColorOf,
 import AuditLogModal from './components/AuditLogModal'
 import BlockedPeopleSection from './components/BlockedPeopleSection'
 import { TimeoutNotice, BlockedNotice } from './components/ComposerNotice'
+import TwoFactorLogin from './components/TwoFactorLogin'
+import SecuritySettings from './components/SecuritySettings'
+import { VerifyEmailBanner, UnverifiedNotice, VerifyLinkDialog, resendVerification, confirmEmailToken, EMAIL_UNVERIFIED, VERIFY_FIRST } from './components/EmailVerification'
 import { useExpiry, formatMoment, formatDuration as formatMinutes } from './moderation'
 import { syncPush, stopPush, pushSupported, pushCovers, windowFocused, useNotificationTarget } from './push'
 import { badgeTotals, channelLevel, isDmMuted, isGroupMuted, unmutedGroupUnread } from './notificationLevels'
@@ -1220,6 +1223,19 @@ export default function App() {
   // Whether the server says this account runs the instance (may review uploaded apps). It comes
   // with the app list and only decides what is DRAWN; the server re-checks on every request.
   const [instanceOwner, setInstanceOwner] = useState(false)
+  // Whether this account's email is confirmed, as the server reports it on sign-in and /auth/me
+  // (always true on an instance with no mailer). Until it is, the server refuses posting in the
+  // public server, direct messages, friend requests, invites, uploads and calls; this only decides
+  // what to show. The ref is for socket handlers, which are bound once.
+  const [emailVerified, setEmailVerified] = useState(true)
+  const emailVerifiedRef = useRef(true)
+  useEffect(() => { emailVerifiedRef.current = emailVerified }, [emailVerified])
+  const [verifyBannerDismissed, setVerifyBannerDismissed] = useState(false) // for this session only
+  // The app was opened from an emailed verification link: { state: 'working' | 'ok' | 'failed' }.
+  const [verifyLink, setVerifyLink] = useState(null)
+  // The password was right and the account has two-step sign-in: { ticket, expiresAt }. The login
+  // form gives way to the code step (components/TwoFactorLogin) until it is used or abandoned.
+  const [twoFactorChallenge, setTwoFactorChallenge] = useState(null)
   // Every request that answers with the app list takes a number when it starts, and a list is only
   // put on screen if no later-started request has already put its own there: a slow GET must not
   // paint over the answer to the approve that was sent after it.
@@ -1228,7 +1244,7 @@ export default function App() {
   // True while the solo viewer was opened from the directory, which then comes back when it closes.
   const viewerFromDirectoryRef = useRef(false)
   const [showSettingsPanel, setShowSettingsPanel] = useState(false)
-  const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages'
+  const [settingsTab, setSettingsTab] = useState('profile') // 'profile' | 'appearance' | 'messages' | 'security' | 'feedback'
   // Feedback / bug-report modal (submissions forward to Vaultline via the server's /feedback route).
   const [feedbackType, setFeedbackType] = useState('feedback') // 'feedback' | 'request' | 'bug'
   const [feedbackTitle, setFeedbackTitle] = useState('')
@@ -1967,6 +1983,18 @@ export default function App() {
       if (p.get('reset')) setAccountFlow({ type: 'reset', token: p.get('reset'), email })
       else if (p.get('deactivate')) setAccountFlow({ type: 'deactivate', token: p.get('deactivate'), email })
       if (p.get('reset') || p.get('deactivate')) window.history.replaceState({}, '', window.location.pathname)
+      // /app/?verify=TOKEN: confirm the address. Works signed in or out and signs nobody in; the
+      // token is scrubbed from the address bar before anything else can copy it.
+      const verifyToken = p.get('verify')
+      if (verifyToken) {
+        window.history.replaceState({}, '', window.location.pathname)
+        setVerifyLink({ state: 'working' })
+        confirmEmailToken(SERVER_URL, verifyToken).then((result) => {
+          setVerifyLink(result)
+          // If it was this browser's own account, the socket says so too; this covers the gap.
+          if (result.state === 'ok') refreshEmailVerifiedRef.current()
+        })
+      }
     } catch (_) { /* ignore */ }
   }, [])
 
@@ -1987,6 +2015,7 @@ export default function App() {
         setUserEmail(data.user.email || '')
         setUserSettings(data.user.settings)
         applySettings(data.user.settings)
+        setEmailVerified(data.user.emailVerified !== false)
         // Resume onboarding if a new account refreshed before finishing it.
         maybeStartOnboarding(data.user.settings)
         // sync and connect
@@ -2317,6 +2346,7 @@ export default function App() {
   const sendFriendRequest = async () => {
     const u = addFriendUsername.trim()
     if (!u || !token) return
+    if (!emailVerified) { setAddFriendError(VERIFY_FIRST); return }
     setAddFriendLoading(true)
     setAddFriendError(null)
     try {
@@ -3548,6 +3578,13 @@ export default function App() {
     })
     // Taken out of one voice channel (access to it was removed), or refused at its door.
     s.on('voice:removed', ({ serverId, reason, until } = {}) => {
+      // Refused at the door because the account's email is not verified yet.
+      if (reason === EMAIL_UNVERIFIED) {
+        setEmailVerified(false)
+        if (inVoiceRef.current && voiceServerIdRef.current === serverId) leaveVoiceRef.current()
+        setToast(VERIFY_FIRST)
+        return
+      }
       if (inVoiceRef.current && voiceServerIdRef.current === serverId) {
         leaveVoiceRef.current()
         // A timeout has its own words: the channel is still theirs, just not yet.
@@ -3646,6 +3683,14 @@ export default function App() {
     // A channel send was rejected (stale server/channel pairing — e.g. mid-resync). Surface it,
     // put the text back so nothing is lost, and re-join the current view to resync rooms.
     s.on('message:error', ({ text: failedText, reason, serverId, until } = {}) => {
+      // Refused because this account has not verified its email. Nothing is out of step: remember
+      // it (the notice replaces the message box), say why, and keep what was typed.
+      if (reason === EMAIL_UNVERIFIED) {
+        setEmailVerified(false)
+        setToast(`${VERIFY_FIRST} That message was not sent.`)
+        if (failedText) setText((cur) => cur || failedText)
+        return
+      }
       // Refused because I am timed out there. Nothing is out of step, so there is nothing to resync:
       // remember the timeout (the banner replaces the message box) and say why it did not send.
       if (reason === 'timed-out') {
@@ -3978,6 +4023,17 @@ export default function App() {
     s.on('call:canceled', () => onCallCanceled())
     s.on('call:ended', () => onCallEnded())
     s.on('call:unavailable', () => onCallUnavailable())
+    // The server would not place or answer the call: this account's email is not verified yet.
+    s.on('call:refused', ({ reason, error } = {}) => {
+      if (reason === EMAIL_UNVERIFIED) setEmailVerified(false)
+      teardownCallRef.current()
+      setToast(reason === EMAIL_UNVERIFIED ? VERIFY_FIRST : (error || 'That call could not be placed'))
+    })
+    // The verification link was opened, here or on another device: everything unlocks.
+    s.on('account:email-verified', () => {
+      setEmailVerified(true)
+      setToast('Email verified. Everything is unlocked.')
+    })
     s.on('call:handled', () => onCallHandledElsewhere())
     s.on('call:signal', ({ from, signal }) => handleCallSignal(from, signal))
     s.on('voice:peer-left', ({ id }) => { forgetPeer(id); playUiSound('peerLeave'); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
@@ -4059,8 +4115,34 @@ export default function App() {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Login failed')
+      // Two-step sign-in is on for this account: the password got a ticket, not a session. Show
+      // the code step; finishSignIn runs when that returns the real sign-in response.
+      if (data.twoFactorRequired) {
+        setLoginPassword('')
+        setTwoFactorChallenge({ ticket: data.ticket, expiresAt: Date.now() + (Number(data.expiresIn) || 300) * 1000 })
+        return
+      }
+      await finishSignIn(data)
+    } catch (err) {
+      setAuthError(err.message)
+    } finally { setAuthLoading(false) }
+  }
+
+  // What follows a successful sign-in, however many steps it took: POST /auth/login for an account
+  // without two-step sign-in, POST /auth/login/2fa (components/TwoFactorLogin) for one with it.
+  const finishSignIn = async (data) => {
+    try {
+      setTwoFactorChallenge(null)
+      setAuthError(null)
       // success: store token and user
       setIsAuthenticated(true)
+      setEmailVerified(data.user.emailVerified !== false)
+      setVerifyBannerDismissed(false)
+      if (typeof data.recoveryCodesRemaining === 'number') {
+        setToast(data.recoveryCodesRemaining > 0
+          ? `Signed in with a recovery code. ${data.recoveryCodesRemaining} left: make new ones in Settings, under Security.`
+          : 'That was your last recovery code. Make new ones in Settings, under Security.')
+      }
       setName(data.user.username)
       setUserEmail(data.user.email || '')
       setToken(data.token)
@@ -4099,8 +4181,31 @@ export default function App() {
       restoreSavedView({ username: data.user.username, friendsList: loadedFriends, conversations: loadedConversations, groups: loadedGroups, authToken: data.token })
     } catch (err) {
       setAuthError(err.message)
-    } finally { setAuthLoading(false) }
+    }
   }
+
+  // Email verification. Resend is offered from the banner, the notices that stand in for a
+  // message box, and Settings > Security; all of them end up here.
+  const resendVerificationEmail = async () => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) return 'Sign in first.'
+    const { message, alreadyVerified } = await resendVerification(SERVER_URL, t)
+    if (alreadyVerified) setEmailVerified(true)
+    return message
+  }
+  // Ask the server again whether this account is verified (after a link was opened in this browser).
+  const refreshEmailVerified = async () => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) return
+    try {
+      const res = await fetch(`${SERVER_URL}/auth/me`, { headers: { Authorization: `Bearer ${t}` } })
+      if (!res.ok) return
+      const data = await res.json()
+      setEmailVerified(data.user?.emailVerified !== false)
+    } catch (_) { /* the socket event or the next start will say */ }
+  }
+  const refreshEmailVerifiedRef = useRef(refreshEmailVerified)
+  refreshEmailVerifiedRef.current = refreshEmailVerified
 
   const handleRegister = async (e) => {
     e && e.preventDefault && e.preventDefault();
@@ -4134,7 +4239,9 @@ export default function App() {
       // On success, switch to login and prefill
       setAuthMode('login')
       clearRegisterForm()
-      setAuthError('Account created. Please log in.')
+      setAuthError(data.verificationSent
+        ? 'Account created. We emailed you a link to verify your address. You can log in now and look around.'
+        : 'Account created. Please log in.')
     } catch (err) {
       setAuthError(err instanceof TypeError ? "Couldn't reach the server. Please try again." : (err.message || 'Register failed'))
     } finally { setAuthLoading(false) }
@@ -4617,6 +4724,8 @@ export default function App() {
 
   const startCall = async (peerUsername, withVideo = false) => {
     if (!peerUsername || callRef.current) return
+    // The server refuses calls from an unverified account; say so before asking for the microphone.
+    if (!emailVerified) { setToast(VERIFY_FIRST); return }
     let stream
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: withVideo }) }
     catch (e) { alert('Microphone access is required to call.'); return }
@@ -4628,6 +4737,7 @@ export default function App() {
   const acceptCall = async () => {
     const c = callRef.current
     if (!c || c.status !== 'incoming') return
+    if (!emailVerified) { setToast(VERIFY_FIRST); declineCall(); return }
     let stream
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: c.video }) }
     catch (e) { declineCall(); return }
@@ -4675,6 +4785,8 @@ export default function App() {
   const onCallEnded = () => { if (callRef.current) teardownCall() }
   const onCallHandledElsewhere = () => { if (callRef.current?.status === 'incoming') teardownCall() }
   const onCallUnavailable = () => { setToast(`${callRef.current?.peer || 'They'} can't be reached`); teardownCall() }
+  const teardownCallRef = useRef(() => {})
+  teardownCallRef.current = () => teardownCall()
   // Safety net: an outgoing call that's never answered (peer online but away, or negotiation stalls)
   // would otherwise ring forever and follow you across every page. Give up after 30s.
   useEffect(() => {
@@ -6727,6 +6839,7 @@ export default function App() {
   const uploadSelectedFile = async () => {
     if (!pendingFile) return null
     if (!token) throw new Error('You must be signed in to upload files.')
+    if (!emailVerified) throw new Error(VERIFY_FIRST)
     const formData = new FormData()
     formData.append('file', pendingFile)
     const res = await fetch(`${SERVER_URL}/files/upload`, {
@@ -7774,6 +7887,9 @@ export default function App() {
     appsAppliedRef.current = ++appsSeqRef.current
     setPublicApps([])
     setInstanceOwner(false)
+    setEmailVerified(true)
+    setVerifyBannerDismissed(false)
+    setTwoFactorChallenge(null)
     setPublicAppsStatus('idle')
   }, [isAuthenticated])
   const pendingAppReviews = instanceOwner ? publicApps.filter((a) => a.status === 'pending').length : 0
@@ -7840,6 +7956,12 @@ export default function App() {
     }
     if (!showHomeChat && activeTimeout) {
       return <TimeoutNotice timeout={activeTimeout} serverName={serverName} />
+    }
+    // A third: the account's email is not verified yet. The server refuses direct and group
+    // messages, and anything posted in the public server (other servers are by invitation and are
+    // not affected). Uploads are refused everywhere; the attach button says so when pressed.
+    if (!emailVerified && (showHomeChat || selectedServerId === 'demo')) {
+      return <UnverifiedNotice what={showHomeChat ? 'send messages' : 'post in the public server'} onResend={resendVerificationEmail} />
     }
     const canSend = Boolean(text.trim() || pendingFile || composerStack.length) && !uploadingFile
     // A stack has its own delivery path: everything in it is already hosted, so there is nothing to
@@ -8315,7 +8437,7 @@ export default function App() {
                       }}>Download App</button>
                     )}
                     {showHomeChat && homeChat?.peerUsername && !call && !blockedNames.has(homeChat.peerUsername) && (
-                      <button className="call-btn" title={`Call ${homeChat.peerUsername}`} onClick={() => startCall(homeChat.peerUsername, false)}>
+                      <button className="call-btn" disabled={!emailVerified} title={emailVerified ? `Call ${homeChat.peerUsername}` : VERIFY_FIRST} onClick={() => startCall(homeChat.peerUsername, false)}>
                         <span aria-hidden>📞</span> Call
                       </button>
                     )}
@@ -8473,7 +8595,9 @@ export default function App() {
                   {/* Timed out here: the server would refuse the join, so say why instead of offering it. */}
                   {activeTimeout
                     ? <TimeoutNotice timeout={activeTimeout} serverName={serverName} />
-                    : <button onClick={() => openPreJoin(activeChannel)} className="voice-btn">Join Voice</button>}
+                    : (!emailVerified && selectedServerId === 'demo')
+                      ? <UnverifiedNotice what="join voice in the public server" onResend={resendVerificationEmail} />
+                      : <button onClick={() => openPreJoin(activeChannel)} className="voice-btn">Join Voice</button>}
                 </div>
               ) : (() => {
                 // Everyone in the room (from the server roster), whether or not their stream has
@@ -8868,6 +8992,12 @@ export default function App() {
         />
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
+      {/* An account that has not opened its verification link yet. Dismissed for this session only. */}
+      {isAuthenticated && !emailVerified && !verifyBannerDismissed && (
+        <VerifyEmailBanner email={userEmail} onResend={resendVerificationEmail} onDismiss={() => setVerifyBannerDismissed(true)} />
+      )}
+      {/* Opened from an emailed verification link (works signed in or out). */}
+      {verifyLink && <VerifyLinkDialog result={verifyLink} signedIn={isAuthenticated} onClose={() => setVerifyLink(null)} />}
       {/* Only shown when the update could not simply be applied: mid-call, mid-sentence, and so on. */}
       {newBuild && (
         <div className="update-bar" role="status">
@@ -9398,7 +9528,15 @@ export default function App() {
               <button className={authMode==='register' ? 'active' : ''} onClick={() => { setAuthMode('register'); clearRegisterForm(); }}>Register Account</button>
             </div>
 
-            {authMode === 'login' && (
+            {authMode === 'login' && twoFactorChallenge && (
+              <TwoFactorLogin
+                serverUrl={SERVER_URL}
+                challenge={twoFactorChallenge}
+                onSignedIn={finishSignIn}
+                onCancel={(message) => { setTwoFactorChallenge(null); setAuthError(message || null) }}
+              />
+            )}
+            {authMode === 'login' && !twoFactorChallenge && (
               <form onSubmit={handleLogin} className="auth-form">
                 {authError && <div className="auth-error">{authError}</div>}
                 <label>Username</label>
@@ -9718,7 +9856,9 @@ export default function App() {
             {inviteLoadingMembers && <div className="invite-loading">Checking who’s already in…</div>}
 
             {/* Links are minted by owner/admins only; the server enforces it, this just hides the controls. */}
-            {inviteModalIsStaff && <InviteLinkSection serverId={inviteModal.serverId} authedFetch={authedFetch} />}
+            {inviteModalIsStaff && (emailVerified
+              ? <InviteLinkSection serverId={inviteModal.serverId} authedFetch={authedFetch} />
+              : <p className="profile-settings-note" role="status">{VERIFY_FIRST} Then you can invite people and create invite links.</p>)}
 
             <div className="invite-actions">
               <button className="feedback-btn primary" onClick={() => setInviteModal(null)}>Done</button>
@@ -9878,6 +10018,7 @@ export default function App() {
           <button type="button" role="tab" aria-selected={settingsTab === 'profile'} className={`profile-settings-tab${settingsTab === 'profile' ? ' active' : ''}`} onClick={() => setSettingsTab('profile')}>Profile</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'appearance'} className={`profile-settings-tab${settingsTab === 'appearance' ? ' active' : ''}`} onClick={() => setSettingsTab('appearance')}>Appearance</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'messages'} className={`profile-settings-tab${settingsTab === 'messages' ? ' active' : ''}`} onClick={() => setSettingsTab('messages')}>Messages</button>
+          <button type="button" role="tab" aria-selected={settingsTab === 'security'} className={`profile-settings-tab${settingsTab === 'security' ? ' active' : ''}`} onClick={() => setSettingsTab('security')}>Security</button>
           <button type="button" role="tab" aria-selected={settingsTab === 'feedback'} className={`profile-settings-tab${settingsTab === 'feedback' ? ' active' : ''}`} onClick={() => { setFeedbackResult(null); setFeedbackSubmitting(false); setSettingsTab('feedback') }}>Feedback</button>
         </div>
         )}
@@ -10379,6 +10520,17 @@ export default function App() {
           )}
           {settingsTab === 'messages' && (
             <BlockedPeopleSection blocked={blockedPeople} onUnblock={unblockUser} onOpenMessages={openBlockedConversation} />
+          )}
+          {settingsTab === 'security' && (
+            <SecuritySettings
+              authedFetch={authedFetch}
+              username={name}
+              email={userEmail}
+              emailVerified={emailVerified}
+              onResendVerification={resendVerificationEmail}
+              instanceOwner={instanceOwner}
+              askConfirm={askConfirm}
+            />
           )}
           {settingsTab === 'feedback' && (
           <section className="profile-settings-section">

@@ -43,7 +43,11 @@ async function startServer(opts = {}) {
     // link would send the server out to fetch it. The link preview suite turns them back on together
     // with LINK_PREVIEW_TRANSPORT, a stand-in for DNS and HTTP, so that even there nothing leaves
     // the machine (and the server keeps previews off if that stand-in cannot be loaded).
-    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', SFU_ADDRESS_CHECK: '0', LINK_PREVIEWS: '0', ...(opts.env || {}) },
+    // EMAIL_TRANSPORT=off: no mailer, whatever SMTP_* variables or server/smtp.key the developer's
+    // machine has, so a test run can never send a real email. It also means accounts do not have to
+    // verify their address (services/emailVerification.js). The email verification suite points it
+    // at fixtures/fakeMailer.js instead, which writes each message to a file.
+    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', SFU_ADDRESS_CHECK: '0', LINK_PREVIEWS: '0', EMAIL_TRANSPORT: 'off', ...(opts.env || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   running.add(child);

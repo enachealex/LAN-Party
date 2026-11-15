@@ -25,6 +25,9 @@ const { createPush, mentionedUsernames, MAX_MENTION_TARGETS, MAX_LEVEL_TARGETS }
 const { createNotificationSettings } = require('./services/notificationSettings');
 const { createLinkPreviews, ownHostnames, IMAGE_DIR: LINK_PREVIEW_DIR } = require('./services/linkPreview');
 const { createInstanceOwners } = require('./services/instanceOwners');
+const { createTwoFactor } = require('./services/twoFactor');
+const { createEmailVerification } = require('./services/emailVerification');
+const { registerSecurityRoutes } = require('./routes/security');
 const { createBlocks } = require('./services/blocks');
 const { createModeration } = require('./services/moderation');
 const { createPermissions } = require('./services/permissions');
@@ -803,12 +806,33 @@ async function main() {
     };
   }
 
+  // What makes a token a SESSION: signed with JWT_SECRET, and it names an account. Both checks
+  // that accept sessions (authMiddleware for HTTP, the socket handshake) go through here. A
+  // two-factor sign-in ticket fails the first test already (it is signed with a different key,
+  // services/twoFactor.js); the second is there so that nothing carrying a `purpose` or lacking a
+  // username can ever be mistaken for one, whatever signs such a thing in future.
+  /** @param {string} token @returns {any} the claims; throws when it is not a session */
+  function sessionClaims(token) {
+    const payload = /** @type {any} */ (jwt.verify(token, JWT_SECRET));
+    if (!payload || typeof payload.username !== 'string' || !payload.username || payload.purpose) throw new Error('not a session token');
+    return payload;
+  }
+
+  // Two-factor sign-in and email verification (services/twoFactor.js, services/emailVerification.js).
+  const twoFactor = createTwoFactor({ db, secret: JWT_SECRET });
+  const emailVerification = createEmailVerification({ db, mailer });
+  // For a route an account may not use until its email is confirmed; goes after authMiddleware.
+  const { requireVerified } = emailVerification;
+  console.log(emailVerification.required()
+    ? '[email] new accounts must verify their email address'
+    : '[email] no mailer configured: email verification is not required');
+
   function authMiddleware(req, res, next) {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Missing token' });
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
+      const payload = sessionClaims(token);
       // check if token has been revoked
       db.get('SELECT token FROM revoked_tokens WHERE token = ?', token).then(row => {
         if (row) return res.status(401).json({ error: 'Token revoked' });
@@ -824,7 +848,7 @@ async function main() {
   }
 
   // Auth + account lifecycle (routes/auth.js).
-  registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer });
+  registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerification, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer });
 
   app.get('/user/settings', authMiddleware, async (req, res) => {
     const username = req.user.username;
@@ -1389,10 +1413,10 @@ async function main() {
   // Servers / channels / membership (routes/servers.js).
   // What a change that takes access away from someone has to do afterwards (services/accessChanges.js).
   const accessChanges = createAccessChanges({ db, permissions, appRooms, enforceVoiceAccess, enforceTextAccess });
-  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, channelLists, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks, notificationSettings });
+  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, channelLists, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks, notificationSettings, requireVerified });
 
   // Shareable invite links (routes/invites.js).
-  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation });
+  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation, requireVerified });
 
   // Bans, timeouts and the audit log (routes/moderation.js). A ban removes a member with the kick
   // route's own clean-up, which is why that is handed over from registerServerRoutes.
@@ -1406,14 +1430,17 @@ async function main() {
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins, requireVerified });
 
   // Tenor / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins });
 
   // Presence / friends / direct messages (routes/social.js).
-  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor });
-  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor });
+  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor, requireVerified });
+  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor, requireVerified });
+  // Two-factor management, the owner's recovery route and the emailed verification link
+  // (routes/security.js).
+  registerSecurityRoutes({ app, db, io, authMiddleware, twoFactor, emailVerification, isInstanceOwner });
   // Blocking another account (routes/blocks.js).
   registerBlockRoutes({ app, db, io, authMiddleware, getUserByUsername, blocks, emitFriendsListUpdate, emitPendingUpdate, emitDmUnreadUpdate });
   // Notification levels: per server, channel, DM and group (routes/notifications.js).
@@ -1425,7 +1452,9 @@ async function main() {
   // Message search across channels, DMs and groups (routes/search.js).
   registerSearchRoutes({ app, db, authMiddleware, roleOf, canAccessChannel, visibleChannelsFor, getUserByUsername, mayReadDirectMessages, parseAttachment });
 
-  app.post('/files/upload', authMiddleware, (req, res) => {
+  // requireVerified: no uploads until the account's email is confirmed. Asked before the body
+  // is read, so a refused upload is not written to disk first.
+  app.post('/files/upload', authMiddleware, requireVerified, (req, res) => {
     upload.single('file')(req, res, (err) => {
       if (err) {
         if (err.code === 'LIMIT_FILE_SIZE') {
@@ -1561,7 +1590,8 @@ async function main() {
       }
       // instanceOwner: whether the caller runs this instance (may review uploaded apps). Sent here
       // as well as on login and /auth/me because this is what a client calls on every start.
-      return res.json({ servers: result, instanceOwner: await isInstanceOwner(me) });
+      // emailVerified rides along for the same reason: it is how an open client learns it.
+      return res.json({ servers: result, instanceOwner: await isInstanceOwner(me), emailVerified: await emailVerification.isVerified(me) });
     } catch (e) {
       console.error('[sync] error:', e);
       return res.status(500).json({ error: 'Server error' });
@@ -1722,7 +1752,9 @@ async function main() {
     const token = socket.handshake.auth && socket.handshake.auth.token;
     let socketUser = null;
     if (token) {
-      try { socketUser = jwt.verify(token, JWT_SECRET).username; } catch (e) { socketUser = null }
+      // sessionClaims: only a session counts. A two-factor ticket presented here leaves the socket
+      // anonymous, exactly like a forged token.
+      try { socketUser = sessionClaims(token).username; } catch (e) { socketUser = null }
     }
     // Kept on the socket as well, for code that starts from a room and needs to know whose sockets
     // are in it (enforceVoiceAccess). `clients` cannot answer that: it is only filled in by 'join',
@@ -1743,6 +1775,10 @@ async function main() {
     // one of its voice rooms, asks this first. Asked of the database each time, so a timeout
     // starts and ends for a socket that is already connected without anything being told to it.
     const timedOutIn = (serverId) => moderation.timeoutOf(serverId, socketUser);
+    // Why this account may not do something reserved for a confirmed email address, or null
+    // (services/emailVerification.js). Asked of the database each time, like a timeout, so
+    // confirming takes effect on a socket that is already connected.
+    const unverifiedRefusal = () => emailVerification.refusalFor(socketUser);
     // Taking part in a voice room's activity: a member, and not timed out.
     const mayActInVoice = async (serverId) => (await mayUseVoice(serverId)) && !(await timedOutIn(serverId));
 
@@ -1887,6 +1923,12 @@ async function main() {
       // back with the refusal like any other, so what they typed is not lost.
       const timeout = await timedOutIn(serverId);
       if (timeout) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'timed-out', until: timeout.until }); return; }
+      // The public commons is open to every account the moment it registers, so posting there
+      // waits for a confirmed email. Other servers are joined by invitation and are not affected.
+      if (serverId === DEMO_ID) {
+        const refusal = await unverifiedRefusal();
+        if (refusal) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: refusal.code, error: refusal.error }); return; }
+      }
       const author = clients[socket.id]?.name || 'Anon';
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);
@@ -2320,6 +2362,12 @@ async function main() {
         // A member, but not of this channel (or it does not exist): refused at the door.
         // Or timed out in this server: refused the same way, with the reason so the client can say so.
         if (!(await mayBeInVoice(socketUser, serverId, channelId))) { socket.emit('voice:removed', await voiceRemovedPayload(socketUser, serverId, channelId)); return; }
+        // The commons' voice rooms are "posting in the commons" with a microphone: the same wait
+        // for a confirmed email as its text channels.
+        if (serverId === DEMO_ID) {
+          const refusal = await unverifiedRefusal();
+          if (refusal) { socket.emit('voice:removed', { serverId, channelId, reason: refusal.code, error: refusal.error }); return; }
+        }
         // An older client that gives up on the SFU says so by joining the room it is already in
         // (that made the server send it the roster again, which it then called directly). Its
         // producers are still registered here, sending nothing; closing them is what lets everyone
@@ -2409,6 +2457,10 @@ async function main() {
     };
     socket.on('call:invite', async ({ to, video } = {}) => {
       if (!socketUser || !to) return;
+      // Calls wait for a confirmed email, in both directions. This is the caller's own state, so
+      // they are told plainly (unlike a block, below).
+      const refusal = await unverifiedRefusal();
+      if (refusal) { socket.emit('call:refused', { to, reason: refusal.code, error: refusal.error }); return; }
       // A block between the two, in either direction, and the call never rings. The caller is told
       // what they are told when the other person is not online, and nothing else: it must not be
       // possible to tell a block from an absence. The lookup runs before the "are they online"
@@ -2418,8 +2470,10 @@ async function main() {
       if (blocked || !room || room.size === 0) { socket.emit('call:unavailable', { to }); return; }
       io.to(`user:${to}`).emit('call:incoming', { from: socketUser, fromSocket: socket.id, video: !!video });
     });
-    socket.on('call:accept', ({ to } = {}) => { // to = caller's socket id
+    socket.on('call:accept', async ({ to } = {}) => { // to = caller's socket id
       if (!to) return;
+      const refusal = await unverifiedRefusal();
+      if (refusal) { socket.emit('call:refused', { reason: refusal.code, error: refusal.error }); return; }
       io.to(to).emit('call:accepted', { from: socketUser, fromSocket: socket.id });
       // Tell this user's OTHER devices to stop ringing.
       socket.to(`user:${socketUser}`).emit('call:handled');
