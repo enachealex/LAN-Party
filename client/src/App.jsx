@@ -2520,7 +2520,7 @@ export default function App() {
   const selectMessageFlow = (flow) => {
     if (flow !== 'top' && flow !== 'bottom') return
     setMessageFlow(flow)
-    patchUserSettings({ messageFlow: flow })
+    persistSetting({ messageFlow: flow })
   }
 
   // UI sound preferences (persisted per-user). Toggling on plays a confirmation blip so the change
@@ -2530,14 +2530,14 @@ export default function App() {
     setUiSoundsEnabled(next)
     setUiSoundPrefs({ enabled: next })
     if (next) { unlockUiSounds(); playUiSound('toggle') }
-    patchUserSettings({ uiSounds: { enabled: next, volume: uiSoundVolume } })
+    persistSetting({ uiSounds: { enabled: next, volume: uiSoundVolume } })
   }
   const changeUiSoundVolume = (v) => {
     const vol = Math.max(0, Math.min(1, v))
     setUiSoundVolume(vol)
     setUiSoundPrefs({ volume: vol })
     if (uiSoundsEnabled) playUiSound('tap')
-    patchUserSettings({ uiSounds: { enabled: uiSoundsEnabled, volume: vol } })
+    persistSetting({ uiSounds: { enabled: uiSoundsEnabled, volume: vol } })
   }
 
   // Replace one quick-reaction slot (from Settings). If the picked emoji already sits in
@@ -2548,13 +2548,13 @@ export default function App() {
       const existing = next.indexOf(emoji)
       if (existing !== -1 && existing !== index) next[existing] = next[index]
       next[index] = emoji
-      patchUserSettings({ quickReactions: next })
+      persistSetting({ quickReactions: next })
       return next
     })
   }
   const resetQuickReactions = () => {
     setQuickReactions(MESSAGE_REACTIONS)
-    patchUserSettings({ quickReactions: MESSAGE_REACTIONS })
+    persistSetting({ quickReactions: MESSAGE_REACTIONS })
   }
   // Open the reaction picker anchored to a quick-reaction slot in Settings.
   const openQuickReactionEditor = (index, event) => {
@@ -5674,7 +5674,7 @@ export default function App() {
   // survives reloads and follows you between devices. HomeLeftPanel debounces the calls.
   const saveHomeLayout = (homeLayout) => {
     setUserSettings((prev) => ({ ...(prev || {}), homeLayout }))
-    patchUserSettings({ homeLayout })
+    persistSetting({ homeLayout })
   }
 
   // Remove a friend (both sides). The server then sends friend:list-updated to both of you, which
@@ -7417,6 +7417,17 @@ export default function App() {
     }
   }
 
+  // A setting changed by its own control (sounds, message direction, quick reactions, emoji...).
+  // Saved at once, and ALSO written into the copies of the settings this page holds: the Settings
+  // screen works on a snapshot taken when it opened, and both picking a colour scheme and pressing
+  // Save re-apply that snapshot. Left out of it, the change was silently undone — turning sounds off
+  // and then choosing a colour scheme turned them back on.
+  const persistSetting = (patch) => {
+    setUserSettings((prev) => ({ ...(prev || {}), ...patch }))
+    setEditingSettings((snapshot) => (snapshot ? { ...snapshot, ...patch } : snapshot))
+    return patchUserSettings(patch)
+  }
+
   // Insert text (an emoji or :shortcode:) into the composer at the caret.
   const insertIntoComposer = (insert) => {
     setText((prev) => `${prev}${insert}`)
@@ -7435,7 +7446,7 @@ export default function App() {
       const next = { ...prev }
       if (toneKey === 'default') delete next[base]
       else next[base] = toneKey
-      patchUserSettings({ emojiSkinTones: next })
+      persistSetting({ emojiSkinTones: next })
       return next
     })
   }
@@ -7455,7 +7466,7 @@ export default function App() {
       if (prev.some((c) => c.url === url)) return prev
       const name = makeEmojiName(suggestedName, prev)
       const next = [...prev, { name, url }]
-      patchUserSettings({ customEmojis: next })
+      persistSetting({ customEmojis: next })
       return next
     })
   }
@@ -7463,7 +7474,7 @@ export default function App() {
   const deletePersonalEmoji = (name) => {
     setCustomEmojis((prev) => {
       const next = prev.filter((c) => c.name !== name)
-      patchUserSettings({ customEmojis: next })
+      persistSetting({ customEmojis: next })
       return next
     })
   }
