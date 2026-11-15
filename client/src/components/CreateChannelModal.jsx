@@ -2,13 +2,15 @@ import React, { useEffect, useRef, useState } from 'react'
 
 // Modal for creating a channel: name + type (Text/Voice) + privacy (Public/Private).
 // Opened from either section's "+" — the clicked section pre-selects the type, but the user can
-// switch to make either kind. When Private is chosen, pick which members get access (owner/admins
-// always have access, so they aren't listed).
-export default function CreateChannelModal({ open, initialType = 'text', serverName = 'this server', members = [], onCreate, onClose }) {
+// switch to make either kind. When Private is chosen, pick which roles and members get access
+// (owner/admins always have access, so they aren't listed). `categoryName` is set when the "+" of
+// a category was used: the channel is filed there, which changes nothing about who can open it.
+export default function CreateChannelModal({ open, initialType = 'text', serverName = 'this server', categoryName = '', members = [], roles = [], onCreate, onClose }) {
   const [name, setName] = useState('')
   const [type, setType] = useState(initialType)
   const [privacy, setPrivacy] = useState('public')
   const [allowed, setAllowed] = useState([]) // usernames granted access to the private channel
+  const [allowedRoles, setAllowedRoles] = useState([]) // ids of the roles granted access to it
   const [busy, setBusy] = useState(false)
   const inputRef = useRef(null)
 
@@ -19,6 +21,7 @@ export default function CreateChannelModal({ open, initialType = 'text', serverN
       setType(initialType === 'voice' ? 'voice' : 'text')
       setPrivacy('public')
       setAllowed([])
+      setAllowedRoles([])
       setBusy(false)
       setTimeout(() => inputRef.current?.focus(), 40)
     }
@@ -37,11 +40,15 @@ export default function CreateChannelModal({ open, initialType = 'text', serverN
     setAllowed((prev) => (prev.includes(username) ? prev.filter((u) => u !== username) : [...prev, username]))
   }
 
+  const toggleRole = (roleId) => {
+    setAllowedRoles((prev) => (prev.includes(roleId) ? prev.filter((id) => id !== roleId) : [...prev, roleId]))
+  }
+
   const submit = async () => {
     const clean = name.trim()
     if (!clean || busy) return
     setBusy(true)
-    try { await onCreate?.({ name: clean, type, privacy, members: privacy === 'private' ? allowed : [] }) }
+    try { await onCreate?.({ name: clean, type, privacy, members: privacy === 'private' ? allowed : [], roles: privacy === 'private' ? allowedRoles : [] }) }
     finally { setBusy(false) }
   }
 
@@ -49,7 +56,7 @@ export default function CreateChannelModal({ open, initialType = 'text', serverN
     <div className="cc-overlay" onClick={onClose}>
       <div className="cc-modal" role="dialog" aria-label="Create channel" onClick={(e) => e.stopPropagation()}>
         <div className="cc-title">Create Channel</div>
-        <div className="cc-sub">in {serverName}</div>
+        <div className="cc-sub">in {serverName}{categoryName ? ` › ${categoryName}` : ''}</div>
 
         <div className="cc-label">Channel type</div>
         <div className="cc-type-row">
@@ -88,6 +95,28 @@ export default function CreateChannelModal({ open, initialType = 'text', serverN
             <span className="cc-type-text"><span className="cc-type-name">Private</span><span className="cc-type-hint">Only you, admins &amp; chosen members</span></span>
           </button>
         </div>
+
+        {privacy === 'private' && roles.length > 0 && (
+          <>
+            <div className="cc-label">Roles with access {allowedRoles.length > 0 && <span className="cc-count">· {allowedRoles.length} selected</span>}</div>
+            <div className="cc-members">
+              {roles.map((role) => (
+                <button
+                  type="button"
+                  key={role.id}
+                  className={`cc-member${allowedRoles.includes(role.id) ? ' on' : ''}`}
+                  onClick={() => toggleRole(role.id)}
+                  aria-pressed={allowedRoles.includes(role.id)}
+                >
+                  <span className="cc-member-check">{allowedRoles.includes(role.id) ? '✓' : ''}</span>
+                  <span className="role-dot" style={{ background: role.color || 'transparent' }} aria-hidden="true" />
+                  <span className="cc-member-name">{role.name}</span>
+                </button>
+              ))}
+            </div>
+            <div className="cc-members-note">Everyone who holds one of these roles can open the channel.</div>
+          </>
+        )}
 
         {privacy === 'private' && (
           <>

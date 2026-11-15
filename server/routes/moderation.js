@@ -3,10 +3,13 @@
 // of a server is the kick route's own clean-up, shared from routes/servers.js so that a ban can
 // never forget a step a kick performs.
 //
-// Every route here is for owner/admins of a real server. The public commons is refused by name
-// before anything else is looked at: it has no staff, and nobody is ever put out of it.
+// Every route here is for people who hold the permission it names in a real server
+// (services/permissions.js): `ban` for bans and the ban list, `timeout` for timeouts, and
+// `view_audit_log` for the log. The owner and admins hold all three; a custom role can give any
+// of them to a member. The public commons is refused by name before anything else is looked at:
+// it has no staff, and nobody is ever put out of it.
 const { rateLimit } = require('../rateLimit');
-const { mayModerate, parseReason, parseMinutes, AUDIT, AUDIT_PAGE_DEFAULT, AUDIT_PAGE_MAX } = require('../services/moderation');
+const { moderationRefusal, parseReason, parseMinutes, AUDIT, AUDIT_PAGE_DEFAULT, AUDIT_PAGE_MAX } = require('../services/moderation');
 
 // Counted per account. Generous for someone actually dealing with a problem; a ceiling for a
 // script (or a stolen admin token) banning its way through a member list, since every ban of a
@@ -16,7 +19,7 @@ const MODERATION_WRITE_LIMIT = { id: 'moderation-write', windowMs: 5 * 60_000, m
 const MODERATION_READ_LIMIT = { id: 'moderation-read', windowMs: 60_000, max: 120, keyOf };
 
 /** @param {Record<string, any>} deps */
-function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, moderation, removeMemberFromServer, broadcastServerState, enforceVoiceAccess }) {
+function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, moderation, removeMemberFromServer, broadcastServerState, enforceVoiceAccess }) {
   // Express 4 does not catch a rejected async handler, and an unhandled rejection ends the process.
   const safely = (handler) => async (req, res) => {
     try {
@@ -28,35 +31,38 @@ function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf
     }
   };
 
-  // The gate every route passes first: a real server, not the commons, and the caller is staff of
-  // THIS server (the role is read for the server in the URL, so being an admin somewhere else is
-  // worth nothing here). Answers the request itself when it fails.
-  async function staffServer(req, res) {
+  // The gate every route passes first: a real server, not the commons, and the caller holds
+  // `permission` in THIS server (it is read for the server in the URL, so being an admin somewhere
+  // else is worth nothing here). Answers the request itself when it fails.
+  async function staffServer(req, res, permission) {
     const serverId = req.params.serverId;
     if (serverId === DEMO_ID) { res.status(400).json({ error: 'The public server has no moderation' }); return null; }
     const srv = await db.get('SELECT id, name, owner FROM servers WHERE id = ?', serverId);
     if (!srv) { res.status(404).json({ error: 'Server not found' }); return null; }
-    const myRole = await roleOf(serverId, req.user.username);
-    if (myRole !== 'owner' && myRole !== 'admin') { res.status(403).json({ error: 'Only server admins can do that' }); return null; }
-    return { srv, myRole };
+    if (!(await permissions.can(serverId, req.user.username, permission))) { res.status(403).json({ error: 'Only server admins can do that' }); return null; }
+    return { srv };
   }
 
-  // The staff gate, then the rank rules for acting on the member named in the URL.
-  async function moderationTarget(req, res) {
-    const gate = await staffServer(req, res);
+  // The same gate, then the rank rules for acting on the member named in the URL
+  // (permissions.mayActOn: only on someone ranked strictly below you).
+  async function moderationTarget(req, res, permission) {
+    const gate = await staffServer(req, res, permission);
     if (!gate) return null;
     const target = String(req.params.username || '').trim();
     if (!target) { res.status(400).json({ error: 'Username required' }); return null; }
-    const targetRole = await roleOf(gate.srv.id, target);
-    const allowed = mayModerate({ actor: req.user.username, actorRole: gate.myRole, target, targetRole, owner: gate.srv.owner || null });
-    if (!allowed.ok) { res.status(allowed.status).json({ error: allowed.error }); return null; }
-    return { ...gate, target, targetRole };
+    const allowed = await permissions.mayActOn(gate.srv.id, req.user.username, target, permission);
+    if (!allowed.ok) {
+      const refusal = moderationRefusal(allowed.reason, allowed.actorRole);
+      res.status(refusal.status).json({ error: refusal.error });
+      return null;
+    }
+    return { ...gate, target, targetRole: allowed.targetRole };
   }
 
   // --- Bans ---
 
   app.get('/servers/:serverId/bans', authMiddleware, rateLimit(MODERATION_READ_LIMIT), safely(async (req, res) => {
-    const gate = await staffServer(req, res);
+    const gate = await staffServer(req, res, 'ban');
     if (!gate) return undefined;
     return res.json({ bans: await moderation.listBans(gate.srv.id) });
   }));
@@ -65,7 +71,7 @@ function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf
   // member (then it only keeps them from joining), but must be a real account: a ban on a name
   // nobody holds would fall on whoever registers it later.
   app.post('/servers/:serverId/bans/:username', authMiddleware, rateLimit(MODERATION_WRITE_LIMIT), safely(async (req, res) => {
-    const ctx = await moderationTarget(req, res);
+    const ctx = await moderationTarget(req, res, 'ban');
     if (!ctx) return undefined;
     const { srv, target, targetRole } = ctx;
     const parsed = parseReason((req.body || {}).reason);
@@ -82,7 +88,7 @@ function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf
   // Unban. They are not put back: whoever was removed by the ban is where a kick would have left
   // them, and comes back when staff invite them by username.
   app.delete('/servers/:serverId/bans/:username', authMiddleware, rateLimit(MODERATION_WRITE_LIMIT), safely(async (req, res) => {
-    const gate = await staffServer(req, res);
+    const gate = await staffServer(req, res, 'ban');
     if (!gate) return undefined;
     const target = String(req.params.username || '').trim();
     if (!(await moderation.unban(gate.srv.id, target))) return res.status(404).json({ error: `${target} is not banned` });
@@ -100,7 +106,7 @@ function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf
   };
 
   app.post('/servers/:serverId/timeouts/:username', authMiddleware, rateLimit(MODERATION_WRITE_LIMIT), safely(async (req, res) => {
-    const ctx = await moderationTarget(req, res);
+    const ctx = await moderationTarget(req, res, 'timeout');
     if (!ctx) return undefined;
     const { srv, target, targetRole } = ctx;
     const length = parseMinutes((req.body || {}).minutes);
@@ -119,7 +125,7 @@ function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf
 
   // Lift a timeout before it runs out. Held to the same rank rules as placing one.
   app.delete('/servers/:serverId/timeouts/:username', authMiddleware, rateLimit(MODERATION_WRITE_LIMIT), safely(async (req, res) => {
-    const ctx = await moderationTarget(req, res);
+    const ctx = await moderationTarget(req, res, 'timeout');
     if (!ctx) return undefined;
     const { srv, target } = ctx;
     if (!(await moderation.clearTimeoutFor(srv.id, target))) return res.status(404).json({ error: `${target} is not timed out` });
@@ -136,7 +142,7 @@ function registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf
   // or a client with a broken one would be handed the newest page and append it to the wrong place.
   const positiveInt = (value) => (typeof value === 'string' && /^\d{1,15}$/.test(value) && Number(value) >= 1 ? Number(value) : null);
   app.get('/servers/:serverId/audit', authMiddleware, rateLimit(MODERATION_READ_LIMIT), safely(async (req, res) => {
-    const gate = await staffServer(req, res);
+    const gate = await staffServer(req, res, 'view_audit_log');
     if (!gate) return undefined;
     let limit = AUDIT_PAGE_DEFAULT;
     if (req.query.limit !== undefined) {

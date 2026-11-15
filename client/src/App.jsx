@@ -44,6 +44,9 @@ import BlockedMessage from './components/BlockedMessage'
 import MemberActionItems from './components/MemberActionItems'
 import ModerationDialog from './components/ModerationDialog'
 import ServerBansModal from './components/ServerBansModal'
+import ServerSettingsModal from './components/ServerSettingsModal'
+import ProfileRoles from './components/ProfileRoles'
+import { effectivePermissions, memberActionsFor, NO_MEMBER_ACTIONS, roleColorOf, rolesHeldBy } from './permissions'
 import AuditLogModal from './components/AuditLogModal'
 import BlockedPeopleSection from './components/BlockedPeopleSection'
 import { TimeoutNotice, BlockedNotice } from './components/ComposerNotice'
@@ -653,7 +656,7 @@ function pinPreview(m) {
   return m.text || '(empty message)'
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones }) {
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
   const [reactionPickerPos, setReactionPickerPos] = useState(null) // { left, top } for the full-library picker
@@ -876,7 +879,8 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
           }}
           aria-pressed={showTimestamp}
         >
-          {!isOutgoing && <div className="msg-author">{message.author}</div>}
+          {/* authorColor: the colour of the author's highest coloured role, in a server channel. */}
+          {!isOutgoing && <div className="msg-author" style={authorColor ? { color: authorColor } : undefined}>{message.author}</div>}
           {Array.isArray(message.quotes) && message.quotes.length > 0 && (
             <div className="msg-quotes">
               {message.quotes.map((q, i) => (
@@ -1168,6 +1172,7 @@ export default function App() {
   const [myTimeouts, setMyTimeouts] = useState({})
   const [moderationRequest, setModerationRequest] = useState(null) // { kind: 'timeout' | 'ban', username, serverId, serverName } | null
   const [bansModal, setBansModal] = useState(null)   // { serverId, serverName } | null
+  const [serverSettingsModal, setServerSettingsModal] = useState(null) // { serverId, serverName } | null
   const [auditModal, setAuditModal] = useState(null) // { serverId, serverName } | null
   // "Now", refreshed whenever a timeout on screen runs out: one of mine, or one marked in the
   // member list. A timeout ends by the clock, so nothing arrives from the server to say it is over.
@@ -1454,12 +1459,14 @@ export default function App() {
     e.preventDefault()
     setPinBarMenu({ x: Math.min(e.clientX, window.innerWidth - 190), y: Math.min(e.clientY, window.innerHeight - 90) })
   }
-  const openMemberMenu = (e, member, role, canManage = false) => {
+  // Who the menu is about. What it offers is worked out when it is drawn (memberActionsOf), so
+  // it follows the roles and permissions of the moment rather than those of when it was opened.
+  const openMemberMenu = (e, member, role) => {
     e.preventDefault()
     setMemberMenu({
       x: Math.min(e.clientX, window.innerWidth - 190),
       y: Math.min(e.clientY, window.innerHeight - 120),
-      username: member.username, name: member.name, role, canManage, timedOut: Boolean(member.timeoutUntil),
+      username: member.username, name: member.name, role, timedOut: Boolean(member.timeoutUntil),
     })
   }
   // Private message composer, opened from a member's right-click menu in a server or group chat.
@@ -1474,6 +1481,8 @@ export default function App() {
   // Create-channel modal (name + type + privacy); channelModalType pre-selects the clicked section.
   const [showChannelModal, setShowChannelModal] = useState(false)
   const [channelModalType, setChannelModalType] = useState('text')
+  // The category whose "+" opened the modal ({ id, name }), or null: the new channel is filed there.
+  const [channelModalCategory, setChannelModalCategory] = useState(null)
   // Manage-access modal for an existing private channel: { id, name } or null.
   const [manageAccessChannel, setManageAccessChannel] = useState(null)
   // Mirrors activeChannel so socket callbacks (bound once) never read stale closures.
@@ -3447,7 +3456,9 @@ export default function App() {
       // clock here means everything that shows or counts one down can compare it with Date.now().
       const skew = typeof data.now === 'number' ? Date.now() - data.now : 0
       const members = Array.from(map.values()).map((m) => (m.timeoutUntil ? { ...m, timeoutUntil: m.timeoutUntil + skew } : m))
-      setServerState({ server: data.server, members, myRole: data.myRole || 'member' })
+      // myPermissions: what the server says I may do here (roles included). Null from a server
+      // that predates custom roles; effectivePermissions() then goes by myRole alone.
+      setServerState({ server: data.server, members, myRole: data.myRole || 'member', myPermissions: Array.isArray(data.myPermissions) ? data.myPermissions : null })
       // My own timeout in this server, or none: the state is sent again whenever it changes.
       const sid = data.server?.id
       if (sid) {
@@ -4181,17 +4192,20 @@ export default function App() {
   }
 
   // The "+" in a channel section opens the create-channel modal, pre-selecting that section's type.
-  const createChannel = (type) => {
+  // A category's own "+" passes its id, and the channel is filed there.
+  const createChannel = (type, categoryId = null) => {
     setChannelModalType(type === 'voice' ? 'voice' : 'text')
+    const category = categoryId ? (serverState?.server?.categories || []).find((c) => c.id === categoryId) : null
+    setChannelModalCategory(category ? { id: category.id, name: category.name } : null)
     setShowChannelModal(true)
   }
 
   // Submit from the create-channel modal (name + chosen type + privacy).
-  const submitCreateChannel = async ({ name: chName, type, privacy, members }) => {
+  const submitCreateChannel = async ({ name: chName, type, privacy, members, roles }) => {
     const sid = currentServerId()
     const t = token || localStorage.getItem('lanparty_token')
     try {
-      const res = await fetch(`${SERVER_URL}/servers/${encodeURIComponent(sid)}/channels`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: chName, type, privacy, members: privacy === 'private' ? (members || []) : [] }) })
+      const res = await fetch(`${SERVER_URL}/servers/${encodeURIComponent(sid)}/channels`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` }, body: JSON.stringify({ name: chName, type, privacy, members: privacy === 'private' ? (members || []) : [], roles: privacy === 'private' ? (roles || []) : [], ...(channelModalCategory ? { categoryId: channelModalCategory.id } : {}) }) })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Could not create channel')
       setShowChannelModal(false)
@@ -4256,6 +4270,50 @@ export default function App() {
     if (!res.ok) alert((await res.json()).error || 'Delete failed')
   }
 
+  // ---- Categories, channel order and roles. Each asks the server and shows its answer if it is
+  // a refusal; the new list arrives by itself in the next server:state. ----
+  const serverCall = async (sid, path, init, failure) => {
+    try {
+      const res = await authedFetch(`/servers/${encodeURIComponent(sid)}${path}`, init)
+      if (!res.ok) setToast((await res.json().catch(() => ({}))).error || failure)
+      return res.ok
+    } catch (_) {
+      setToast('Could not reach the server')
+      return false
+    }
+  }
+  const createCategory = async () => {
+    const sid = currentServerId() // read before the question: the answer is about this server
+    const name2 = ((await askPrompt({ title: 'New category', label: 'Category name', placeholder: 'e.g. Games', submitLabel: 'Create' })) || '').trim()
+    if (!name2) return
+    await serverCall(sid, '/categories', { method: 'POST', body: JSON.stringify({ name: name2 }) }, 'Could not create the category')
+  }
+  const renameCategory = async (categoryId, oldName) => {
+    const sid = currentServerId()
+    const name2 = ((await askPrompt({ title: 'Rename category', label: 'Category name', initial: oldName || '', submitLabel: 'Rename' })) || '').trim()
+    if (!name2 || name2 === oldName) return
+    await serverCall(sid, `/categories/${encodeURIComponent(categoryId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) }, 'Could not rename the category')
+  }
+  const deleteCategory = async (categoryId, categoryName) => {
+    const sid = currentServerId()
+    const ok = await askConfirm({
+      title: `Delete the category “${categoryName}”?`,
+      message: 'Only the heading goes. Its channels stay, with their messages and with the same people able to open them; they are listed outside any category again.',
+      submitLabel: 'Delete category',
+    })
+    if (!ok) return
+    await serverCall(sid, `/categories/${encodeURIComponent(categoryId)}`, { method: 'DELETE' }, 'Could not delete the category')
+  }
+  const moveCategory = (categoryId, direction) =>
+    serverCall(currentServerId(), `/categories/${encodeURIComponent(categoryId)}/move`, { method: 'POST', body: JSON.stringify({ direction }) }, 'Could not move the category')
+  const moveChannel = (channelId, direction) =>
+    serverCall(currentServerId(), `/channels/${encodeURIComponent(channelId)}/move`, { method: 'POST', body: JSON.stringify({ direction }) }, 'Could not move the channel')
+  const setChannelCategory = (channelId, categoryId) =>
+    serverCall(currentServerId(), `/channels/${encodeURIComponent(channelId)}/category`, { method: 'PUT', body: JSON.stringify({ categoryId: categoryId || null }) }, 'Could not move the channel')
+  // Give a member a role, or take it back (from the member menu and the profile card).
+  const toggleMemberRole = (username, roleId, on) =>
+    serverCall(currentServerId(), `/members/${encodeURIComponent(username)}/roles/${encodeURIComponent(roleId)}`, { method: on ? 'PUT' : 'DELETE' }, on ? `Could not give ${username} the role` : `Could not take the role from ${username}`)
+
   // ---- Membership management (invite / leave / kick / roles) ----
   // Open the invite dialog for a server and load its current members (so friends already in show a ✓).
   const openServerInvite = async (serverId, serverName) => {
@@ -4297,8 +4355,10 @@ export default function App() {
       setInviteBusy((prev) => { const n = new Set(prev); n.delete(username); return n })
     }
   }
-  // Link controls in the invite dialog are for owner/admins. The rail already knows my role in each server.
-  const inviteModalIsStaff = !!inviteModal && ['owner', 'admin'].includes(serversList.find((s) => s.id === inviteModal.serverId)?.role)
+  // Link controls in the invite dialog are for people who may invite (owner, admins, or a role
+  // that permits it). The rail already knows what I may do in each server.
+  const inviteModalServer = inviteModal ? serversList.find((s) => s.id === inviteModal.serverId) : null
+  const inviteModalIsStaff = !!inviteModalServer && effectivePermissions(inviteModalServer.role, inviteModalServer.permissions).has('invite')
   // Accept the invite link this page was opened through, then land in the server it led to.
   const acceptServerInvite = async () => {
     const joined = await inviteJoin.accept(authedFetch)
@@ -6247,6 +6307,22 @@ export default function App() {
   const isHomeView = selectedServerId === 'home'
   // Channels of the server on screen; the active channel's type drives which panel renders.
   const serverChannels = serverState?.server?.channels || []
+  // Custom roles and categories of the server on screen, and what I may do in it. All of it is
+  // what the server sent in server:state; it decides what is SHOWN, and the server decides again
+  // on every request (client/src/permissions.ts).
+  const serverRoles = serverState?.server?.roles || []
+  const serverCategories = serverState?.server?.categories || []
+  const myPermissions = effectivePermissions(serverState?.myRole, serverState?.myPermissions)
+  const viewerInServer = { username: name, role: serverState?.myRole || 'member', roles: (serverState?.members || []).find((m) => m.username === name)?.roles || [] }
+  // The colour each member's name is shown in: that of their highest coloured role.
+  const nameColors = new Map((serverState?.members || []).filter((m) => m.username).map((m) => [m.username, roleColorOf(m, serverRoles)]))
+  // What I may do to this member here: kick, time out, ban, and which roles I may tick for them.
+  // Nothing outside a real server (Home, a group chat, the public commons).
+  const memberActionsOf = (username) => {
+    if (isHomeView || currentServerId() === 'demo' || !username) return NO_MEMBER_ACTIONS
+    const target = (serverState?.members || []).find((m) => m.username === username)
+    return target ? memberActionsFor(viewerInServer, myPermissions, target, serverRoles) : NO_MEMBER_ACTIONS
+  }
   // Ids of pinned messages in the current channel (for the Pin/Unpin menu toggle).
   const pinnedIdSet = useMemo(() => new Set(channelPins.map((p) => p.id)), [channelPins])
   // Total unreads per server for the rail badges.
@@ -6339,6 +6415,9 @@ export default function App() {
       name: memberName,
       username: member.username || null,
       role: member.role || (member.username === serverState?.server?.owner ? 'owner' : 'member'),
+      // Ids of their custom roles, and the colour their name is shown in because of them.
+      roles: member.roles || [],
+      color: (member.username && nameColors.get(member.username)) || null,
       online: member.online !== false,
       isYou: member.id === socket?.id || member.username === name || memberName === name,
       // Timed out in this server right now (the list marks them, and staff get "Remove time out").
@@ -8028,6 +8107,18 @@ export default function App() {
         socketId={socket?.id}
         onSelectMember={openMemberProfile}
         myRole={serverState?.myRole || 'member'}
+        myPermissions={myPermissions}
+        viewer={viewerInServer}
+        serverRoles={serverRoles}
+        categories={serverCategories}
+        onCreateCategory={createCategory}
+        onRenameCategory={renameCategory}
+        onDeleteCategory={deleteCategory}
+        onMoveCategory={moveCategory}
+        onMoveChannel={moveChannel}
+        onSetChannelCategory={setChannelCategory}
+        onOpenServerSettings={(serverId, serverName2) => setServerSettingsModal({ serverId, serverName: serverName2 || 'this server' })}
+        onToggleMemberRole={toggleMemberRole}
         serverOwner={serverState?.server?.owner || null}
         currentUsername={name}
         onInviteServer={openServerInvite}
@@ -8226,6 +8317,7 @@ export default function App() {
                         onPin={pinMessage}
                         onUnpin={unpinMessage}
                         isPinned={pinnedIdSet.has(m.id)}
+                        authorColor={nameColors.get(m.author) || null}
                       />
                     )
                     // From someone I blocked: collapsed behind "Show", one message at a time.
@@ -8540,7 +8632,9 @@ export default function App() {
         open={showChannelModal}
         initialType={channelModalType}
         serverName={serverName}
+        categoryName={channelModalCategory?.name || ''}
         members={(serverState?.members || []).filter((m) => m.username && m.role !== 'owner' && m.role !== 'admin' && m.username !== name)}
+        roles={currentServerId() === 'demo' ? [] : serverRoles}
         onCreate={submitCreateChannel}
         onClose={() => setShowChannelModal(false)}
       />
@@ -8549,6 +8643,7 @@ export default function App() {
         serverId={currentServerId()}
         channel={manageAccessChannel}
         roster={(serverState?.members || []).filter((m) => m.username !== name)}
+        roles={serverRoles}
         serverUrl={SERVER_URL}
         token={token || localStorage.getItem('lanparty_token')}
         onClose={() => setManageAccessChannel(null)}
@@ -8589,6 +8684,15 @@ export default function App() {
                     )}
                   </div>
                 )}
+                {/* Their roles in the server on screen, and ticks for whoever may hand roles out to them. */}
+                {!isHomeView && currentServerId() !== 'demo' && (serverState?.members || []).some((m) => m.username === profileCard.username) && (
+                  <ProfileRoles
+                    username={profileCard.username}
+                    held={rolesHeldBy((serverState?.members || []).find((m) => m.username === profileCard.username), serverRoles)}
+                    options={memberActionsOf(profileCard.username).roles}
+                    onToggle={toggleMemberRole}
+                  />
+                )}
                 {/* Block or unblock, for anyone but yourself. The card closes first, so the question
                     that follows is not asked from underneath it. */}
                 {profileCard.username && profileCard.username !== name && (
@@ -8617,6 +8721,19 @@ export default function App() {
       )}
       {auditModal && (
         <AuditLogModal serverId={auditModal.serverId} serverName={auditModal.serverName} authedFetch={authedFetch} onClose={() => setAuditModal(null)} />
+      )}
+      {/* Server settings (Roles). syncKey makes it reload when the roles of the server on screen
+          change under it; for another server it shows what it loaded and what it changes itself. */}
+      {serverSettingsModal && (
+        <ServerSettingsModal
+          serverId={serverSettingsModal.serverId}
+          serverName={serverSettingsModal.serverName}
+          currentUsername={name}
+          authedFetch={authedFetch}
+          askConfirm={askConfirm}
+          syncKey={serverSettingsModal.serverId === serverState?.server?.id ? JSON.stringify([serverRoles, (serverState?.members || []).map((m) => [m.username, m.role, m.roles])]) : ''}
+          onClose={() => setServerSettingsModal(null)}
+        />
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
       {/* Only shown when the update could not simply be applied: mid-call, mid-sentence, and so on. */}
@@ -9001,7 +9118,7 @@ export default function App() {
         <div className="members-panel-header">
           <div>{isHomeView ? 'Members' : 'Server Members'} — {membersPanelUsers.length}</div>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {!isHomeView && (serverState?.myRole === 'owner' || serverState?.myRole === 'admin') && currentServerId() !== 'demo' && (
+            {!isHomeView && myPermissions.has('invite') && currentServerId() !== 'demo' && (
               <button className="members-invite-btn" title="Invite people" onClick={() => openServerInvite(currentServerId(), serverState?.server?.name)}>+ Invite</button>
             )}
             {activeGroupChat && (
@@ -9017,13 +9134,10 @@ export default function App() {
           {membersPanelUsers.length > 0 ? (
             <ul className="members-panel-list">
               {membersPanelUsers.map((member) => {
-                const myRole = serverState?.myRole
-                const isStaff = myRole === 'owner' || myRole === 'admin'
                 const role = member.role || 'member'
-                const canManage = !isHomeView && currentServerId() !== 'demo' && isStaff && !member.isYou && member.username
-                  && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
-                // Everyone gets a menu (for Private message); only staff get the manage entries. This
-                // is the group-chat path, which is why it can't be staff-gated like it used to be.
+                // Everyone gets a menu (for Private message); the manage entries in it follow what the
+                // viewer may do to this member (memberActionsOf). This is the group-chat path too,
+                // which is why the menu itself can't be staff-gated.
                 const hasMenu = Boolean(member.username) && !member.isYou
                 return (
                   <li key={member.id}>
@@ -9031,12 +9145,12 @@ export default function App() {
                       type="button"
                       className="members-panel-row"
                       onClick={() => member.username && openMemberProfile(member.username)}
-                      onContextMenu={hasMenu ? (e) => openMemberMenu(e, member, role, canManage) : undefined}
-                      {...(hasMenu ? longPressProps((e) => openMemberMenu(e, member, role, canManage)) : {})}
+                      onContextMenu={hasMenu ? (e) => openMemberMenu(e, member, role) : undefined}
+                      {...(hasMenu ? longPressProps((e) => openMemberMenu(e, member, role)) : {})}
                       title={member.username ? `View ${member.name}'s profile${hasMenu ? ' — right-click for more' : ''}` : undefined}
                     >
                       {(!isHomeView || activeGroupChat) && <span className={`dc-member-dot ${member.online ? 'online' : 'offline'}`} />}
-                      <span className="members-panel-name">{member.name}{member.isYou ? ' (you)' : ''}</span>
+                      <span className="members-panel-name" style={!isHomeView && member.color ? { color: member.color } : undefined}>{member.name}{member.isYou ? ' (you)' : ''}</span>
                       {member.timeoutUntil && <span className="dc-member-timeout" title={`Timed out until ${formatMoment(member.timeoutUntil)}`} aria-label={`Timed out until ${formatMoment(member.timeoutUntil)}`}>⏳</span>}
                       {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
                       {role === 'admin' && <span className="dc-member-role admin" title="Admin">🛡️</span>}
@@ -9065,23 +9179,26 @@ export default function App() {
             {!blockedNames.has(memberMenu.username) && (
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); openPrivateMessage({ username: memberMenu.username, name: memberMenu.name }) }}>✉️ Private message</button>
             )}
-            {/* Manage entries are staff-only; the menu itself now opens for every member. */}
-            {memberMenu.canManage && serverState?.myRole === 'owner' && memberMenu.role === 'member' && (
+            {/* Making and unmaking an admin is the owner's alone; the menu itself opens for every member. */}
+            {!isHomeView && currentServerId() !== 'demo' && serverState?.myRole === 'owner' && memberMenu.role === 'member' && (
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'admin') }}>🛡️ Make admin</button>
             )}
-            {memberMenu.canManage && serverState?.myRole === 'owner' && memberMenu.role === 'admin' && (
+            {!isHomeView && currentServerId() !== 'demo' && serverState?.myRole === 'owner' && memberMenu.role === 'admin' && (
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setMemberMenu(null); setMemberRole(memberMenu.username, 'member') }}>⬇️ Remove admin</button>
             )}
-            {memberMenu.canManage && (
+            {memberActionsOf(memberMenu.username).kick && (
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setMemberMenu(null); kickMember(memberMenu.username) }}>🚫 Remove from server</button>
             )}
             {activeGroupChat && activeGroupChat.ownerUsername === name && memberMenu.username !== name && (
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { const groupId = activeGroupChat.id; setMemberMenu(null); removeFromGroup(groupId, memberMenu.username) }}>🚫 Remove from group</button>
             )}
-            {/* Time out / Ban for staff in a server (never in a group chat), and Block for anyone. */}
+            {/* Roles, Time out and Ban as the viewer's permissions allow in a server (never in a
+                group chat), and Block for anyone. */}
             <MemberActionItems
               username={memberMenu.username}
-              canModerate={Boolean(memberMenu.canManage)}
+              actions={memberActionsOf(memberMenu.username)}
+              heldRoleIds={isHomeView ? [] : ((serverState?.members || []).find((m) => m.username === memberMenu.username)?.roles || [])}
+              onToggleRole={toggleMemberRole}
               timedOut={Boolean(memberMenu.timedOut)}
               blocked={blockedNames.has(memberMenu.username)}
               onDone={() => setMemberMenu(null)}

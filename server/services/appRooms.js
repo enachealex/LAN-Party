@@ -16,10 +16,17 @@
 //   - an admin is demoted and a private channel goes with the role
 //                                                      PATCH /servers/:id/members/:username
 //   - a member is taken off a private channel's list   DELETE /servers/:id/channels/:ch/members/:username
+//   - a custom role stops opening a private channel to someone who had no other way in:
+//       the role is taken from them                    DELETE /servers/:id/members/:username/roles/:role
+//       the role is deleted                            DELETE /servers/:id/roles/:role
+//       the role loses manage_channels                 PATCH  /servers/:id/roles/:role
+//       the role is taken off the channel's list       DELETE /servers/:id/channels/:ch/roles/:role
 //   - an account is deleted: every server it was in    deleteUserCompletely (routes/auth.js)
 //   - staff reset the rooms                            POST /servers/:id/app-rooms/reset
-// A new way of losing access (a route that makes a public channel private, say) has to call
-// rotate() too. A server that is deleted has no epoch left to bump; its running apps are ended
+// The ones that take a channel from someone who stays a member (the demotion, the list, the role
+// cases) go through services/accessChanges.js, which works out whether anything was really lost
+// and rotates once if so, and never on a gain. A new way of losing access (a route that makes a
+// public channel private, say) has to do the same. A server that is deleted has no epoch left to bump; its running apps are ended
 // instead, and its ids are never used again.
 //
 // The public commons never rotates: everyone is a member of it and nobody is ever removed, so there

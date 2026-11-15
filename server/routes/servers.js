@@ -1,6 +1,7 @@
 // Server + channel management: the rail list, unread totals, create/rename/delete for servers
-// and channels, private-channel member lists, and membership (roster/invite/kick/role/leave).
-// Role checks and the state broadcasts are shared with the socket layer, so they are injected.
+// and channels, private-channel access lists, and membership (roster/invite/kick/role/leave).
+// Who may do what is services/permissions.js: every check here asks it, by permission name. The
+// state broadcasts are shared with the socket layer, so they are injected.
 const { mentionedUsernames } = require('../services/push');
 const { parsePageQuery, fetchPage, channelHistory } = require('../services/history');
 const { rateLimit } = require('../rateLimit');
@@ -16,7 +17,10 @@ const APP_ROOMS_RESET_LIMIT = {
 };
 
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks }) {
+  const { roleOf, isMember, can, canAccessChannel, visibleChannelsFor } = permissions;
+  // The commons is open (anyone may add a public channel there); elsewhere it is manage_channels.
+  const canManageChannels = permissions.mayManageChannels;
   // The audit log (services/moderation.js): who did what in a server. Written after the action
   // itself, never before; it does nothing for the commons and never fails the request.
   const audit = moderation.audit;
@@ -37,7 +41,12 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
       'SELECT s.id, s.name, s.owner, s.icon_url, m.role FROM server_members m JOIN servers s ON s.id = m.server_id WHERE m.username = ? ORDER BY s.rowid ASC',
       me
     );
-    const out = mine.map((s) => ({ id: s.id, name: s.name, owner: s.owner || null, role: s.role, iconUrl: s.icon_url || null }));
+    // permissions: what the caller may do in each server, so the rail's menus can offer the right
+    // entries for a server that is not the one on screen. Advice for the client; nothing trusts it.
+    const out = [];
+    for (const s of mine) {
+      out.push({ id: s.id, name: s.name, owner: s.owner || null, role: s.role, iconUrl: s.icon_url || null, permissions: [...await permissions.permissionsOf(s.id, me)] });
+    }
     return res.json({ servers: out });
   });
 
@@ -103,7 +112,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ server: { id, name, owner: me, role: 'owner' } });
   });
 
-  // Add a channel (owner/admin only for private servers; anyone for the demo commons).
+  // Add a channel (manage_channels; anyone for the demo commons).
   app.post('/servers/:serverId/channels', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
     const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
@@ -115,7 +124,12 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const privacy = (serverId !== DEMO_ID && (req.body || {}).privacy === 'private') ? 'private' : 'public';
     if (!name) return res.status(400).json({ error: 'Channel name required' });
     const chId = newId('ch');
-    await db.run('INSERT INTO channels (id, server_id, name, type, privacy) VALUES (?, ?, ?, ?, ?)', chId, serverId, name, type, privacy);
+    // Straight into a category when one is named (never in the commons, which has none). A
+    // category of another server, or one that is gone, is ignored rather than refused: the
+    // channel is still made, just not filed.
+    const wantedCategory = typeof (req.body || {}).categoryId === 'string' && serverId !== DEMO_ID ? (req.body || {}).categoryId : null;
+    const category = wantedCategory ? await db.get('SELECT id FROM channel_categories WHERE id = ? AND server_id = ?', wantedCategory, serverId) : null;
+    await db.run('INSERT INTO channels (id, server_id, name, type, privacy, category_id) VALUES (?, ?, ?, ?, ?, ?)', chId, serverId, name, type, privacy, category ? category.id : null);
     // For a private channel, grant the requested members access (must be members of this server).
     // Staff (owner/admins) always have access, so they don't need a row.
     if (privacy === 'private') {
@@ -127,10 +141,16 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
         seen.add(u);
         if (await isMember(serverId, u)) await db.run('INSERT OR IGNORE INTO channel_members (server_id, channel_id, username) VALUES (?, ?, ?)', serverId, chId, u);
       }
+      // ...and the requested roles (must be roles of this server): everyone who holds one gets in.
+      const wantedRoles = Array.isArray((req.body || {}).roles) ? (req.body || {}).roles : [];
+      const known = new Set((await permissions.listRoles(serverId)).map((r) => r.id));
+      for (const roleId of new Set(wantedRoles.slice(0, 50))) {
+        if (typeof roleId === 'string' && known.has(roleId)) await db.run('INSERT OR IGNORE INTO channel_roles (server_id, channel_id, role_id) VALUES (?, ?, ?)', serverId, chId, roleId);
+      }
     }
     await broadcastServerState(serverId);
     await audit(serverId, req.user.username, AUDIT.channelCreated, null, { channelId: chId, name, type, privacy });
-    return res.json({ channel: { id: chId, name, type, privacy } });
+    return res.json({ channel: { id: chId, name, type, privacy, categoryId: category ? category.id : null } });
   });
 
   // A page of a channel's history: what the client asks for when the reader scrolls back, or jumps
@@ -161,16 +181,23 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return { channelId, channel: ch ? ch.name : null };
   }
 
-  // Read / manage a private channel's access list (owner/admins only). Public channels have none.
+  // Read / manage a private channel's access list (manage_channels). Public channels have none.
+  // The list names members (channel_members) and roles (channel_roles); the owner, admins and
+  // anyone with manage_channels can open every channel without being on it.
   app.get('/servers/:serverId/channels/:channelId/members', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can view channel access' });
+    if (!(await can(serverId, req.user.username, 'manage_channels'))) return res.status(403).json({ error: 'Only server admins can view channel access' });
     const rows = await db.all('SELECT username FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId);
-    return res.json({ members: rows.map((r) => r.username) });
+    const roles = await db.all(
+      `SELECT cr.role_id FROM channel_roles cr JOIN server_roles r ON r.id = cr.role_id AND r.server_id = cr.server_id
+        WHERE cr.server_id = ? AND cr.channel_id = ?`,
+      serverId, channelId
+    );
+    return res.json({ members: rows.map((r) => r.username), roles: roles.map((r) => r.role_id) });
   });
   app.post('/servers/:serverId/channels/:channelId/members', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
+    if (!(await can(serverId, req.user.username, 'manage_channels'))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
     const u = String((req.body || {}).username || '').trim();
     if (!u) return res.status(400).json({ error: 'Username required' });
     if (!(await isMember(serverId, u))) return res.status(400).json({ error: `${u} isn't a member of this server` });
@@ -182,43 +209,72 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
   });
   app.delete('/servers/:serverId/channels/:channelId/members/:username', authMiddleware, async (req, res) => {
     const { serverId, channelId, username } = req.params;
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
+    if (!(await can(serverId, req.user.username, 'manage_channels'))) return res.status(403).json({ error: 'Only server admins can manage channel access' });
+    const before = await accessChanges.snapshot(serverId, [username]);
     const removed = await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ? AND username = ?', serverId, channelId, username);
     // They can no longer open this channel, so the room keys they collected in it are revoked
-    // (services/appRooms.js). Only when something was really taken away: a name that was not on
-    // the list changes nothing, and neither does a row for an owner or admin, who can open every
-    // channel with or without one.
-    if (removed.changes > 0 && !isStaffRole(await roleOf(serverId, username))) await appRooms.rotate(serverId);
-    // ...and if they are sitting in that channel's voice room right now, they are taken out of it.
-    // The same for a socket that has the channel open as text: it stops receiving its messages.
-    if (removed.changes > 0) { await enforceVoiceAccess(username, serverId); await enforceTextAccess(username, serverId); }
+    // (services/appRooms.js), and if they are sitting in its voice room right now, or have it open
+    // as text, they are taken out of it. Only when something was really taken away, which is what
+    // settle() works out: a name that was not on the list changes nothing, and neither does a row
+    // for someone who can open the channel anyway (an owner or admin, a manager of channels, a
+    // holder of a role that is on the list).
+    await accessChanges.settle(serverId, before);
     await broadcastServerState(serverId);
     if (removed.changes > 0) await audit(serverId, req.user.username, AUDIT.accessRemoved, username, await channelDetail(serverId, channelId));
+    return res.json({ success: true });
+  });
+
+  // A role on a private channel's list: everyone who holds it can open the channel, now and for
+  // as long as they hold it. Both the channel and the role have to belong to the server in the URL.
+  async function channelAndRole(req, res) {
+    const { serverId, channelId } = req.params;
+    if (serverId === DEMO_ID) { res.status(400).json({ error: 'The public server has no private channels' }); return null; }
+    if (!(await can(serverId, req.user.username, 'manage_channels'))) { res.status(403).json({ error: 'Only server admins can manage channel access' }); return null; }
+    const ch = await db.get('SELECT id, name FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
+    if (!ch) { res.status(404).json({ error: 'Channel not found' }); return null; }
+    const roleId = String(req.params.roleId || (req.body || {}).roleId || '');
+    const role = await db.get('SELECT id, name FROM server_roles WHERE id = ? AND server_id = ?', roleId, serverId);
+    if (!role) { res.status(404).json({ error: 'Role not found' }); return null; }
+    return { serverId, ch, role };
+  }
+  app.post('/servers/:serverId/channels/:channelId/roles', authMiddleware, async (req, res) => {
+    const ctx = await channelAndRole(req, res);
+    if (!ctx) return undefined;
+    const { serverId, ch, role } = ctx;
+    const granted = await db.run('INSERT OR IGNORE INTO channel_roles (server_id, channel_id, role_id) VALUES (?, ?, ?)', serverId, ch.id, role.id);
+    await broadcastServerState(serverId);
+    if (granted.changes > 0) await audit(serverId, req.user.username, AUDIT.accessRoleGranted, null, { channelId: ch.id, channel: ch.name, roleId: role.id, role: role.name });
+    return res.json({ success: true });
+  });
+  app.delete('/servers/:serverId/channels/:channelId/roles/:roleId', authMiddleware, async (req, res) => {
+    const ctx = await channelAndRole(req, res);
+    if (!ctx) return undefined;
+    const { serverId, ch, role } = ctx;
+    // Everyone who holds the role may be about to lose the channel; who really does (not someone
+    // also listed by name, or holding another listed role) is settle()'s to work out.
+    const holders = (await db.all('SELECT username FROM server_member_roles WHERE server_id = ? AND role_id = ?', serverId, role.id)).map((r) => r.username);
+    const before = await accessChanges.snapshot(serverId, holders);
+    const removed = await db.run('DELETE FROM channel_roles WHERE server_id = ? AND channel_id = ? AND role_id = ?', serverId, ch.id, role.id);
+    await accessChanges.settle(serverId, before);
+    await broadcastServerState(serverId);
+    if (removed.changes > 0) await audit(serverId, req.user.username, AUDIT.accessRoleRemoved, null, { channelId: ch.id, channel: ch.name, roleId: role.id, role: role.name });
     return res.json({ success: true });
   });
 
   // Rebroadcast a server's state (role-filtered per socket).
   async function pushServerState(serverId) { await broadcastServerState(serverId); }
 
-  // Minting invite links is a staff power, and a link keeps admitting people for as long as it is
-  // live. So the links someone minted are revoked the moment they stop being staff of that server
-  // (kicked, demoted, or gone of their own accord): otherwise the power outlives the role, and a
-  // removed admin could let themselves, or anyone else, back in with a link made beforehand.
-  // Revoked rather than deleted, like a manual revoke, so the record of who minted what survives.
-  async function revokeInvitesBy(serverId, username) {
-    await db.run(
-      'UPDATE server_invites SET revoked_at = ? WHERE server_id = ? AND created_by = ? AND revoked_at IS NULL',
-      Date.now(), serverId, username
-    );
-  }
+  // The links someone minted are revoked the moment they can no longer invite here (kicked,
+  // demoted, or gone of their own accord); see services/accessChanges.js for why.
+  const { revokeInvitesBy } = accessChanges;
 
-  // Rename a server (owner/admin; the public commons can't be renamed).
+  // Rename a server (manage_server; the public commons can't be renamed).
   app.patch('/servers/:serverId', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
     if (serverId === DEMO_ID) return res.status(400).json({ error: "The public server can't be renamed" });
     const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can rename it' });
+    if (!(await can(serverId, req.user.username, 'manage_server'))) return res.status(403).json({ error: 'Only server admins can rename it' });
     const name = String((req.body || {}).name || '').trim().slice(0, 40);
     if (!name) return res.status(400).json({ error: 'Server name required' });
     await db.run('UPDATE servers SET name = ? WHERE id = ?', name, serverId);
@@ -228,7 +284,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ server: { id: serverId, name } });
   });
 
-  // Set a server's tile icon (owner/admin). Shared, not per-viewer: everyone in the rail sees it, so
+  // Set a server's tile icon (manage_server). Shared, not per-viewer: everyone in the rail sees it, so
   // it lives on the server row and every member is told to refresh.
   app.post('/servers/:serverId/icon', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
@@ -236,7 +292,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const srv = await db.get('SELECT id, icon_url FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
     // Permission BEFORE the upload, so a non-admin's bytes are never written to disk.
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can change the icon' });
+    if (!(await can(serverId, req.user.username, 'manage_server'))) return res.status(403).json({ error: 'Only server admins can change the icon' });
     const saved = await receiveTileIcon(req, res);
     if (!saved) return undefined; // receiveTileIcon already answered
     await db.run('UPDATE servers SET icon_url = ? WHERE id = ?', saved.url, serverId);
@@ -247,12 +303,12 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ success: true, url: saved.url });
   });
 
-  // Clear a server's tile icon, falling back to the coloured initials (owner/admin).
+  // Clear a server's tile icon, falling back to the coloured initials (manage_server).
   app.delete('/servers/:serverId/icon', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
     const srv = await db.get('SELECT id, icon_url FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can change the icon' });
+    if (!(await can(serverId, req.user.username, 'manage_server'))) return res.status(403).json({ error: 'Only server admins can change the icon' });
     await db.run('UPDATE servers SET icon_url = NULL WHERE id = ?', serverId);
     if (srv.icon_url) removeTileIconFile(srv.icon_url);
     io.emit('servers:updated');
@@ -277,6 +333,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     await db.run('DELETE FROM server_invites WHERE server_id = ?', serverId);
     await db.run('DELETE FROM server_removed WHERE server_id = ?', serverId);
     await moderation.forgetServer(serverId); // its bans, timeouts and audit log go with it
+    await permissions.forgetServer(serverId); // and its roles, who held them, and its categories
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
     // Nobody is a member any more, and there is no epoch left to bump (services/appRooms.js): the
@@ -287,7 +344,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ success: true });
   });
 
-  // Rename a channel (owner/admin).
+  // Rename a channel (manage_channels).
   app.patch('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
     const ch = await db.get('SELECT id, name FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
@@ -301,7 +358,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ channel: { id: channelId, name } });
   });
 
-  // Delete a channel (owner/admin). A server always keeps at least one text channel.
+  // Delete a channel (manage_channels). A server always keeps at least one text channel.
   app.delete('/servers/:serverId/channels/:channelId', authMiddleware, async (req, res) => {
     const { serverId, channelId } = req.params;
     const ch = await db.get('SELECT id, name, type FROM channels WHERE id = ? AND server_id = ?', channelId, serverId);
@@ -313,6 +370,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     }
     await db.run('DELETE FROM messages WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId);
+    await db.run('DELETE FROM channel_roles WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channels WHERE id = ?', channelId);
     await pushServerState(serverId);
     await audit(serverId, req.user.username, AUDIT.channelDeleted, null, { channelId, name: ch.name, type: ch.type });
@@ -331,13 +389,13 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ members });
   });
 
-  // Invite a user by username (owner/admin) → they become a member; their rail refreshes.
+  // Invite a user by username (the invite permission) → they become a member; their rail refreshes.
   app.post('/servers/:serverId/invite', authMiddleware, async (req, res) => {
     const serverId = req.params.serverId;
     if (serverId === DEMO_ID) return res.status(400).json({ error: 'Everyone is already in the public server' });
     const srv = await db.get('SELECT id, name FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can invite' });
+    if (!(await can(serverId, req.user.username, 'invite'))) return res.status(403).json({ error: 'Only server admins can invite' });
     const invite = validate(inviteInput, req.body);
     if (!invite.ok) return res.status(400).json({ error: invite.error });
     const target = invite.data.username;
@@ -358,18 +416,22 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ success: true });
   });
 
-  // Kick a member (owner/admin). Can't kick the owner; admins can't kick other admins.
+  // Kick a member (the kick permission). Only someone ranked strictly below you: never the owner,
+  // an admin never another admin, a role holder never an admin or their own rank
+  // (permissions.mayActOn). The answers are worded as they always were.
   app.delete('/servers/:serverId/members/:username', authMiddleware, async (req, res) => {
     const { serverId, username: target } = req.params;
     if (serverId === DEMO_ID) return res.status(400).json({ error: "You can't kick from the public server" });
     const srv = await db.get('SELECT id, owner FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
-    const myRole = await roleOf(serverId, req.user.username);
-    if (!isStaffRole(myRole)) return res.status(403).json({ error: 'Only server admins can remove members' });
+    const allowed = await permissions.mayActOn(serverId, req.user.username, target, 'kick');
+    if (!allowed.ok && allowed.reason === 'no-permission') return res.status(403).json({ error: 'Only server admins can remove members' });
     if (target === srv.owner) return res.status(400).json({ error: "The owner can't be removed" });
-    const targetRole = await roleOf(serverId, target);
-    if (!targetRole) return res.status(404).json({ error: 'Not a member' });
-    if (myRole === 'admin' && targetRole === 'admin') return res.status(403).json({ error: "Admins can't remove other admins" });
+    if (!allowed.targetRole) return res.status(404).json({ error: 'Not a member' });
+    if (!allowed.ok) {
+      const sideways = allowed.actorRole === 'admin' && allowed.targetRole === 'admin';
+      return res.status(403).json({ error: sideways ? "Admins can't remove other admins" : 'You can only remove members ranked below you' });
+    }
     await removeMemberFromServer(serverId, target, req.user.username);
     await audit(serverId, req.user.username, AUDIT.kick, target);
     return res.json({ success: true });
@@ -382,6 +444,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
   async function removeMemberFromServer(serverId, target, by, { banned = false } = {}) {
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, target);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, target);
+    await permissions.forgetMember(serverId, target); // the roles they held here do not wait for them
     // A kick has to hold against invite links too. Remembering who was removed is what stops them
     // rejoining through ANY live link (one they were sent, one a friend forwards); revoking the ones
     // they minted stops them handing the server out to others.
@@ -414,23 +477,15 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     const role = (req.body || {}).role === 'admin' ? 'admin' : 'member';
     const before = await roleOf(serverId, target);
     if (!before) return res.status(404).json({ error: 'Not a member' });
+    const reach = await accessChanges.snapshot(serverId, [target]);
     await db.run('UPDATE server_members SET role = ? WHERE server_id = ? AND username = ?', role, serverId, target);
-    if (role === 'member') await revokeInvitesBy(serverId, target); // no longer staff: see revokeInvitesBy
-    // An admin can open every private channel; a member only the ones they are listed on. So a
-    // demotion can take channels away just as a removal from their lists would, and the room keys
-    // go with them (services/appRooms.js). Not when it takes nothing away: a server with no
-    // private channel the person is missing from keeps its apps running through a role change.
-    if (before === 'admin' && role === 'member') {
-      const lost = await db.get(
-        `SELECT 1 FROM channels c WHERE c.server_id = ? AND COALESCE(c.privacy, 'public') = 'private'
-           AND NOT EXISTS (SELECT 1 FROM channel_members m WHERE m.server_id = c.server_id AND m.channel_id = c.id AND m.username = ?)
-         LIMIT 1`,
-        serverId, target
-      );
-      if (lost) await appRooms.rotate(serverId);
-      await enforceVoiceAccess(target, serverId);
-      await enforceTextAccess(target, serverId);
-    }
+    // An admin can open every private channel and mint invite links; a member only what they are
+    // listed on, or what a custom role of theirs gives them. So a demotion can take channels away
+    // just as a removal from their lists would, and the room keys go with them
+    // (services/appRooms.js), and the links they minted are revoked if they can no longer invite.
+    // Not when it takes nothing away: a server with no private channel the person is missing from
+    // keeps its apps running through a role change (services/accessChanges.js).
+    await accessChanges.settle(serverId, reach);
     io.to(`user:${target}`).emit('servers:updated');
     await broadcastServerState(serverId);
     if (before !== role) await audit(serverId, req.user.username, AUDIT.role, target, { from: before, to: role });
@@ -448,6 +503,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (!(await isMember(serverId, me))) return res.status(400).json({ error: 'Not a member' });
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, me);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, me);
+    await permissions.forgetMember(serverId, me);
     // An admin who walks out takes their links with them. Nothing is written to server_removed:
     // leaving is not being removed, so they may come back through a link someone else made.
     await revokeInvitesBy(serverId, me);
@@ -463,7 +519,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     return res.json({ success: true });
   });
 
-  // Reset app rooms (owner/admin): give every voice channel of this server a new room key for
+  // Reset app rooms (manage_server): give every voice channel of this server a new room key for
   // every app, by hand. For when a key may have got out some other way than someone leaving, which
   // rotates on its own. Apps running in the server are ended (they are on the old keys), and what
   // an app's own server kept for a channel is no longer where that channel leads.
@@ -473,7 +529,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, rol
     if (serverId === DEMO_ID) return res.status(400).json({ error: "App rooms can't be reset in the public server" });
     const srv = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
     if (!srv) return res.status(404).json({ error: 'Server not found' });
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) return res.status(403).json({ error: 'Only server admins can reset app rooms' });
+    if (!(await can(serverId, req.user.username, 'manage_server'))) return res.status(403).json({ error: 'Only server admins can reset app rooms' });
     const epoch = await appRooms.rotate(serverId);
     await audit(serverId, req.user.username, AUDIT.appRoomsReset);
     return res.json({ success: true, epoch });

@@ -3,6 +3,8 @@ import longPressProps from '../longPress'
 import HomeLeftPanel from './HomeLeftPanel'
 import FloatingMenu from './FloatingMenu'
 import MemberActionItems from './MemberActionItems'
+import ChannelList from './ChannelList'
+import { effectivePermissions, memberActionsFor, NO_MEMBER_ACTIONS } from '../permissions'
 import { formatMoment } from '../moderation'
 import ProfileAvatar from './ProfileAvatar'
 import { nameStyleToCss } from '../profileData'
@@ -40,14 +42,6 @@ function CogIcon() {
       ))}
       {/* evenodd so the centre is punched out rather than painted with a background colour. */}
       <path fillRule="evenodd" d="M12 5a7 7 0 1 0 0 14 7 7 0 1 0 0-14Zm0 3.9a3.1 3.1 0 1 0 0 6.2 3.1 3.1 0 1 0 0-6.2Z" />
-    </svg>
-  )
-}
-
-function ChannelSpeakerIcon() {
-  return (
-    <svg className="dc-channel-speaker-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d={SPEAKER_ICON_PATH} />
     </svg>
   )
 }
@@ -242,14 +236,34 @@ export default function AppLeftPane({
   onBlockUser,            // (username) => void
   onUnblockUser,          // (username) => void
   blockedNames = new Set(), // usernames the signed-in person has blocked
-  onOpenBans,             // (serverId, serverName) => void — owner/admins
-  onOpenAuditLog,         // (serverId, serverName) => void — owner/admins
+  onOpenBans,             // (serverId, serverName) => void — people with the ban permission
+  onOpenAuditLog,         // (serverId, serverName) => void — people with view_audit_log
+  // Roles and categories. What the viewer may do is the server's word (server:state); here it
+  // only decides which controls are drawn. The server refuses anything else, whatever is shown.
+  myPermissions = new Set(), // what I may do in the server on screen (permissions.ts)
+  viewer = null,          // { username, role, roles } — me, in the server on screen
+  serverRoles = [],       // the server's custom roles, highest first
+  categories = [],        // the channel categories I am shown
+  onCreateCategory,       // () => void — asks for a name
+  onRenameCategory,       // (categoryId, name) => void
+  onDeleteCategory,       // (categoryId, name) => void — asks first
+  onMoveCategory,         // (categoryId, 'up' | 'down') => void
+  onMoveChannel,          // (channelId, 'up' | 'down') => void
+  onSetChannelCategory,   // (channelId, categoryId | null) => void
+  onOpenServerSettings,   // (serverId, serverName) => void — any member; opens on Roles
+  onToggleMemberRole,     // (username, roleId, on) => void
 }) {
-  const isStaff = myRole === 'owner' || myRole === 'admin'
+  // Channels: anyone may add one in the public commons; elsewhere it takes manage_channels.
+  // Categories and channel order exist in real servers only.
+  const canManageChannels = serverId === 'demo' || myPermissions.has('manage_channels')
+  const canArrangeChannels = serverId !== 'demo' && myPermissions.has('manage_channels')
   const showMembersTab = paneTab === 'members'
   const showVoiceOnHome = inVoice && voiceRailTarget === 'home'
   // Right-click context menu for server tiles / channel rows: { x, y, kind, id, name, isDefault }.
   const [ctxMenu, setCtxMenu] = useState(null)
+  // Whether the channel menu's "Move to category" list is open. It unfolds inside the menu
+  // rather than flying out beside it: a fly-out has nowhere to go on a phone.
+  const [ctxSubOpen, setCtxSubOpen] = useState(false)
   const ctxMenuRef = useRef(null)
   useEffect(() => {
     if (!ctxMenu) return
@@ -261,10 +275,14 @@ export default function AppLeftPane({
   }, [ctxMenu])
   const openCtxMenu = (e, item) => {
     e.preventDefault()
+    setCtxSubOpen(false)
     setCtxMenu({ x: Math.min(e.clientX, window.innerWidth - 180), y: Math.min(e.clientY, window.innerHeight - 110), ...item })
   }
   // What the server menu needs to know about a server (its right-click menu and the header dropdown).
-  const serverMenuItem = (s) => ({ kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl })
+  // `permissions` is what GET /servers says I may do there; for the server on screen the live
+  // answer from server:state is used instead (it changes the moment a role does).
+  const serverMenuItem = (s) => ({ kind: 'server', id: s.id, name: s.name, isDefault: s.id === 'demo', role: s.role || 'member', owner: s.owner || null, hasIcon: !!s.iconUrl, permissions: Array.isArray(s.permissions) ? s.permissions : null })
+  const permissionsInServer = (item) => (variant === 'server' && item.id === serverId ? myPermissions : effectivePermissions(item.role, item.permissions))
   // The server-name header opens the same menu as right-clicking the server's tile, just below itself.
   const openServerHeaderMenu = (e) => {
     const s = servers.find((sv) => sv.id === selectedServerId)
@@ -426,7 +444,7 @@ export default function AppLeftPane({
 
               {showMembersTab ? (
                 <div className="dc-members-section">
-                  {isStaff && serverId !== 'demo' && (
+                  {myPermissions.has('invite') && serverId !== 'demo' && (
                     <button type="button" className="dc-members-invite" onClick={() => onInviteServer?.(serverId, serverName)}>
                       + Invite people
                     </button>
@@ -437,15 +455,12 @@ export default function AppLeftPane({
                     <ul className="dc-members-list">
                       {members.map((m) => {
                         const role = m.role || 'member'
-                        // Staff manage only people below them: never the owner, never yourself, and an
-                        // admin can't act on another admin. Mirrors what the server enforces.
-                        const canManage = isStaff && serverId !== 'demo' && !m.isYou && m.username
-                          && role !== 'owner' && !(myRole === 'admin' && role === 'admin')
                         // Anyone can privately message anyone else here, so the menu opens for every
                         // member but yourself — it used to open only for staff, which would have left
-                        // ordinary members with no way to reach it. The manage entries stay gated.
+                        // ordinary members with no way to reach it. The manage entries in it are
+                        // worked out when it is drawn, from what the viewer may do to this member.
                         const hasMenu = Boolean(m.username) && !m.isYou
-                        const openMemberMenu = (e) => openCtxMenu(e, { kind: 'member', id: m.id, name: m.name, username: m.username, role, canManage, timedOut: Boolean(m.timeoutUntil) })
+                        const openMemberMenu = (e) => openCtxMenu(e, { kind: 'member', id: m.id, name: m.name, username: m.username, role, timedOut: Boolean(m.timeoutUntil) })
                         return (
                           <li key={m.id}>
                             <button
@@ -457,7 +472,8 @@ export default function AppLeftPane({
                               title={m.username ? `View ${m.name}'s profile${hasMenu ? ' — right-click for more' : ''}` : undefined}
                             >
                               <span className={`dc-member-dot ${m.online === false ? 'offline' : ''}`} />
-                              <span className="dc-member-name">{m.name}{m.isYou ? ' (you)' : ''}</span>
+                              {/* In the colour of their highest coloured role, if they have one. */}
+                              <span className="dc-member-name" style={m.color ? { color: m.color } : undefined}>{m.name}{m.isYou ? ' (you)' : ''}</span>
                               {/* Timed out here: shown to everyone, and gone the moment it ends. */}
                               {m.timeoutUntil && <span className="dc-member-timeout" title={`Timed out until ${formatMoment(m.timeoutUntil)}`} aria-label={`Timed out until ${formatMoment(m.timeoutUntil)}`}>⏳</span>}
                               {role === 'owner' && <span className="dc-member-role owner" title="Owner">👑</span>}
@@ -470,63 +486,24 @@ export default function AppLeftPane({
                   )}
                 </div>
               ) : (
-              <>
-              <div className="dc-channel-section">
-                <div className="dc-channel-section-label">
-                  <span>Text Channels</span>
-                  <button type="button" className="dc-dm-add" aria-label="Create Text Channel" onClick={() => onCreateChannel?.('text')}>+</button>
-                </div>
-                {channels.filter((c) => c.type === 'text').map((ch) => {
-                  const unread = channelUnreads[ch.id] || 0
-                  const mentions = channelMentions[ch.id] || 0
-                  return (
-                    <button
-                      key={ch.id}
-                      type="button"
-                      className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''} ${unread > 0 ? 'unread' : ''}`}
-                      onClick={() => onJoinChannel?.(ch.id)}
-                      onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy })}
-                      {...longPressProps((e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy }))}
-                    >
-                      <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
-                      <span>{ch.name}</span>
-                      {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
-                      {mentions > 0 && <span className="dc-channel-mention" title={`You were mentioned ${mentions === 1 ? 'once' : `${mentions} times`}`}>@{mentions > 99 ? '99+' : mentions}</span>}
-                      {unread > 0 && <span className="dc-channel-unread">{unread > 99 ? '99+' : unread}</span>}
-                    </button>
-                  )
-                })}
-              </div>
-              <div className="dc-channel-section">
-                <div className="dc-channel-section-label">
-                  <span>Voice Channels</span>
-                  <button type="button" className="dc-dm-add" aria-label="Create Voice Channel" onClick={() => onCreateChannel?.('voice')}>+</button>
-                </div>
-                {channels.filter((c) => c.type === 'voice').map((ch) => {
-                  const inThisCall = inVoice && voiceServerId === serverId && voiceChannelId === ch.id
-                  return (
-                    <div key={ch.id} className={`dc-channel-item-row ${activeChannel === ch.id ? 'active' : ''}`}>
-                      <button
-                        type="button"
-                        className="dc-channel-item"
-                        onClick={() => onJoinChannel?.(ch.id)}
-                        onContextMenu={(e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy })}
-                        {...longPressProps((e) => openCtxMenu(e, { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy }))}
-                      >
-                        <span className="dc-channel-icon dc-channel-icon-voice"><ChannelSpeakerIcon /></span>
-                        <span>{ch.name}</span>
-                        {ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>}
-                      </button>
-                      {inThisCall ? (
-                        <button type="button" className="dc-voice-join-btn leave" onClick={() => onLeaveVoice?.()} title="Leave voice">Leave</button>
-                      ) : (
-                        <button type="button" className="dc-voice-join-btn" onClick={() => onJoinVoice?.(ch.id)} title="Join voice">Join Voice</button>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-              </>
+              <ChannelList
+                channels={channels}
+                categories={categories}
+                serverId={serverId}
+                activeChannel={activeChannel}
+                channelUnreads={channelUnreads}
+                channelMentions={channelMentions}
+                canManage={canManageChannels}
+                collapseKey={currentUsername || displayName || 'guest'}
+                inVoice={inVoice}
+                voiceServerId={voiceServerId}
+                voiceChannelId={voiceChannelId}
+                onJoinChannel={onJoinChannel}
+                onJoinVoice={onJoinVoice}
+                onLeaveVoice={onLeaveVoice}
+                onCreateChannel={onCreateChannel}
+                onOpenMenu={openCtxMenu}
+              />
               )}
             </>
           ) : (
@@ -626,14 +603,24 @@ export default function AppLeftPane({
         <FloatingMenu x={ctxMenu.x} y={ctxMenu.y} className="dc-ctx-menu" menuRef={ctxMenuRef}>
           {ctxMenu.kind === 'server' && (() => {
             const role = ctxMenu.role || 'member'
-            const staff = role === 'owner' || role === 'admin'
             const isDemo = ctxMenu.isDefault
+            // Each entry follows the permission its route asks for (server/services/permissions.js):
+            // the owner and admins hold them all, a member the ones their roles give them.
+            const may = isDemo ? new Set() : permissionsInServer(ctxMenu)
             const items = []
-            if (staff && !isDemo) {
+            if (may.has('manage_server')) {
               items.push(
-                <button key="rename" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameServer?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename server</button>,
-                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id, ctxMenu.name) }}>➕ Invite people</button>,
-                // The icon is shared, so only staff can set it — and everyone in the server sees it.
+                <button key="rename" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameServer?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename server</button>
+              )
+            }
+            if (may.has('invite')) {
+              items.push(
+                <button key="invite" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onInviteServer?.(ctxMenu.id, ctxMenu.name) }}>➕ Invite people</button>
+              )
+            }
+            if (may.has('manage_server')) {
+              items.push(
+                // The icon is shared, so it takes manage_server to set it — and everyone in the server sees it.
                 <button key="icon" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onChangeTileImage?.({ kind: 'server', id: ctxMenu.id, name: ctxMenu.name }) }}>
                   🖼️ {ctxMenu.hasIcon ? 'Change icon' : 'Set icon'}
                 </button>
@@ -643,13 +630,36 @@ export default function AppLeftPane({
                   <button key="icon-reset" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetTileImage?.({ kind: 'server', id: ctxMenu.id, name: ctxMenu.name }) }}>↩️ Reset icon</button>
                 )
               }
+            }
+            if (!isDemo) {
+              items.push(
+                // For every member: the roles are what the member list shows them anyway, and the
+                // dialog disables whatever they may not change.
+                <button key="settings" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onOpenServerSettings?.(ctxMenu.id, ctxMenu.name) }}>⚙️ Server settings</button>
+              )
+            }
+            // Categories belong to the channel list on screen, so this is only offered for that server.
+            if (may.has('manage_channels') && variant === 'server' && ctxMenu.id === serverId) {
+              items.push(
+                <button key="category" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onCreateCategory?.() }}>📁 New category…</button>
+              )
+            }
+            if (may.has('manage_server')) {
               // New room ids for every app in this server's voice channels. The "…" is a promise
               // that nothing happens yet: App asks first, and says what it ends.
               items.push(
-                <button key="app-rooms" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetAppRooms?.(ctxMenu.id, ctxMenu.name) }}>🔄 Reset app rooms…</button>,
-                // Moderation records, for owner/admins. Each opens a dialog; the server refuses
-                // both to anyone else, whatever this menu shows.
-                <button key="bans" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onOpenBans?.(ctxMenu.id, ctxMenu.name) }}>⛔ Bans</button>,
+                <button key="app-rooms" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onResetAppRooms?.(ctxMenu.id, ctxMenu.name) }}>🔄 Reset app rooms…</button>
+              )
+            }
+            // Moderation records. Each opens a dialog; the server refuses both to anyone without
+            // the permission, whatever this menu shows.
+            if (may.has('ban')) {
+              items.push(
+                <button key="bans" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onOpenBans?.(ctxMenu.id, ctxMenu.name) }}>⛔ Bans</button>
+              )
+            }
+            if (may.has('view_audit_log')) {
+              items.push(
                 <button key="audit" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onOpenAuditLog?.(ctxMenu.id, ctxMenu.name) }}>📜 Audit log</button>
               )
             }
@@ -684,38 +694,91 @@ export default function AppLeftPane({
             </>
           )}
 
+          {/* Only opened for someone who manages channels (ChannelList): everything in it is theirs to use. */}
           {ctxMenu.kind === 'channel' && (
             <>
               <div className="dc-ctx-title">#{ctxMenu.name}</div>
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameChannel?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename</button>
-              {ctxMenu.privacy === 'private' && isStaff && serverId !== 'demo' && (
+              {ctxMenu.privacy === 'private' && canArrangeChannels && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onManageAccess?.(ctxMenu.id, ctxMenu.name) }}>🔑 Manage access</button>
+              )}
+              {canArrangeChannels && (
+                <>
+                  <div className="dc-ctx-sep" role="separator" />
+                  <button type="button" role="menuitem" className="dc-ctx-item" disabled={!ctxMenu.canUp} onClick={() => { setCtxMenu(null); onMoveChannel?.(ctxMenu.id, 'up') }}>⬆️ Move up</button>
+                  <button type="button" role="menuitem" className="dc-ctx-item" disabled={!ctxMenu.canDown} onClick={() => { setCtxMenu(null); onMoveChannel?.(ctxMenu.id, 'down') }}>⬇️ Move down</button>
+                  {/* Where it is filed only changes where it is listed: who can open it stays as it is. */}
+                  {(categories.length > 0) && (
+                    <button type="button" role="menuitem" className="dc-ctx-item" aria-expanded={ctxSubOpen} onClick={() => setCtxSubOpen((open) => !open)}>
+                      📂 Move to category <span className="dc-ctx-caret" aria-hidden="true">{ctxSubOpen ? '▾' : '▸'}</span>
+                    </button>
+                  )}
+                  {ctxSubOpen && (
+                    <div className="dc-ctx-sub" role="group" aria-label="Move to category">
+                      {categories.map((cat) => (
+                        <button key={cat.id} type="button" role="menuitemradio" aria-checked={ctxMenu.categoryId === cat.id} className="dc-ctx-item dc-ctx-check" disabled={ctxMenu.categoryId === cat.id}
+                          onClick={() => { setCtxMenu(null); onSetChannelCategory?.(ctxMenu.id, cat.id) }}>
+                          <span className="dc-ctx-checkbox" aria-hidden="true">{ctxMenu.categoryId === cat.id ? '✓' : ''}</span>
+                          <span className="dc-ctx-check-label">{cat.name}</span>
+                        </button>
+                      ))}
+                      <button type="button" role="menuitemradio" aria-checked={!ctxMenu.categoryId} className="dc-ctx-item dc-ctx-check" disabled={!ctxMenu.categoryId}
+                        onClick={() => { setCtxMenu(null); onSetChannelCategory?.(ctxMenu.id, null) }}>
+                        <span className="dc-ctx-checkbox" aria-hidden="true">{!ctxMenu.categoryId ? '✓' : ''}</span>
+                        <span className="dc-ctx-check-label">No category</span>
+                      </button>
+                    </div>
+                  )}
+                  <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onCreateCategory?.() }}>📁 New category…</button>
+                  <div className="dc-ctx-sep" role="separator" />
+                </>
               )}
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onDeleteChannel?.(ctxMenu.id, ctxMenu.name) }}>🗑️ Delete</button>
             </>
           )}
 
-          {ctxMenu.kind === 'member' && (
+          {/* A category is a heading: none of these change who can open the channels under it. */}
+          {ctxMenu.kind === 'category' && (
+            <>
+              <div className="dc-ctx-title">{ctxMenu.name}</div>
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onCreateChannel?.('text', ctxMenu.id) }}>➕ New channel here</button>
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameCategory?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename</button>
+              <button type="button" role="menuitem" className="dc-ctx-item" disabled={!ctxMenu.canUp} onClick={() => { setCtxMenu(null); onMoveCategory?.(ctxMenu.id, 'up') }}>⬆️ Move up</button>
+              <button type="button" role="menuitem" className="dc-ctx-item" disabled={!ctxMenu.canDown} onClick={() => { setCtxMenu(null); onMoveCategory?.(ctxMenu.id, 'down') }}>⬇️ Move down</button>
+              <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onCreateCategory?.() }}>📁 New category…</button>
+              <div className="dc-ctx-sep" role="separator" />
+              <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onDeleteCategory?.(ctxMenu.id, ctxMenu.name) }}>🗑️ Delete</button>
+            </>
+          )}
+
+          {ctxMenu.kind === 'member' && (() => {
+            // Worked out now, from the member as the server last described them: what I may do to
+            // them (permissions.ts mirrors the server's rank rules) and the roles they hold.
+            const target = members.find((m) => m.username === ctxMenu.username)
+            const actions = serverId !== 'demo' && target ? memberActionsFor(viewer, myPermissions, target, serverRoles) : NO_MEMBER_ACTIONS
+            return (
             <>
               <div className="dc-ctx-title">{ctxMenu.name}{ctxMenu.role !== 'member' ? ` · ${ctxMenu.role}` : ''}</div>
               {/* Not offered for someone you blocked: the server would refuse the message. */}
               {!blockedNames.has(ctxMenu.username) && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onPrivateMessage?.({ username: ctxMenu.username, name: ctxMenu.name }) }}>✉️ Private message</button>
               )}
-              {/* Only the owner hands out or takes back admin; admins can kick but not promote. */}
-              {ctxMenu.canManage && myRole === 'owner' && ctxMenu.role === 'member' && (
+              {/* Only the owner hands out or takes back admin; no permission stands in for that. */}
+              {serverId !== 'demo' && myRole === 'owner' && ctxMenu.role === 'member' && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'admin') }}>🛡️ Make admin</button>
               )}
-              {ctxMenu.canManage && myRole === 'owner' && ctxMenu.role === 'admin' && (
+              {serverId !== 'demo' && myRole === 'owner' && ctxMenu.role === 'admin' && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onSetMemberRole?.(ctxMenu.username, 'member') }}>⬇️ Remove admin</button>
               )}
-              {ctxMenu.canManage && (
+              {actions.kick && (
                 <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onKickMember?.(ctxMenu.username) }}>🚫 Remove from server</button>
               )}
-              {/* Time out / Ban (staff, same rule as the entry above) and Block (anyone). */}
+              {/* Roles, Time out and Ban (each by its own permission) and Block (anyone). */}
               <MemberActionItems
                 username={ctxMenu.username}
-                canModerate={Boolean(ctxMenu.canManage)}
+                actions={actions}
+                heldRoleIds={target?.roles || []}
+                onToggleRole={onToggleMemberRole}
                 timedOut={Boolean(ctxMenu.timedOut)}
                 blocked={blockedNames.has(ctxMenu.username)}
                 onDone={() => setCtxMenu(null)}
@@ -726,7 +789,8 @@ export default function AppLeftPane({
                 onUnblock={onUnblockUser}
               />
             </>
-          )}
+            )
+          })()}
 
         </FloatingMenu>
       )}

@@ -1,9 +1,11 @@
 import React, { useEffect, useState, useCallback } from 'react'
 
-// Manage which members can access an existing PRIVATE channel. Owner/admins always have access,
-// so they aren't listed — this edits the explicit-grant list only.
-export default function ManageChannelAccessModal({ open, serverId, channel, roster = [], serverUrl, token, onClose }) {
+// Manage who can access an existing PRIVATE channel: the roles on its list (everyone who holds
+// one gets in, for as long as they hold it) and the members named on it. Owner/admins and anyone
+// whose role manages channels always have access, so they aren't listed — this edits the list only.
+export default function ManageChannelAccessModal({ open, serverId, channel, roster = [], roles = [], serverUrl, token, onClose }) {
   const [granted, setGranted] = useState([]) // usernames with access (from the server)
+  const [grantedRoles, setGrantedRoles] = useState([]) // ids of the roles on the list
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('') // username currently being toggled
@@ -19,6 +21,7 @@ export default function ManageChannelAccessModal({ open, serverId, channel, rost
       const d = await r.json()
       if (!r.ok) throw new Error(d.error || 'Could not load access list')
       setGranted(d.members || [])
+      setGrantedRoles(d.roles || [])
     } catch (e) { setError(e.message) }
     finally { setLoading(false) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -57,6 +60,19 @@ export default function ManageChannelAccessModal({ open, serverId, channel, rost
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
+  // Put a role on the list, or take it off. Taking it off closes the channel at once for every
+  // holder with no other way in; the server does that, this only asks.
+  const toggleRole = async (roleId, on) => {
+    setBusy(`role:${roleId}`); setError('')
+    try {
+      const r = on
+        ? await fetch(`${serverUrl}/servers/${encodeURIComponent(serverId)}/channels/${encodeURIComponent(cid)}/roles`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...auth }, body: JSON.stringify({ roleId }) })
+        : await fetch(`${serverUrl}/servers/${encodeURIComponent(serverId)}/channels/${encodeURIComponent(cid)}/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE', headers: auth })
+      if (!r.ok) throw new Error((await r.json()).error || (on ? 'Could not add the role' : 'Could not remove the role'))
+      setGrantedRoles((g) => (on ? (g.includes(roleId) ? g : [...g, roleId]) : g.filter((id) => id !== roleId)))
+    } catch (e) { setError(e.message) } finally { setBusy('') }
+  }
+
   return (
     <div className="cc-overlay" onClick={onClose}>
       <div className="cc-modal" role="dialog" aria-label="Manage channel access" onClick={(e) => e.stopPropagation()}>
@@ -65,7 +81,38 @@ export default function ManageChannelAccessModal({ open, serverId, channel, rost
 
         {error && <div className="cc-access-error">{error}</div>}
 
-        <div className="cc-label">Who can access it {granted.length > 0 && <span className="cc-count">· {granted.length} added</span>}</div>
+        {roles.length > 0 && (
+          <>
+            <div className="cc-label">Roles with access {grantedRoles.length > 0 && <span className="cc-count">· {grantedRoles.length} added</span>}</div>
+            <div className="cc-members">
+              {loading ? (
+                <div className="cc-members-empty">Loading…</div>
+              ) : (
+                roles.map((role) => {
+                  const on = grantedRoles.includes(role.id)
+                  return (
+                    <button
+                      type="button"
+                      key={role.id}
+                      className={`cc-member${on ? ' on' : ''}`}
+                      disabled={busy === `role:${role.id}`}
+                      onClick={() => toggleRole(role.id, !on)}
+                      aria-pressed={on}
+                    >
+                      <span className="cc-member-check">{on ? '✓' : ''}</span>
+                      <span className="role-dot" style={{ background: role.color || 'transparent' }} aria-hidden="true" />
+                      <span className="cc-member-name">{role.name}</span>
+                      {busy === `role:${role.id}` && <span className="cc-member-busy">…</span>}
+                    </button>
+                  )
+                })
+              )}
+            </div>
+            <div className="cc-members-note">Everyone who holds one of these roles can open the channel, for as long as they hold it.</div>
+          </>
+        )}
+
+        <div className="cc-label">{roles.length > 0 ? 'Members with access' : 'Who can access it'} {granted.length > 0 && <span className="cc-count">· {granted.length} added</span>}</div>
         <div className="cc-members">
           {loading ? (
             <div className="cc-members-empty">Loading…</div>

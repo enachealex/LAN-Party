@@ -129,6 +129,32 @@ export function describeAudit(entry: AuditEntry): string {
     }
     case 'invite.revoke': return `${actor} revoked an invite link${text(d?.createdBy) && d?.createdBy !== entry.actor ? ` made by ${text(d?.createdBy)}` : ''}`
     case 'app_rooms.reset': return `${actor} reset the app rooms`
+    // Custom roles. The role is named in the detail; the target, when there is one, is a member.
+    case 'role.create': return `${actor} created the role ${text(d?.role) || '(unnamed)'}`
+    case 'role.update': {
+      const changes = [
+        d?.name && typeof d.name === 'object' ? `renamed it from “${text((d.name as Record<string, unknown>).from)}”` : '',
+        d?.color ? 'changed its colour' : '',
+        Array.isArray(d?.added) && d.added.length ? `added ${d.added.join(', ')}` : '',
+        Array.isArray(d?.removed) && d.removed.length ? `removed ${d.removed.join(', ')}` : '',
+      ].filter(Boolean)
+      return `${actor} edited the role ${text(d?.role) || '(unnamed)'}${changes.length ? `: ${changes.join('; ')}` : ''}`
+    }
+    case 'role.delete': return `${actor} deleted the role ${text(d?.role) || '(unnamed)'}`
+    case 'role.move': return `${actor} moved the role ${text(d?.role) || '(unnamed)'} ${d?.direction === 'up' ? 'up' : 'down'}`
+    case 'member.role_add': return `${actor} gave ${target} the role ${text(d?.role) || '(unnamed)'}`
+    case 'member.role_remove': return `${actor} took the role ${text(d?.role) || '(unnamed)'} from ${target}`
+    case 'channel.access_role_grant': return `${actor} gave the role ${text(d?.role) || '(unnamed)'} access to ${text(d?.channel) || 'a private channel'}`
+    case 'channel.access_role_remove': return `${actor} removed the role ${text(d?.role) || '(unnamed)'}’s access to ${text(d?.channel) || 'a private channel'}`
+    // Categories and channel order: where things are listed, never who can open them.
+    case 'category.create': return `${actor} created the category ${text(d?.name) || '(unnamed)'}`
+    case 'category.rename': return `${actor} renamed the category ${text(d?.from)} to ${text(d?.to)}`
+    case 'category.delete': return `${actor} deleted the category ${text(d?.name) || '(unnamed)'}`
+    case 'category.move': return `${actor} moved the category ${text(d?.name) || '(unnamed)'} ${d?.direction === 'up' ? 'up' : 'down'}`
+    case 'channel.move': return `${actor} moved the channel ${text(d?.channel) || '(unnamed)'} ${d?.direction === 'up' ? 'up' : 'down'}`
+    case 'channel.category': return text(d?.category)
+      ? `${actor} moved the channel ${text(d?.channel) || '(unnamed)'} into the category ${text(d?.category)}`
+      : `${actor} moved the channel ${text(d?.channel) || '(unnamed)'} out of its category`
     default: return `${actor}: ${entry.action}${entry.target ? ` (${entry.target})` : ''}`
   }
 }

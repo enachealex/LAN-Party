@@ -12,14 +12,19 @@
 //   timeout  Still a member, still reading, but may not take part until a moment in time. Nothing
 //            runs when it ends: every check is `until > now`, so it is over the instant it is over.
 //
-// WHO MAY DO IT (mayModerate): the owner to anyone but themselves, an admin to plain members only.
-// Never sideways (admin on admin), never upwards (admin on owner), never to yourself.
+// WHO MAY DO IT: whoever holds the `ban` or `timeout` permission, to someone ranked strictly below
+// them. So the owner to anyone but themselves, an admin to anyone who is not staff, a member whose
+// custom role carries the permission to members ranked below that role. Never sideways (admin on
+// admin), never upwards (admin on owner), never to yourself. The rule itself is
+// services/permissions.js (decideAction); this file words its refusals (moderationRefusal).
 //
 // NEVER THE COMMONS. The public server has no staff and nobody can be removed from it, so every
 // function here answers "nothing" for it, whatever the tables hold, and the routes refuse it by name.
 //
 // THE AUDIT LOG records who did what to whom, and when: never what anyone said. `target` is a
 // username or null; everything else goes in `detail`. Kept to AUDIT_MAX_ROWS per server.
+
+const { decideAction, builtinRank, isStaffRole } = require('./permissions');
 
 const REASON_MAX = 300;
 const TIMEOUT_MIN_MINUTES = 1;
@@ -52,6 +57,23 @@ const AUDIT = Object.freeze({
   inviteCreated: 'invite.create',
   inviteRevoked: 'invite.revoke',
   appRoomsReset: 'app_rooms.reset',
+  // Custom roles (routes/roles.js). A role is named in `detail` ({ roleId, role }), never in
+  // `target`, which is only ever a username.
+  roleCreated: 'role.create',
+  roleUpdated: 'role.update',
+  roleDeleted: 'role.delete',
+  roleMoved: 'role.move',
+  roleAssigned: 'member.role_add',
+  roleUnassigned: 'member.role_remove',
+  accessRoleGranted: 'channel.access_role_grant',
+  accessRoleRemoved: 'channel.access_role_remove',
+  // Channel categories and channel order (routes/categories.js).
+  categoryCreated: 'category.create',
+  categoryRenamed: 'category.rename',
+  categoryDeleted: 'category.delete',
+  categoryMoved: 'category.move',
+  channelMoved: 'channel.move',
+  channelFiled: 'channel.category',
 });
 /** @type {Set<string>} */
 const AUDIT_ACTIONS = new Set(Object.values(AUDIT));
@@ -85,18 +107,38 @@ function parseMinutes(value) {
 }
 
 /**
- * May `actor` ban or time out `target` in a server? `targetRole` is null for someone who is not a
- * member (a ban can still be placed on them).
+ * How a refusal to ban or time someone out is answered: the status and the words for each line
+ * of the rule in services/permissions.js (decideAction) that can say no.
+ * @param {'no-permission' | 'self' | 'owner' | 'rank'} reason
+ * @param {string | null | undefined} actorRole the built-in standing of whoever asked
+ * @returns {{ ok: false, status: number, error: string }}
+ */
+function moderationRefusal(reason, actorRole) {
+  if (reason === 'no-permission') return { ok: false, status: 403, error: 'Only server admins can do that' };
+  if (reason === 'self') return { ok: false, status: 400, error: "You can't do that to yourself" };
+  if (reason === 'owner') return { ok: false, status: 403, error: "The owner can't be moderated" };
+  if (actorRole === 'admin') return { ok: false, status: 403, error: 'Admins can only do that to members, not to other admins' };
+  return { ok: false, status: 403, error: 'You can only do that to members ranked below you' };
+}
+
+/**
+ * May `actor` ban or time out `target`, going by the built-in standings alone? `targetRole` is
+ * null for someone who is not a member (a ban can still be placed on them). The routes ask
+ * permissions.mayActOn, which also knows custom roles; this is the same rule (decideAction) for
+ * a server that has none.
  * @param {{ actor: string, actorRole: string | null, target: string, targetRole: string | null, owner: string | null }} who
  * @returns {{ ok: true } | { ok: false, status: number, error: string }}
  */
 function mayModerate({ actor, actorRole, target, targetRole, owner }) {
-  if (actorRole !== 'owner' && actorRole !== 'admin') return { ok: false, status: 403, error: 'Only server admins can do that' };
-  if (target === actor) return { ok: false, status: 400, error: "You can't do that to yourself" };
-  // By name as well as by role: the owner column is what the rest of the server trusts.
-  if (target === owner || targetRole === 'owner') return { ok: false, status: 403, error: "The owner can't be moderated" };
-  if (actorRole === 'admin' && targetRole === 'admin') return { ok: false, status: 403, error: 'Admins can only do that to members, not to other admins' };
-  return { ok: true };
+  const verdict = decideAction({
+    actorCan: isStaffRole(actorRole),
+    self: target === actor,
+    // By name as well as by role: the owner column is what the rest of the server trusts.
+    targetIsOwner: target === owner || targetRole === 'owner',
+    actorRank: builtinRank(actorRole),
+    targetRank: builtinRank(targetRole),
+  });
+  return verdict.ok ? verdict : moderationRefusal(verdict.reason, actorRole);
 }
 
 /**
@@ -277,6 +319,6 @@ function createModeration({ db, commonsId, now = Date.now }) {
 }
 
 module.exports = {
-  createModeration, mayModerate, parseReason, parseMinutes, AUDIT,
+  createModeration, mayModerate, moderationRefusal, parseReason, parseMinutes, AUDIT,
   REASON_MAX, TIMEOUT_MIN_MINUTES, TIMEOUT_MAX_MINUTES, AUDIT_MAX_ROWS, AUDIT_PAGE_DEFAULT, AUDIT_PAGE_MAX,
 };

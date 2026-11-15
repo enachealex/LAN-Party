@@ -435,6 +435,63 @@ const MIGRATIONS = [
       await db.exec('CREATE INDEX IF NOT EXISTS idx_server_audit_server ON server_audit (server_id, id)');
     },
   },
+  {
+    // Custom roles with permissions, roles on a private channel's access list, and channel
+    // categories (services/permissions.js, routes/roles.js, routes/categories.js). Four new tables
+    // and two new columns; no existing row is read or changed, so a server behaves exactly as it
+    // did until someone creates a role or a category in it.
+    //
+    // server_roles         one row per custom role. `permissions` is a JSON array of names from
+    //                      PERMISSIONS; `position` orders them, higher = higher rank, kept unique
+    //                      per server by the routes. The built-in owner/admin/member stay where
+    //                      they were, in server_members.role: a custom role is additive.
+    // server_member_roles  who holds which role. Keyed by username like server_members, so a
+    //                      rename has to carry it (POST /user/username).
+    // channel_roles        the roles a PRIVATE channel's list names, next to the usernames in
+    //                      channel_members.
+    // channel_categories   headings the channel list is grouped under. Presentation only: a
+    //                      category never decides who can open a channel.
+    //
+    // channels.category_id is NULL for "not in a category", which is every channel that exists
+    // when this runs. channels.position is NULL for "never moved": such channels keep the order
+    // they have always been listed in (the order they were created), after any that were placed.
+    name: '0015_roles_and_categories',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_roles (
+        id TEXT PRIMARY KEY,
+        server_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        color TEXT,
+        position INTEGER NOT NULL DEFAULT 0,
+        permissions TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_server_roles_server ON server_roles (server_id, position)');
+      await db.exec(`CREATE TABLE IF NOT EXISTS server_member_roles (
+        server_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        PRIMARY KEY (server_id, username, role_id)
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_server_member_roles_role ON server_member_roles (role_id)');
+      await db.exec(`CREATE TABLE IF NOT EXISTS channel_roles (
+        server_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        PRIMARY KEY (server_id, channel_id, role_id)
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_channel_roles_role ON channel_roles (role_id)');
+      await db.exec(`CREATE TABLE IF NOT EXISTS channel_categories (
+        id TEXT PRIMARY KEY,
+        server_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0
+      )`);
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_channel_categories_server ON channel_categories (server_id, position)');
+      await addColumn(db, 'channels', 'category_id', 'TEXT');
+      await addColumn(db, 'channels', 'position', 'INTEGER');
+    },
+  },
 ];
 
 /**

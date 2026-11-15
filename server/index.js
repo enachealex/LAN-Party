@@ -25,6 +25,11 @@ const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./servi
 const { createInstanceOwners } = require('./services/instanceOwners');
 const { createBlocks } = require('./services/blocks');
 const { createModeration } = require('./services/moderation');
+const { createPermissions } = require('./services/permissions');
+const { createChannels } = require('./services/channels');
+const { createAccessChanges } = require('./services/accessChanges');
+const { registerRoleRoutes } = require('./routes/roles');
+const { registerCategoryRoutes } = require('./routes/categories');
 const { registerBlockRoutes } = require('./routes/blocks');
 const { registerModerationRoutes } = require('./routes/moderation');
 const { registerMediaRoutes } = require('./routes/media');
@@ -556,6 +561,12 @@ async function main() {
   // from their routes: every rule they describe is enforced here, never left to the client.
   const blocks = createBlocks({ db });
   const moderation = createModeration({ db, commonsId: DEMO_ID });
+  // Who may do what in a server: the built-in owner/admin/member, custom roles and their
+  // permissions, rank, and who can open which channel (services/permissions.js). Every check in
+  // the routes and in the socket handlers below asks it; none of them decides for itself.
+  const permissions = createPermissions({ db, commonsId: DEMO_ID });
+  // Channel order and categories (services/channels.js).
+  const channelLists = createChannels({ db });
 
   // Return deduped members for a server: prefer username when available, keep latest connection per key
   function getMembersForServer(serverId) {
@@ -1095,6 +1106,8 @@ async function main() {
       await db.run('UPDATE users SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE server_members SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE channel_members SET username = ? WHERE username = ?', newUsername, oldUsername);
+      // The custom roles they hold go with them, like the membership rows the roles hang off.
+      await db.run('UPDATE server_member_roles SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE channel_reads SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE music_playlists SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE messages SET author = ? WHERE author = ?', newUsername, oldUsername);
@@ -1159,20 +1172,12 @@ async function main() {
   const newId = (prefix) => `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
   // --- Membership & roles ---
-  const isStaffRole = (role) => role === 'owner' || role === 'admin';
+  // The rules are services/permissions.js. These are the names the handlers below have always
+  // called them by: roleOf answers 'member' for everyone in the public commons and null for
+  // someone who is not a member; canAccessChannel and visibleChannelsFor are the one answer to
+  // "may this person open that channel" for reading, joining, posting, searching and pushing.
+  const { roleOf, canAccessChannel, visibleChannelsFor } = permissions;
   const roleRank = (role) => (role === 'owner' ? 0 : role === 'admin' ? 1 : 2);
-  async function roleOf(serverId, username) {
-    if (!username) return null;
-    if (serverId === DEMO_ID) return 'member'; // everyone belongs to the public commons
-    const row = await db.get('SELECT role FROM server_members WHERE server_id = ? AND username = ?', serverId, username);
-    return row ? row.role : null;
-  }
-  async function isMember(serverId, username) { return (await roleOf(serverId, username)) != null; }
-  // demo: anyone can create public channels (open commons). Otherwise owner/admins only.
-  async function canManageChannels(serverId, username) {
-    if (serverId === DEMO_ID) return true;
-    return isStaffRole(await roleOf(serverId, username));
-  }
   // Full member roster with roles + online flag. demo has no rows → show connected users.
   async function serverRoster(serverId) {
     const onlineUsers = new Set(Object.values(clients).filter((c) => c.serverId === serverId && c.username).map((c) => c.username));
@@ -1194,36 +1199,17 @@ async function main() {
       // Who is timed out right now, and until when: everyone's member list marks them. Only the
       // moment it ends, not the reason, which is between staff and the person (and the audit log).
       const timedOut = await moderation.timeoutsIn(serverId);
+      // The custom roles each member holds (ids, highest first): shown on their profile card, and
+      // what colours their name. Everyone in the server may see who holds what.
+      const heldRoles = await permissions.memberRolesIn(serverId);
       roster = rows.map((r) => ({
-        username: r.username, name: r.username, role: r.role, online: onlineUsers.has(r.username), profile: displayProfileFromSettings(r.settings),
+        username: r.username, name: r.username, role: r.role, roles: heldRoles.get(r.username) || [], online: onlineUsers.has(r.username), profile: displayProfileFromSettings(r.settings),
         ...(timedOut.has(r.username) ? { timeoutUntil: timedOut.get(r.username) } : {}),
       }));
     }
     roster.sort((a, b) => roleRank(a.role) - roleRank(b.role) || (b.online - a.online) || String(a.name).localeCompare(String(b.name)));
     return roster;
   }
-  // Is a user explicitly granted access to a private channel?
-  async function inChannelMembers(serverId, channelId, username) {
-    if (!username) return false;
-    const row = await db.get('SELECT 1 FROM channel_members WHERE server_id = ? AND channel_id = ? AND username = ?', serverId, channelId, username);
-    return !!row;
-  }
-  // Can this user see/use the channel? Public → any member. Private → owner/admins or an explicit grant.
-  async function canAccessChannel(serverId, channelId, username, privacy, role) {
-    if (!role) return false;                 // not a member of the server
-    if (privacy !== 'private') return true;  // public channel
-    if (isStaffRole(role)) return true;      // owner/admins manage everything
-    return inChannelMembers(serverId, channelId, username);
-  }
-  // Channels a given user can see: staff see all; others see public channels + the private ones
-  // they've been explicitly added to.
-  async function visibleChannelsFor(serverId, channels, username, role) {
-    if (isStaffRole(role)) return channels;
-    const grantedRows = await db.all('SELECT channel_id FROM channel_members WHERE server_id = ? AND username = ?', serverId, username);
-    const granted = new Set(grantedRows.map((r) => r.channel_id));
-    return channels.filter((c) => c.privacy !== 'private' || granted.has(c.id));
-  }
-
   // --- Unreads ---
   async function markChannelRead(username, serverId, channelId) {
     if (!username) return;
@@ -1255,14 +1241,13 @@ async function main() {
       io.except([...blockers].map((name) => `user:${name}`)).emit('unread:bump', payload);
       return;
     }
-    // For a private channel, only staff + explicitly-granted members should be nudged.
-    const granted = privacy === 'private'
-      ? new Set((await db.all('SELECT username FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId)).map((r) => r.username))
-      : null;
+    // For a private channel, only the people who can open it are nudged. Asked through
+    // canAccessChannel like every other path, so a role on the channel's list counts here too
+    // (this loop used to read the list of names itself, and would have missed one).
     const members = await db.all('SELECT username, role FROM server_members WHERE server_id = ?', serverId);
     for (const m of members) {
       if (m.username === author || blockers.has(m.username)) continue;
-      if (privacy === 'private' && !isStaffRole(m.role) && !granted.has(m.username)) continue;
+      if (privacy === 'private' && !(await canAccessChannel(serverId, channelId, m.username, privacy, m.role))) continue;
       io.to(`user:${m.username}`).emit('unread:bump', payload);
     }
   }
@@ -1306,31 +1291,50 @@ async function main() {
   async function broadcastServerState(serverId) {
     const srv = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
     if (!srv) return;
-    const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
+    const allChannels = await channelLists.listChannels(serverId);
+    const allCategories = await channelLists.listCategories(serverId);
     const roster = await serverRoster(serverId);
+    // The server's custom roles, highest first. What each one permits is only sent to people who
+    // manage roles; everyone else gets the name, colour and order, which is what the UI shows them.
+    const allRoles = await permissions.listRoles(serverId);
+    const rolesForDisplay = allRoles.map(({ id, name, color, position }) => ({ id, name, color, position }));
     const room = io.sockets.adapter.rooms.get(`server:${serverId}`) || new Set();
     for (const sid of room) {
       const username = clients[sid]?.username;
-      const role = await roleOf(serverId, username);
+      const standing = await permissions.standingOf(serverId, username);
+      const role = standing.role;
       const channels = await visibleChannelsFor(serverId, allChannels, username, role);
+      // A category is shown to someone only if it holds a channel they can see (or they manage
+      // channels). It is a heading, never a rule: which channels they see was decided above.
+      const categories = channelLists.categoriesFor(allCategories, channels, standing.permissions.has('manage_channels'));
+      const roles = standing.permissions.has('manage_roles') ? allRoles : rolesForDisplay;
+      // myPermissions: what this person may do here, so their client can show and hide controls.
+      // It decides nothing: every route and handler asks services/permissions.js again.
+      const myPermissions = [...standing.permissions];
       // myTimeout: this person's own timeout here, with its reason, or null. It is how a client
       // that was not connected when the timeout was placed (or that has just switched to this
       // server) learns of it. `now` is this server's clock, so that a client whose own clock is
       // off still counts down the right length of time for it and for the roster's markers.
       const myTimeout = await moderation.timeoutOf(serverId, username);
-      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, iconUrl: srv.icon_url || null, channels }, members: roster, myRole: role, myTimeout, now: Date.now() });
+      io.to(sid).emit('server:state', { server: { id: srv.id, name: srv.name, owner: srv.owner || null, iconUrl: srv.icon_url || null, channels, categories, roles }, members: roster, myRole: role, myPermissions, myTimeout, now: Date.now() });
     }
   }
 
   // Servers / channels / membership (routes/servers.js).
-  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, roleOf, isMember, isStaffRole, canManageChannels, canAccessChannel, visibleChannelsFor, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks });
+  // What a change that takes access away from someone has to do afterwards (services/accessChanges.js).
+  const accessChanges = createAccessChanges({ db, permissions, appRooms, enforceVoiceAccess, enforceTextAccess });
+  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, channelLists, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks });
 
   // Shareable invite links (routes/invites.js).
-  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput, moderation });
+  registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation });
 
   // Bans, timeouts and the audit log (routes/moderation.js). A ban removes a member with the kick
   // route's own clean-up, which is why that is handed over from registerServerRoutes.
-  registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, moderation, removeMemberFromServer, broadcastServerState, enforceVoiceAccess });
+  registerModerationRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, moderation, removeMemberFromServer, broadcastServerState, enforceVoiceAccess });
+
+  // Custom roles (routes/roles.js), and channel categories and channel order (routes/categories.js).
+  registerRoleRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, accessChanges, moderation, broadcastServerState });
+  registerCategoryRoutes({ app, db, authMiddleware, DEMO_ID, newId, permissions, channelLists, moderation, broadcastServerState });
 
   // Web Push subscriptions (routes/push.js).
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
@@ -1478,7 +1482,7 @@ async function main() {
       const result = {};
       const blocked = await blocks.blockedBy(me); // marked, like every other history the caller is sent
       for (const s of rows) {
-        const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", s.id);
+        const allChannels = await channelLists.listChannels(s.id);
         const channels = await visibleChannelsFor(s.id, allChannels, me, s.role);
         const messagesByChannel = {};
         for (const ch of channels) {
@@ -1716,7 +1720,7 @@ async function main() {
         if (room !== socket.id && (room.startsWith('server:') || room.startsWith('channel:'))) socket.leave(room);
       }
       socket.join(`server:${serverId}`);
-      const allChannels = await db.all("SELECT id, name, type, COALESCE(privacy, 'public') AS privacy FROM channels WHERE server_id = ?", serverId);
+      const allChannels = await channelLists.listChannels(serverId);
       await broadcastServerState(serverId); // role-filtered state to everyone (incl. this newcomer)
 
       // Enter the first text channel this user can actually see, and send its history.
@@ -2164,8 +2168,12 @@ async function main() {
 
     // --- Collaborative image editing (shared annotation canvas, session keyed by image url) ---
     // Announce a collaboration so others in the channel can join.
-    socket.on('collab:start', ({ serverId = 'demo', channelId = 'general', sessionId, imageUrl } = {}) => {
+    // Held to the channel's access rules like anything else sent into one: this used to relay the
+    // invitation to whichever channel room was named, a private one the sender cannot open included.
+    socket.on('collab:start', async ({ serverId = 'demo', channelId = 'general', sessionId, imageUrl } = {}) => {
       if (!sessionId) return;
+      const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+      if (!ch || !(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, await roleOf(serverId, socketUser)))) return;
       if (!collabSessions[sessionId]) collabSessions[sessionId] = { imageUrl, segments: [] };
       const by = clients[socket.id]?.name || 'Anon';
       socket.to(`channel:${serverId}:${channelId}`).emit('collab:invite', { sessionId, imageUrl, by });

@@ -127,10 +127,18 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
         await db.run('DELETE FROM server_bans WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_timeouts WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_audit WHERE server_id = ?', s.id);
+        // Its custom roles, who held them, the roles on its channels' lists, and its categories.
+        await db.run('DELETE FROM server_member_roles WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM channel_roles WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM server_roles WHERE server_id = ?', s.id);
+        await db.run('DELETE FROM channel_categories WHERE server_id = ?', s.id);
         await db.run('DELETE FROM servers WHERE id = ?', s.id);
       }
       await db.run('DELETE FROM server_members WHERE username = ?', username);
       await db.run('DELETE FROM channel_members WHERE username = ?', username);
+      // The custom roles they held, everywhere: whoever registers the freed username next must
+      // not find themselves holding a role (and whatever it permits) in someone's server.
+      await db.run('DELETE FROM server_member_roles WHERE username = ?', username);
       await db.run('DELETE FROM channel_reads WHERE username = ?', username);
       await db.run('DELETE FROM music_playlists WHERE username = ?', username);
       await db.run('DELETE FROM messages WHERE author = ?', username);

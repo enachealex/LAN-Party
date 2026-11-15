@@ -5,8 +5,9 @@
 // Rules:
 // - The code is the credential. It comes from crypto.randomBytes (96 bits), so it cannot be guessed
 //   or enumerated, and nothing about the server can be read back out of it.
-// - Only owner/admins mint, list and revoke. The public 'demo' server has no links: everyone is
-//   already in it.
+// - Only people with the invite permission (the owner, admins, and members a custom role gives it
+//   to; services/permissions.js) mint, list and revoke. The public 'demo' server has no links:
+//   everyone is already in it.
 // - GET /invites/:code is deliberately unauthenticated, because a logged-out visitor has to see what
 //   they are about to join before making an account. It therefore says as little as possible (name,
 //   icon, member count) and gives ONE answer for every code that cannot be used. Revoked, expired,
@@ -16,7 +17,8 @@
 // - A link does not undo a kick. Someone staff removed (server_removed, written by the kick route in
 //   routes/servers.js) is refused by every link to that server until staff add them back by
 //   username, and gets the same answer as for a dead code. The links a person minted are revoked
-//   when they stop being staff there (kicked, demoted, left); that happens in routes/servers.js too.
+//   when they can no longer invite there (kicked, demoted, left, a role gone); see
+//   services/accessChanges.js.
 // - A link does not get round a ban either (server_bans, services/moderation.js). The difference
 //   from a kick is on the other side: staff adding a kicked person by username lets them back in,
 //   while a banned person stays out until the ban itself is lifted. To the person holding the link
@@ -47,7 +49,8 @@ const ACCEPT_LIMIT = { id: 'invite-accept', windowMs: 5 * 60_000, max: 60 };
 const ACTIVE = 'revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) AND (max_uses IS NULL OR uses < max_uses)';
 
 /** @param {Record<string, any>} deps */
-function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, isMember, isStaffRole, broadcastServerState, validate, inviteLinkInput, moderation }) {
+function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation }) {
+  const { isMember } = permissions;
   const newCode = () => crypto.randomBytes(CODE_BYTES).toString('base64url');
 
   // The one response for every unusable code. Same status and same body whatever the reason.
@@ -71,7 +74,7 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
     if (serverId === DEMO_ID) { res.status(400).json({ error: 'Everyone is already in the public server' }); return null; }
     const srv = await db.get('SELECT id, name FROM servers WHERE id = ?', serverId);
     if (!srv) { res.status(404).json({ error: 'Server not found' }); return null; }
-    if (!isStaffRole(await roleOf(serverId, req.user.username))) { res.status(403).json({ error: `Only server admins can ${action}` }); return null; }
+    if (!(await permissions.can(serverId, req.user.username, 'invite'))) { res.status(403).json({ error: `Only server admins can ${action}` }); return null; }
     return srv;
   }
 
@@ -86,7 +89,7 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
     return run;
   }
 
-  // Mint a link (owner/admin).
+  // Mint a link (the invite permission).
   app.post('/servers/:serverId/invites', rateLimit({ id: 'invite-create', windowMs: 10 * 60_000, max: 120 }), authMiddleware, async (req, res) => {
     const srv = await staffServer(req, res, 'create invite links');
     if (!srv) return undefined;
@@ -112,7 +115,7 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
     return res.json({ invite: shape(row) });
   });
 
-  // Links that can still be used, newest first (owner/admin). Dead ones are left out: there is
+  // Links that can still be used, newest first (the invite permission). Dead ones are left out: there is
   // nothing an admin can do with them.
   app.get('/servers/:serverId/invites', authMiddleware, async (req, res) => {
     const srv = await staffServer(req, res, 'view invite links');
@@ -125,7 +128,7 @@ function registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, roleOf, is
     return res.json({ invites: rows.map(shape) });
   });
 
-  // Revoke a link (owner/admin). Scoped to the server in the URL, so an admin of one server cannot
+  // Revoke a link (the invite permission). Scoped to the server in the URL, so an admin of one server cannot
   // kill another server's link by knowing its code.
   app.delete('/servers/:serverId/invites/:code', authMiddleware, async (req, res) => {
     const srv = await staffServer(req, res, 'revoke invite links');

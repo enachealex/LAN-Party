@@ -90,7 +90,11 @@ describe('schema migrations', () => {
     const before = await snapshot();
     assert.equal(before.messages.rows.length, 1);
 
-    await migrate(db); // the boot that picks 0014 up
+    // The boot that picks 0014 up. Run through 0014 and no further: this is about what THAT
+    // migration does, and a later one is free to add a column to a table that was here before it
+    // (0015 does, and has its own test below).
+    const boot = async () => { await runMigrations(db, MIGRATIONS.slice(0, upTo + 1)); await seedDemo(db); };
+    await boot();
     assert.deepEqual(await snapshot(), before, 'no existing table gained, lost or changed anything');
 
     const applied = (await db.all('SELECT name FROM schema_migrations')).map((r) => r.name);
@@ -117,9 +121,84 @@ describe('schema migrations', () => {
 
     // Running it again (a database that lost its migration record) changes nothing either.
     await db.exec('DROP TABLE schema_migrations');
-    await migrate(db);
+    await boot();
     assert.deepEqual(await snapshot(), before);
     assert.equal((await db.get('SELECT COUNT(*) AS n FROM user_blocks')).n, 2, 'and keeps what the new tables hold');
+    await db.close();
+  });
+
+  test('0015 (roles and categories) adds four tables and two empty columns, and changes no existing row', async () => {
+    // A database as production has it the moment before this migration: everything up to 0014
+    // applied and recorded, with servers, channels (one private, with a member on its list),
+    // members of every built-in standing, and moderation records.
+    const db = await freshDb();
+    const upTo = MIGRATIONS.findIndex((m) => m.name === '0015_roles_and_categories');
+    assert.ok(upTo > 0, 'the migration exists, after the ones already shipped');
+    assert.equal(MIGRATIONS[upTo - 1].name, '0014_blocks_and_moderation', 'appended directly after 0014');
+    await runMigrations(db, MIGRATIONS.slice(0, upTo));
+    await seedDemo(db);
+    await db.run("INSERT INTO users (username, email, password_hash, settings) VALUES ('ann', 'ann@example.com', 'hash', '{}'), ('ben', 'ben@example.com', 'hash', '{}'), ('cat', 'cat@example.com', 'hash', '{}')");
+    await db.run("INSERT INTO servers (id, name, owner, app_room_epoch) VALUES ('srv-1', 'Crew', 'ann', 4)");
+    await db.run("INSERT INTO channels (id, server_id, name, type, privacy) VALUES ('ch-1', 'srv-1', 'general', 'text', 'public'), ('ch-2', 'srv-1', 'staff', 'text', 'private'), ('ch-3', 'srv-1', 'Voice 1', 'voice', NULL)");
+    await db.run("INSERT INTO server_members (server_id, username, role) VALUES ('srv-1', 'ann', 'owner'), ('srv-1', 'ben', 'admin'), ('srv-1', 'cat', 'member')");
+    await db.run("INSERT INTO channel_members (server_id, channel_id, username) VALUES ('srv-1', 'ch-2', 'cat')");
+    await db.run("INSERT INTO messages (server_id, channel_id, author, text, ts) VALUES ('srv-1', 'ch-2', 'cat', 'hello', 1700000000001)");
+    await db.run("INSERT INTO server_bans (server_id, username, banned_by, banned_at) VALUES ('srv-1', 'dan', 'ann', 1700000000000)");
+    await db.run("INSERT INTO server_audit (server_id, ts, actor, action, target) VALUES ('srv-1', 1700000000000, 'ann', 'member.ban', 'dan')");
+
+    const tables = (await db.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations' ORDER BY name")).map((r) => r.name);
+    const ADDED_TO_CHANNELS = ['category_id', 'position'];
+    // Every existing table as it stands, with the two new channel columns left out of the
+    // comparison (they are checked on their own, below).
+    const snapshot = async () => {
+      const out = {};
+      for (const t of tables) {
+        const columns = (await columnNames(db, t)).filter((c) => !(t === 'channels' && ADDED_TO_CHANNELS.includes(c)));
+        out[t] = { columns, rows: await db.all(`SELECT ${columns.join(', ')} FROM ${t} ORDER BY rowid`) };
+      }
+      return out;
+    };
+    const before = await snapshot();
+    assert.equal(before.channels.rows.length, 5, 'the two commons channels and the three of srv-1');
+    assert.ok(!(await columnNames(db, 'channels')).includes('category_id'));
+
+    await migrate(db); // the boot that picks 0015 up
+    assert.deepEqual(await snapshot(), before, 'no existing row or column changed');
+    assert.deepEqual((await columnNames(db, 'channels')).slice(-2), ADDED_TO_CHANNELS, 'channels gained exactly these, at the end');
+    assert.deepEqual(
+      await db.all('SELECT DISTINCT category_id, position FROM channels'), [{ category_id: null, position: null }],
+      'every existing channel is in no category and has never been moved'
+    );
+
+    const NEW = {
+      server_roles: ['id', 'server_id', 'name', 'color', 'position', 'permissions', 'created_at'],
+      server_member_roles: ['server_id', 'username', 'role_id'],
+      channel_roles: ['server_id', 'channel_id', 'role_id'],
+      channel_categories: ['id', 'server_id', 'name', 'position'],
+    };
+    for (const [table, columns] of Object.entries(NEW)) {
+      assert.ok(!tables.includes(table), `${table} is new`);
+      assert.deepEqual(await columnNames(db, table), columns);
+      assert.equal((await db.get(`SELECT COUNT(*) AS n FROM ${table}`)).n, 0, `${table} starts empty: no server has a role or a category`);
+    }
+    // A member holds a role once, and a channel lists a role once.
+    await db.run("INSERT INTO server_member_roles (server_id, username, role_id) VALUES ('srv-1', 'cat', 'role-1')");
+    await assert.rejects(() => db.run("INSERT INTO server_member_roles (server_id, username, role_id) VALUES ('srv-1', 'cat', 'role-1')"));
+    await db.run("INSERT INTO server_member_roles (server_id, username, role_id) VALUES ('srv-1', 'cat', 'role-2')");
+    await db.run("INSERT INTO channel_roles (server_id, channel_id, role_id) VALUES ('srv-1', 'ch-2', 'role-1')");
+    await assert.rejects(() => db.run("INSERT INTO channel_roles (server_id, channel_id, role_id) VALUES ('srv-1', 'ch-2', 'role-1')"));
+
+    // The channel list is in the order it always was: the order the channels were created in.
+    const { createChannels } = require('../services/channels');
+    assert.deepEqual((await createChannels({ db }).listChannels('srv-1')).map((c) => [c.id, c.privacy, c.categoryId]), [
+      ['ch-1', 'public', null], ['ch-2', 'private', null], ['ch-3', 'public', null],
+    ]);
+
+    // Running it again (a database that lost its migration record) changes nothing either.
+    await db.exec('DROP TABLE schema_migrations');
+    await migrate(db);
+    assert.deepEqual(await snapshot(), before);
+    assert.equal((await db.get('SELECT COUNT(*) AS n FROM server_member_roles')).n, 2, 'and keeps what the new tables hold');
     await db.close();
   });
 

@@ -11,6 +11,12 @@ Trusted Web Activity APK for Android.
 
 - **Servers & channels**: text and voice channels, private channels, owner/admin roles, invites by
   username or by shareable link, custom server icons.
+- **Roles & categories**: custom roles with a name, a colour and a set of permissions (manage the
+  server, channels or roles, invite, kick, time out, ban, read the audit log), ranked so that
+  people only act on members and roles below their own, and nobody grants a permission they lack.
+  A private channel can list roles as well as members, and losing the role closes it at once.
+  Channels can be grouped under collapsible categories and reordered; a category is only a
+  heading and never changes who can open a channel.
 - **Chat**: file uploads (deleted after 7 days), GIFs (Tenor plus your own library), custom emojis,
   reactions with customizable quick reactions, quoted replies, pins, and edits and deletes that are
   saved and shown to everyone.
