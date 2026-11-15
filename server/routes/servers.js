@@ -17,7 +17,7 @@ const APP_ROOMS_RESET_LIMIT = {
 };
 
 /** @param {Record<string, any>} deps */
-function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks }) {
+function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks, notificationSettings }) {
   const { roleOf, isMember, can, canAccessChannel, visibleChannelsFor } = permissions;
   // The commons is open (anyone may add a public channel there); elsewhere it is manage_channels.
   const canManageChannels = permissions.mayManageChannels;
@@ -52,8 +52,15 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
 
   // Unread message counts per channel, for every server the user belongs to. Only channels the
   // user can see are included (private channels never leak counts to plain members).
+  //
+  // `notifications` is everything the caller has set a notification level for
+  // (services/notificationSettings.js). It rides along because it is what turns these counts into
+  // badges: a muted channel's count is still here (its row shows it, dimmed) and it is the client
+  // that leaves it out of the server tile's badge. Sent in the same answer so that the counts and
+  // the levels they are read with can never be from two different moments.
   app.get('/unreads', authMiddleware, async (req, res) => {
     const me = req.user.username;
+    const notifications = await notificationSettings.settingsOfUsername(me);
     // Messages from someone the caller has blocked are not counted, here or among the mentions
     // below: a blocked person must not be able to light up a badge (services/blocks.js).
     const counts = await db.all(
@@ -64,7 +71,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
        GROUP BY m.server_id, m.channel_id`,
       me, me, me
     );
-    if (!counts.length) return res.json({ unreads: {}, mentions: {} });
+    if (!counts.length) return res.json({ unreads: {}, mentions: {}, notifications });
     // Roles for my servers, from membership rows (no implicit public server anymore).
     const memberships = await db.all('SELECT server_id, role FROM server_members WHERE username = ?', me);
     const myRole = new Map(memberships.map((m) => [m.server_id, m.role]));
@@ -95,7 +102,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
       if (!mentionedUsernames(row.text).includes(me)) continue;
       (mentions[row.server_id] ||= {})[row.channel_id] = (mentions[row.server_id][row.channel_id] || 0) + 1;
     }
-    return res.json({ unreads, mentions });
+    return res.json({ unreads, mentions, notifications });
   });
 
   // Create a server: the creator becomes its owner + first member.
@@ -334,6 +341,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
     await db.run('DELETE FROM server_removed WHERE server_id = ?', serverId);
     await moderation.forgetServer(serverId); // its bans, timeouts and audit log go with it
     await permissions.forgetServer(serverId); // and its roles, who held them, and its categories
+    await notificationSettings.forgetServer(serverId); // and what anyone set its notifications to
     await db.run('DELETE FROM server_members WHERE server_id = ?', serverId);
     await db.run('DELETE FROM servers WHERE id = ?', serverId);
     // Nobody is a member any more, and there is no epoch left to bump (services/appRooms.js): the
@@ -371,6 +379,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
     await db.run('DELETE FROM messages WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND channel_id = ?', serverId, channelId);
     await db.run('DELETE FROM channel_roles WHERE server_id = ? AND channel_id = ?', serverId, channelId);
+    await notificationSettings.forgetChannel(channelId);
     await db.run('DELETE FROM channels WHERE id = ?', channelId);
     await pushServerState(serverId);
     await audit(serverId, req.user.username, AUDIT.channelDeleted, null, { channelId, name: ch.name, type: ch.type });
@@ -445,6 +454,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, target);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, target);
     await permissions.forgetMember(serverId, target); // the roles they held here do not wait for them
+    await notificationSettings.forgetMember(serverId, target); // nor do their notification levels
     // A kick has to hold against invite links too. Remembering who was removed is what stops them
     // rejoining through ANY live link (one they were sent, one a friend forwards); revoking the ones
     // they minted stops them handing the server out to others.
@@ -504,6 +514,7 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
     await db.run('DELETE FROM server_members WHERE server_id = ? AND username = ?', serverId, me);
     await db.run('DELETE FROM channel_members WHERE server_id = ? AND username = ?', serverId, me);
     await permissions.forgetMember(serverId, me);
+    await notificationSettings.forgetMember(serverId, me);
     // An admin who walks out takes their links with them. Nothing is written to server_removed:
     // leaving is not being removed, so they may come back through a link someone else made.
     await revokeInvitesBy(serverId, me);

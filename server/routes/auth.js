@@ -132,6 +132,8 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
         await db.run('DELETE FROM channel_roles WHERE server_id = ?', s.id);
         await db.run('DELETE FROM server_roles WHERE server_id = ?', s.id);
         await db.run('DELETE FROM channel_categories WHERE server_id = ?', s.id);
+        // What anyone had set its notifications to, and its channels' (services/notificationSettings.js).
+        await db.run("DELETE FROM notification_settings WHERE (scope = 'server' AND target = ?) OR (scope = 'channel' AND server_id = ?)", s.id, s.id);
         await db.run('DELETE FROM servers WHERE id = ?', s.id);
       }
       await db.run('DELETE FROM server_members WHERE username = ?', username);
@@ -175,6 +177,11 @@ function registerAuthRoutes({ app, db, authMiddleware, JWT_SECRET, isStrongPassw
       );
       await db.run('DELETE FROM group_messages WHERE group_id NOT IN (SELECT group_id FROM group_members)');
       await db.run('DELETE FROM group_chats WHERE id NOT IN (SELECT group_id FROM group_members)');
+      // Notification levels (keyed by user id): everything they had set, everyone else's mute of
+      // the conversation with them, and anything left pointing at a group that just went with them.
+      await db.run('DELETE FROM notification_settings WHERE user_id = ?', userId);
+      await db.run("DELETE FROM notification_settings WHERE scope = 'dm' AND target = ?", String(userId));
+      await db.run("DELETE FROM notification_settings WHERE scope = 'group' AND target NOT IN (SELECT id FROM group_chats)");
       await db.run('DELETE FROM auth_tokens WHERE user_id = ?', userId);
       // Their browsers stop being notified. Left behind, the rows would deliver to whoever registers
       // the freed username next.

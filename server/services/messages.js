@@ -3,6 +3,8 @@
 //
 // Shared by channel messages and DMs, which is why the reaction/pin helpers take a table name.
 
+const { parsePreview } = require('./linkPreview');
+
 /** @param {{ db: any }} deps */
 function createMessages({ db }) {
   function parseAttachment(value) {
@@ -88,6 +90,9 @@ function createMessages({ db }) {
    * @param {any} row @param {string | null} [forUsername] @param {Set<string> | null} [blockedAuthors]
    */
   function mapMessageRow(row, forUsername, blockedAuthors) {
+    // The link preview card (services/linkPreview.js). Only present on a message that has one; a
+    // query that does not select preview_json simply yields none.
+    const preview = parsePreview(row.preview_json);
     return {
       ...(blockedAuthors && blockedAuthors.has(row.author) ? { blocked: true } : {}),
       id: row.id,
@@ -97,6 +102,7 @@ function createMessages({ db }) {
       attachment: parseAttachment(row.attachment_json),
       reactions: formatReactions(parseReactions(row.reactions_json), forUsername),
       quotes: parseQuotes(row.quotes_json),
+      ...(preview ? { preview } : {}),
       edited: !!row.edited_at,
       editedAt: row.edited_at || null,
       pinnedAt: row.pinned_at || null,
@@ -107,7 +113,7 @@ function createMessages({ db }) {
   // Pinned messages of a channel, newest pin first (so pins[0] is what the pinned bar shows).
   async function channelPins(serverId, channelId, forUsername) {
     const rows = await db.all(
-      'SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
+      'SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, preview_json, edited_at, pinned_at, pinned_by FROM messages WHERE server_id = ? AND channel_id = ? AND pinned_at IS NOT NULL ORDER BY pinned_at DESC',
       serverId, channelId
     );
     return (rows || []).map((m) => mapMessageRow(m, forUsername));

@@ -188,6 +188,8 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED`, `SFU_ADDRESS_CHECK` | Voice networking, above |
 | `STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web Push (notifications while the app is closed). All optional: with none set, a keypair is generated on first boot and kept in `DATA_DIR/vapid.json`, and the subject is `mailto:admin@<CLIENT_ORIGIN host>`. See below. |
+| `LINK_PREVIEWS` | Optional. Set to `0` to stop the server fetching the pages people link to (the preview cards under messages). On when unset. See "Link previews" below. |
+| `LINK_PREVIEW_DEBUG` | Optional. Set to anything to log why a link got no preview, or a preview no image: one line with the host name and a short reason code (`[link-preview] no preview: example.com (timeout)`). Never the rest of the URL, and nothing about who posted it. Off when unset. |
 | `TENOR_API_KEY` / `tenor.key` | GIF search |
 | `YOUTUBE_API_KEY` / `youtube.key` | Watch Together search |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI` / `spotify.key` | Spotify |
@@ -211,6 +213,49 @@ Google, Mozilla, Apple, Microsoft). No account or API key is involved.
   restore that brings the database back brings the key with it.
 - Subscriptions are rows in `push_subscriptions`. A browser that has gone away is removed the first
   time its push service answers 404/410.
+- Who is pushed follows each person's notification levels (`notification_settings`): "All
+  messages" adds them to every message of a channel, "Nothing" and a muted DM or group take them
+  out. A level never widens who MAY be pushed: channel access, blocking and the per-sender push
+  allowances are checked the same way at every level.
+
+## Link previews
+
+When a message contains a link, the server fetches that page once and attaches a small card to the
+message (`server/services/linkPreview.js`). This is the only place the server makes a request to an
+address a member chose, so it is held to rules meant for a server that shares a network with
+private services:
+
+- **What is fetched**: `http`/`https` pages on the default port, by DNS name only. Never an IP
+  address in any spelling, `localhost`, a single-label or `.local`/`.internal`/`.lan`-style name, a
+  URL with credentials, or this instance's own hostnames (the request's `Host`, `CLIENT_ORIGIN`,
+  `PUBLIC_APP_URL`).
+- **Where it connects**: the name is resolved by the server, and the fetch is refused if **any**
+  address it resolves to is not public (loopback, RFC 1918, link-local, CGNAT/Tailscale
+  `100.64.0.0/10`, multicast, reserved ranges; for IPv6 anything outside global unicast). The
+  connection then goes to the address that was checked, never to a second lookup of the name, so
+  DNS rebinding changes nothing. Up to 3 redirects, each checked the same way.
+- **YouTube links use oEmbed**: for a video link (`youtube.com/watch?v=`, `youtu.be/<id>`,
+  `/shorts/<id>`, also `m.` and `music.`) the watch page is not fetched; it is ~1.5 MB with its
+  title past what is read of any page. The server asks `https://www.youtube.com/oembed` about the
+  video instead (a small JSON answer, at most 64 KB, by the same rules as any other fetch) and takes
+  the title, the uploader and the thumbnail from it. The thumbnail is fetched and checked like any
+  other image, and the card still links to the address that was posted.
+- **Limits**: 5 s per fetch, 512 KB of HTML read, 2 MB per image, 4 fetches at once, 10 new links
+  per person per minute. Results are cached in the `link_previews` table (24 h, or 1 h for a link
+  that yielded nothing), so a link is fetched once however often it is posted.
+- **What the site sees**: a request from the server's address with a generic `User-Agent`, no
+  cookies and no referrer. Nothing identifies the person who posted the link, and readers' browsers
+  never contact the site: the card's image is fetched by the server (PNG/JPEG/GIF/WebP only, never
+  SVG), stored under `DATA_DIR/link-previews/` by content hash and served from `/link-previews/`
+  with the same headers as uploaded files. Images no stored preview refers to are swept after 30 days.
+- **Outbound access**: the host needs outbound DNS and HTTP/HTTPS (80/443) for this, which it
+  already has. Nothing inbound changes.
+- **Turning it off**: `LINK_PREVIEWS=0` and restart. Nothing is fetched from then on; cards already
+  attached to messages stay (their images are local files). The log says
+  `[link-preview] LINK_PREVIEWS=0: link previews are off`.
+- `DATA_DIR/link-previews/` holds at most 512 MB (past that, new cards go without an image until
+  the sweep frees room). It is disposable: it does not need backing up, and deleting it only costs
+  the images on existing cards.
 
 ## Scale
 

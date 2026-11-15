@@ -60,6 +60,14 @@ const MAX_MENTION_TARGETS = 20;
 // How many mention-bearing messages from one sender may push per window (see allowMentionPush).
 const MENTION_PUSHES_PER_WINDOW = 6;
 const MENTION_WINDOW_MS = 60_000;
+// How many people one channel message can push because they asked for "All messages" in that
+// channel (services/notificationSettings.js), on top of the ones it mentions. The same reason as
+// the mention ceiling: one message must never fan out into an unbounded number of sends.
+const MAX_LEVEL_TARGETS = 50;
+// How many messages from one sender may push those listeners per window (see allowChannelPush).
+// Counted apart from the mention pushes, so a chatty channel with listeners in it can never use
+// up the allowance that lets a mention through.
+const CHANNEL_PUSHES_PER_WINDOW = 6;
 
 const VAPID_FILE = 'vapid.json';
 
@@ -491,6 +499,21 @@ function createPush({ db, dataDir, clientOrigin = '', env = process.env, webpush
     });
   }
 
+  /**
+   * An ordinary channel message, for the people who set that channel to "All messages". Titled the
+   * way the in-page notification titles channel chatter ('#', where a mention has the bell), with
+   * the channel's tag, so the two collapse into one.
+   * @param {{ serverId: string, channelId: string, serverName?: string, channelName?: string, from: string, to: string[], text?: string, attachment?: Attachment }} message
+   */
+  function notifyChannelMessage({ serverId, channelId, serverName, channelName, from, to, text, attachment }) {
+    return notify(to.filter((name) => name !== from), {
+      title: `# ${channelName || 'channel'} · ${serverName || 'LAN Party'}`,
+      body: bodyFrom(from, previewOf(text, attachment)),
+      tag: `lanparty-channel-${serverId}-${channelId}`,
+      url: `/app/?open=channel/${encodeURIComponent(serverId)}/${encodeURIComponent(channelId)}`,
+    });
+  }
+
   /** @param {{ from: string, to: string }} request */
   function notifyFriendRequest({ from, to }) {
     if (!to || to === from) return Promise.resolve();
@@ -511,26 +534,31 @@ function createPush({ db, dataDir, clientOrigin = '', env = process.env, webpush
   // screen, and the socket 'message' handler has no flood control of its own, so without a ceiling a
   // single account could buzz twenty people per message as fast as it could send. Over the limit the
   // messages still deliver and still raise unread badges; they just stop ringing phones.
-  /** @type {Map<string, number[]>} */
-  const mentionTimes = new Map();
-  /** @param {string} sender @param {number} [now] @returns {boolean} true if this mention may push */
-  function allowMentionPush(sender, now = Date.now()) {
-    const recent = (mentionTimes.get(sender) || []).filter((t) => now - t < MENTION_WINDOW_MS);
-    if (recent.length >= MENTION_PUSHES_PER_WINDOW) { mentionTimes.set(sender, recent); return false; }
+  /** @param {Map<string, number[]>} times @param {number} max */
+  const senderLimiter = (times, max) => (/** @type {string} */ sender, now = Date.now()) => {
+    const recent = (times.get(sender) || []).filter((t) => now - t < MENTION_WINDOW_MS);
+    if (recent.length >= max) { times.set(sender, recent); return false; }
     recent.push(now);
-    mentionTimes.set(sender, recent);
-    if (mentionTimes.size > 5000) mentionTimes.clear(); // a bound, not a cache worth tuning
+    times.set(sender, recent);
+    if (times.size > 5000) times.clear(); // a bound, not a cache worth tuning
     return true;
-  }
+  };
+  /** @type {(sender: string, now?: number) => boolean} true if this mention may push */
+  const allowMentionPush = senderLimiter(new Map(), MENTION_PUSHES_PER_WINDOW);
+  // The same ceiling for the pushes "All messages" asks for, kept in a bucket of its own: someone
+  // listening to a whole channel hears the first few lines of a burst and then the unread badge
+  // takes over, and none of that is ever charged to the mention allowance above.
+  /** @type {(sender: string, now?: number) => boolean} true if this message may push its channel's listeners */
+  const allowChannelPush = senderLimiter(new Map(), CHANNEL_PUSHES_PER_WINDOW);
 
   return {
-    available, publicKey, subscribe, unsubscribe, accountExists, allowMentionPush,
+    available, publicKey, subscribe, unsubscribe, accountExists, allowMentionPush, allowChannelPush,
     setFocus, dropSocket, isFocused,
-    notify, notifyDirectMessage, notifyGroupMessage, notifyMention, notifyFriendRequest,
+    notify, notifyDirectMessage, notifyGroupMessage, notifyMention, notifyChannelMessage, notifyFriendRequest,
   };
 }
 
 module.exports = {
   createPush, loadWebPush, previewOf, mentionedUsernames, vapidSubjectFor, isVapidPair, generateVapidKeys,
-  MAX_SUBSCRIPTIONS_PER_USER, MAX_MENTION_TARGETS, BODY_MAX, MENTION_PUSHES_PER_WINDOW,
+  MAX_SUBSCRIPTIONS_PER_USER, MAX_MENTION_TARGETS, MAX_LEVEL_TARGETS, BODY_MAX, MENTION_PUSHES_PER_WINDOW, CHANNEL_PUSHES_PER_WINDOW,
 };

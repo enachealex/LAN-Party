@@ -113,7 +113,7 @@ async function fetchPage(db, source, page) {
  */
 function channelHistory(serverId, channelId) {
   return {
-    columns: 'id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at, pinned_at, pinned_by',
+    columns: 'id, author, text, ts, attachment_json, reactions_json, quotes_json, preview_json, edited_at, pinned_at, pinned_by',
     from: 'messages',
     where: 'server_id = ? AND channel_id = ?',
     params: [serverId, channelId],

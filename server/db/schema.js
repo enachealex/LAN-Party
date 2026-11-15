@@ -492,6 +492,54 @@ const MIGRATIONS = [
       await addColumn(db, 'channels', 'position', 'INTEGER');
     },
   },
+  {
+    // Notification levels (services/notificationSettings.js) and link previews
+    // (services/linkPreview.js). Two new tables and one new column on each of the three message
+    // tables; no existing row is read or changed, so everyone keeps today's behaviour ("only
+    // @mentions", nothing muted, no previews on old messages) until they choose otherwise.
+    //
+    // notification_settings  one row per thing a person has set a level for. Keyed by user id, like
+    //                        user_blocks and friendships, so a rename needs no cascade; an account
+    //                        deletion clears the rows (routes/auth.js). `scope` says what `target`
+    //                        is: 'server' (a server id), 'channel' (a channel id, with its server in
+    //                        server_id so the rows go when the server does), 'dm' (the other
+    //                        person's user id, as text) or 'group' (a group chat id). `level` is
+    //                        'all' | 'mentions' | 'none'. No row means the default: a channel
+    //                        follows its server, a server is 'mentions', a DM or group is not muted.
+    //
+    // link_previews          the fetch cache, by normalised URL: what a page said about itself
+    //                        (status 'ok', `data` JSON) or that nothing usable came back (status
+    //                        'none'), and until when that answer stands. It is what makes one link
+    //                        cost one fetch however many times it is posted.
+    //
+    // preview_json           the preview attached to a message, NULL for none: every message that
+    //                        exists when this runs, any message without a previewable link, and
+    //                        one whose author removed it.
+    name: '0016_notification_levels_and_link_previews',
+    up: async (db) => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS notification_settings (
+        user_id INTEGER NOT NULL,
+        scope TEXT NOT NULL,
+        target TEXT NOT NULL,
+        server_id TEXT,
+        level TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, scope, target)
+      )`);
+      // "Who has a setting for this channel or this server" is asked on every channel message.
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_notification_settings_target ON notification_settings (scope, target)');
+      await db.exec(`CREATE TABLE IF NOT EXISTS link_previews (
+        url TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        data TEXT,
+        fetched_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      )`);
+      await addColumn(db, 'messages', 'preview_json', 'TEXT');
+      await addColumn(db, 'direct_messages', 'preview_json', 'TEXT');
+      await addColumn(db, 'group_messages', 'preview_json', 'TEXT');
+    },
+  },
 ];
 
 /**

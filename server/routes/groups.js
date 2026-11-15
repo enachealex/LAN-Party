@@ -20,7 +20,7 @@ const GROUP_MAX_MEMBERS = 25;
 const GROUP_NAME_MAX = 60;
 
 /** @param {Record<string, any>} deps */
-function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks }) {
+function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor }) {
   const newGroupId = () => `grp-${crypto.randomBytes(8).toString('hex')}`;
 
   // "Not sent by someone this reader has blocked", for a query over `group_messages gm`. One
@@ -136,7 +136,8 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     if (!push.available()) return;
     const group = await db.get('SELECT name FROM group_chats WHERE id = ?', groupId);
     const blockers = await blocks.blockersOf(from); // no phone buzzes for someone its owner blocked
-    const to = (await memberUsernames(groupId)).filter((username) => username !== from && !blockers.has(username));
+    const muters = await notificationSettings.groupMuters(groupId); // nor for someone who muted this group
+    const to = (await memberUsernames(groupId)).filter((username) => username !== from && !blockers.has(username) && !muters.has(username));
     await push.notifyGroupMessage({ groupId, groupName: group ? group.name : '', from, to, text, attachment });
   }
 
@@ -162,11 +163,14 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
   // the group outright once nobody is left.
   async function removeMember(groupId, user) {
     await db.run('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', groupId, user.id);
+    // Their mute of this group goes with the membership (services/notificationSettings.js).
+    await notificationSettings.forgetGroupMember(groupId, user.id);
     io.to(`user:${user.username}`).emit('group:removed', { groupId });
     const remaining = await membersOf(groupId);
     if (remaining.length === 0) {
       await db.run('DELETE FROM group_messages WHERE group_id = ?', groupId);
       await db.run('DELETE FROM group_chats WHERE id = ?', groupId);
+      await notificationSettings.forgetGroup(groupId);
       return;
     }
     const group = await db.get('SELECT owner_id FROM group_chats WHERE id = ?', groupId);
@@ -176,7 +180,7 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     await broadcastGroup(groupId);
   }
 
-  const MESSAGE_COLUMNS = 'gm.id, gm.body AS text, gm.created_at AS ts, gm.attachment_json, gm.reactions_json, gm.quotes_json, gm.edited_at, u.username AS author';
+  const MESSAGE_COLUMNS = 'gm.id, gm.body AS text, gm.created_at AS ts, gm.attachment_json, gm.reactions_json, gm.quotes_json, gm.preview_json, gm.edited_at, u.username AS author';
   const MESSAGE_FROM = 'group_messages gm JOIN users u ON u.id = gm.sender_id';
   const MESSAGE_SELECT = `SELECT ${MESSAGE_COLUMNS} FROM ${MESSAGE_FROM}`;
 
@@ -310,6 +314,11 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     // Everyone else in the group, for those whose app is closed. Not awaited: the message is stored
     // and emitted, and pushing must never delay or fail the send.
     pushToGroup(ctx.groupId, ctx.me.username, body, attachment).catch(() => {});
+    // The link preview follows, to every member, if the message has a link whose page can be fetched.
+    linkPreviews.attachTo({
+      table: 'group_messages', id: message.id, user: ctx.me.username, ownHosts: ownHostsFor(req.headers),
+      emit: (preview) => emitToMembers(ctx.groupId, 'group:message-preview', { groupId: ctx.groupId, id: message.id, preview }),
+    });
     return res.json({ success: true, message });
   });
 
@@ -321,7 +330,7 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     const body = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
     if (!id) return res.status(400).json({ error: 'Invalid message id' });
     if (!body) return res.status(400).json({ error: 'A message needs some text' });
-    const msg = await db.get('SELECT sender_id, attachment_json FROM group_messages WHERE id = ? AND group_id = ?', id, ctx.groupId);
+    const msg = await db.get('SELECT sender_id, body, attachment_json FROM group_messages WHERE id = ? AND group_id = ?', id, ctx.groupId);
     if (!msg) return res.status(404).json({ error: 'Message not found' });
     if (msg.sender_id !== ctx.me.id) return res.status(403).json({ error: 'You can only edit your own messages' });
     if (msg.attachment_json) return res.status(400).json({ error: "Messages with an attachment can't be edited" });
@@ -329,7 +338,28 @@ function registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, c
     await db.run('UPDATE group_messages SET body = ?, edited_at = ? WHERE id = ?', body, editedAt, id);
     const payload = { groupId: ctx.groupId, id, text: body, editedAt };
     await emitToMembers(ctx.groupId, 'group:message-edited', payload);
+    // The preview is only looked at again if the link it is for changed (services/linkPreview.js).
+    const previewEvent = (preview) => emitToMembers(ctx.groupId, 'group:message-preview', { groupId: ctx.groupId, id, preview });
+    linkPreviews.afterEdit({
+      table: 'group_messages', id, oldText: msg.body || '', newText: body, user: ctx.me.username, ownHosts: ownHostsFor(req.headers),
+      emit: previewEvent, clear: () => previewEvent(null),
+    });
     return res.json({ success: true, ...payload });
+  });
+
+  // Take the link preview off a group message — its sender only. It goes for every member.
+  app.delete('/groups/:id/messages/:messageId/preview', authMiddleware, async (req, res) => {
+    const ctx = await requireMember(req, res);
+    if (!ctx) return;
+    const id = parseInt(req.params.messageId, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid message id' });
+    const msg = await db.get('SELECT sender_id FROM group_messages WHERE id = ? AND group_id = ?', id, ctx.groupId);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    if (msg.sender_id !== ctx.me.id) return res.status(403).json({ error: 'You can only remove the preview from your own messages' });
+    if (await linkPreviews.remove('group_messages', id)) {
+      await emitToMembers(ctx.groupId, 'group:message-preview', { groupId: ctx.groupId, id, preview: null });
+    }
+    return res.json({ success: true });
   });
 
   app.delete('/groups/:id/messages/:messageId', authMiddleware, async (req, res) => {

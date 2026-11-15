@@ -13,7 +13,7 @@ const NAV_META = {
   messages: { label: 'Messages', icon: null },
 }
 
-function DmAvatar({ name, color, status, bot, unreadCount = 0, profile = null, resolveSrc = (u) => u }) {
+function DmAvatar({ name, color, status, bot, unreadCount = 0, muted = false, profile = null, resolveSrc = (u) => u }) {
   const initial = (name || '?').replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || '?'
   const hasProfile = profile && (profile.avatarUrl || profile.border?.preset !== 'none' || (profile.overlay && profile.overlay !== 'none'))
   return (
@@ -28,7 +28,7 @@ function DmAvatar({ name, color, status, bot, unreadCount = 0, profile = null, r
       <span className={`dc-status-ring dc-status-${status}`} aria-hidden="true" />
       {bot && <span className="dc-bot-tag">BOT</span>}
       {unreadCount > 0 && (
-        <span className="dc-avatar-unread-badge" aria-label={`${unreadCount} unread messages`}>
+        <span className={`dc-avatar-unread-badge${muted ? ' muted' : ''}`} aria-label={`${unreadCount} unread messages${muted ? ' (muted)' : ''}`}>
           {unreadCount > 99 ? '99+' : unreadCount}
         </span>
       )}
@@ -126,6 +126,9 @@ export default function HomeLeftPanel({
   unreadByChatId = {},
   groupUnread = {},
   resolveAvatarSrc = (u) => u,
+  // Muting (notificationLevels.ts). `kind` is 'dm' or 'group'; a DM's id is the other person's.
+  isConversationMuted = () => false,   // (kind, id) => boolean
+  onSetConversationMuted,              // (kind, id, muted) => void
 }) {
   const [layout, setLayout] = useState(() => normalizeLayout(defaultLayout()))
   const setLayoutNormalized = (updater) => {
@@ -625,6 +628,8 @@ export default function HomeLeftPanel({
     const unread = getUnread(item)
     const preview = item.lastMessage?.text || item.activity || item.preview
     const convId = String(item.id)
+    // Muted: the count is still shown, dimmed, and the row no longer stands out as unread.
+    const muted = isConversationMuted(kind, convId)
     return (
       <li
         key={item.id}
@@ -633,7 +638,7 @@ export default function HomeLeftPanel({
       >
         <button
           type="button"
-          className={`dc-dm-item ${selected ? 'active' : ''} ${unread > 0 ? 'has-unread' : ''}`}
+          className={`dc-dm-item ${selected ? 'active' : ''} ${unread > 0 && !muted ? 'has-unread' : ''} ${muted ? 'muted' : ''}`}
           onClick={() => onClick?.(item)}
           onContextMenu={(e) => openDmMenu(e, kind, item)}
           {...longPressProps((e) => openDmMenu(e, kind, item))}
@@ -644,6 +649,7 @@ export default function HomeLeftPanel({
             status={item.status || 'online'}
             bot={item.bot}
             unreadCount={unread}
+            muted={muted}
             profile={item.profile}
             resolveSrc={resolveAvatarSrc}
           />
@@ -654,8 +660,9 @@ export default function HomeLeftPanel({
                 the profile card, where identity is the point. */}
             {preview && <span className="dc-dm-activity">{preview}</span>}
           </span>
+          {muted && <span className="dc-dm-muted" title="Muted" aria-label="Muted">🔕</span>}
           {unread > 0 && (
-            <span className="dc-dm-row-unread" aria-hidden="true">
+            <span className={`dc-dm-row-unread${muted ? ' muted' : ''}`} aria-hidden="true">
               {unread > 99 ? '99+' : unread}
             </span>
           )}
@@ -896,6 +903,19 @@ export default function HomeLeftPanel({
               View Profile
             </button>
           )}
+          {/* A conversation is muted or it is not: one entry that says which way it will go. */}
+          {(dmMenu.kind === 'dm' || dmMenu.kind === 'group') && onSetConversationMuted && (() => {
+            const muted = isConversationMuted(dmMenu.kind, String(dmMenu.id))
+            return (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { onSetConversationMuted(dmMenu.kind, String(dmMenu.id), !muted); setDmMenu(null) }}
+              >
+                {muted ? '🔔 Unmute' : '🔕 Mute'}
+              </button>
+            )
+          })()}
           {menuFriend && onRemoveFriend && (
             <button
               type="button"

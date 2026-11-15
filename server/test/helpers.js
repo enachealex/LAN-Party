@@ -39,7 +39,11 @@ async function startServer(opts = {}) {
     // SFU_ADDRESS_CHECK=0: the server asks an outside service for its public address when it
     // announces one, and a test run must not depend on the network (or on what the developer's own
     // shell has in SFU_ANNOUNCED_IPS). A test of that check turns it back on with a local stand-in.
-    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', SFU_ADDRESS_CHECK: '0', ...(opts.env || {}) },
+    // LINK_PREVIEWS=0 for the same reason: with previews on, a test message that happens to hold a
+    // link would send the server out to fetch it. The link preview suite turns them back on together
+    // with LINK_PREVIEW_TRANSPORT, a stand-in for DNS and HTTP, so that even there nothing leaves
+    // the machine (and the server keeps previews off if that stand-in cannot be loaded).
+    env: { ...process.env, PORT: '0', DATA_DIR: dataDir, JWT_SECRET: 'test-secret', SFU_ADDRESS_CHECK: '0', LINK_PREVIEWS: '0', ...(opts.env || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   running.add(child);

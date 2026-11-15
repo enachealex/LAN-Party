@@ -35,10 +35,14 @@ let active = false
  * group messages and @mentions to anyone with no focused window, so a background tab that also
  * raised its own would alert twice for one message. Ordinary channel chatter is never pushed, and a
  * focused window is never pushed to, so in both of those cases the in-page one stays.
+ *
+ * `pushed` is whether the server pushes this channel message to me at all: I am mentioned in it,
+ * or I set its channel to "All messages" (notificationLevels.ts). It is ignored for DMs and groups,
+ * which are always pushed (a muted one never reaches this question).
  */
-export function pushCovers(kind: string, mentioned: boolean): boolean {
+export function pushCovers(kind: string, pushed: boolean): boolean {
   if (!active) return false
-  if (kind === 'channel' && !mentioned) return false
+  if (kind === 'channel' && !pushed) return false
   return !windowFocused()
 }
 

@@ -26,6 +26,8 @@ interface ChannelListProps {
   activeChannel?: string | null
   channelUnreads: Record<string, number>
   channelMentions: Record<string, number>
+  /** The channels whose notifications I have set to "Nothing" (directly, or through the server). */
+  mutedChannels?: Set<string>
   /** May create, rename and delete channels here: manage_channels, or anyone in the public commons. */
   canManage: boolean
   /** Whose collapsed categories to remember (the signed-in username). */
@@ -43,6 +45,7 @@ interface ChannelListProps {
 
 const SPEAKER_ICON_PATH = 'M12 3a9 9 0 0 0-9 9v3a3 3 0 0 0 3 3h1v-6H6a7 7 0 0 1 14 0v6h1a3 3 0 0 0 3-3v-3a9 9 0 0 0-9-9Zm-1 14h2v3h-2v-3Z'
 const badge = (n: number) => (n > 99 ? '99+' : n)
+const NO_MUTED: Set<string> = new Set()
 
 // longPress.js is plain JS; what it returns is a set of touch handlers for any element.
 const press = (handler: (e: MenuEvent) => void) => longPressProps(handler) as HTMLAttributes<HTMLElement>
@@ -78,7 +81,7 @@ function useCollapsedCategories(collapseKey: string) {
  * a category nobody can see into is never sent.
  */
 export default function ChannelList({
-  channels, categories, serverId, activeChannel, channelUnreads, channelMentions, canManage, collapseKey,
+  channels, categories, serverId, activeChannel, channelUnreads, channelMentions, mutedChannels = NO_MUTED, canManage, collapseKey,
   inVoice, voiceServerId, voiceChannelId, onJoinChannel, onJoinVoice, onLeaveVoice, onCreateChannel, onOpenMenu,
 }: ChannelListProps) {
   const { collapsed, toggle } = useCollapsedCategories(collapseKey)
@@ -95,8 +98,10 @@ export default function ChannelList({
     const index = list.findIndex((c) => c.id === ch.id)
     const item: ChannelMenuItem = { kind: 'channel', id: ch.id, name: ch.name, privacy: ch.privacy, type: ch.type, categoryId: categoryOf(ch), canUp: index > 0, canDown: index >= 0 && index < list.length - 1 }
     const openMenu = (e: MenuEvent) => onOpenMenu(e, item)
-    // The menu holds nothing but channel management, so it only opens for someone who has that.
-    const menuProps = canManage ? { onContextMenu: (e: MouseEvent) => openMenu(e), ...press(openMenu) } : {}
+    // A text channel's menu opens for everyone: it holds that channel's notification level, which
+    // is each person's own. A voice channel's holds nothing but channel management, so it only
+    // opens for someone who has that.
+    const menuProps = canManage || ch.type === 'text' ? { onContextMenu: (e: MouseEvent) => openMenu(e), ...press(openMenu) } : {}
     const lock = ch.privacy === 'private' && <span className="dc-channel-lock" title="Private channel">🔒</span>
     if (ch.type === 'voice') {
       return (
@@ -118,17 +123,21 @@ export default function ChannelList({
     }
     const unread = channelUnreads[ch.id] || 0
     const mentions = channelMentions[ch.id] || 0
+    // Muted: the counts are still kept and still shown, dimmed, so nothing is lost by muting. The
+    // row just stops standing out (no bold name, grey badges), and nothing here reaches the rail.
+    const muted = mutedChannels.has(ch.id)
     return (
       <button
         key={ch.id}
         type="button"
-        className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''} ${unread > 0 ? 'unread' : ''}`}
+        className={`dc-channel-item ${activeChannel === ch.id ? 'active' : ''} ${unread > 0 && !muted ? 'unread' : ''} ${muted ? 'muted' : ''}`}
         onClick={() => onJoinChannel?.(ch.id)}
         {...menuProps}
       >
         <span className="dc-channel-icon"><span className="dc-channel-hash">#</span></span>
         <span>{ch.name}</span>
         {lock}
+        {muted && <span className="dc-channel-muted" title="Notifications are off for this channel" aria-label="Muted">🔕</span>}
         {mentions > 0 && <span className="dc-channel-mention" title={`You were mentioned ${mentions === 1 ? 'once' : `${mentions} times`}`}>@{badge(mentions)}</span>}
         {unread > 0 && <span className="dc-channel-unread">{badge(unread)}</span>}
       </button>
@@ -160,8 +169,10 @@ export default function ChannelList({
       {categories.map((cat, index) => {
         const list = channels.filter((ch) => categoryOf(ch) === cat.id)
         const folded = collapsed.has(cat.id)
-        const unread = list.reduce((sum, ch) => sum + (channelUnreads[ch.id] || 0), 0)
-        const mentions = list.reduce((sum, ch) => sum + (channelMentions[ch.id] || 0), 0)
+        // What a fold hides, summed. A muted channel adds nothing here, as it adds nothing to the rail.
+        const heard = list.filter((ch) => !mutedChannels.has(ch.id))
+        const unread = heard.reduce((sum, ch) => sum + (channelUnreads[ch.id] || 0), 0)
+        const mentions = heard.reduce((sum, ch) => sum + (channelMentions[ch.id] || 0), 0)
         const item: ChannelMenuItem = { kind: 'category', id: cat.id, name: cat.name, canUp: index > 0, canDown: index < categories.length - 1 }
         const openMenu = (e: MenuEvent) => onOpenMenu(e, item)
         const menuProps = canManage ? { onContextMenu: (e: MouseEvent) => openMenu(e), ...press(openMenu) } : {}

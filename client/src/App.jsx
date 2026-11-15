@@ -52,6 +52,11 @@ import BlockedPeopleSection from './components/BlockedPeopleSection'
 import { TimeoutNotice, BlockedNotice } from './components/ComposerNotice'
 import { useExpiry, formatMoment, formatDuration as formatMinutes } from './moderation'
 import { syncPush, stopPush, pushSupported, pushCovers, windowFocused, useNotificationTarget } from './push'
+import { badgeTotals, channelLevel, isDmMuted, isGroupMuted, unmutedGroupUnread } from './notificationLevels'
+import { useNotificationSettings } from './useNotificationSettings'
+import LinkPreviewCard from './components/LinkPreviewCard'
+import LinkPreviewSetting from './components/LinkPreviewSetting'
+import { readShowLinkPreviews, writeShowLinkPreviews } from './linkPreviews'
 import { createMicMeter } from './micLevel'
 import { normalizeProfile, nameStyleToCss, borderPresetColor, AVATAR_OVERLAYS, BORDER_PRESETS, BORDER_STYLES, NAME_FONTS, NAME_STYLES } from './profileData'
 import { WebcamEffectProcessor, effectsSupported, warmUpEffects } from './webcamEffects'
@@ -656,7 +661,7 @@ function pinPreview(m) {
   return m.text || '(empty message)'
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null }) {
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null, showPreviews = true, onRemovePreview }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
   const [reactionPickerPos, setReactionPickerPos] = useState(null) // { left, top } for the full-library picker
@@ -922,6 +927,15 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
             )))
           )}
           <AttachmentCard attachment={message.attachment} onOpenMedia={onOpenMedia} />
+          {/* The card for the message's link, when the server found one worth showing and this
+              device has previews on. Only the author gets the ✕, which removes it for everyone. */}
+          {message.preview && showPreviews && (
+            <LinkPreviewCard
+              preview={message.preview}
+              resolveSrc={(path) => `${SERVER_URL}${path}`}
+              onRemove={isOutgoing && onRemovePreview ? () => onRemovePreview(message.id) : undefined}
+            />
+          )}
           {Object.keys(reactions).length > 0 && (
             <div className="msg-reactions" aria-label="Message reactions">
               {Object.entries(reactions).map(([emoji, data]) => (
@@ -1432,6 +1446,15 @@ export default function App() {
   // Unread messages that @mention me, per channel: { serverId: { channelId: n } }. Kept apart from
   // the unread count because it is a different question ("did anyone ask for me?") with its own badge.
   const [channelMentions, setChannelMentions] = useState({})
+  // My notification levels: per server and channel ("All messages" / "Only @mentions" / "Nothing"),
+  // and which DMs and groups are muted (notificationLevels.ts). They decide which of the counts
+  // above feed a badge, and whether a message makes a sound or a notification. The ref is for the
+  // socket handlers, which are bound once per connection. (authedFetch is defined further down;
+  // it is only called when a level is changed.)
+  const {
+    settings: notificationSettings, settingsRef: notificationSettingsRef,
+    apply: applyNotificationSettings, setLevel: setNotificationLevel, reset: resetNotificationSettings,
+  } = useNotificationSettings((path, opts) => authedFetch(path, opts), (message) => setToast(message))
   // Who is typing where: { conversationKey: { username: expiresAtMs } }. An entry expires on its own,
   // so a "typing" that is never followed by a message (they gave up, or the stop was lost) clears.
   const [typingBy, setTypingBy] = useState({})
@@ -3174,9 +3197,24 @@ export default function App() {
     },
   }
 
-  const appendHomeMessage = (chatKey, message) => {
+  // The link preview of a direct message I just sent can overtake the message itself: the preview
+  // comes over the socket, the message in the answer to my own POST, and for a link the server
+  // already knows the socket is the quicker of the two. So the last preview event per message is
+  // kept for a moment, and a message that turns up after its preview takes it from here.
+  const earlyPreviewsRef = useRef(new Map()) // message id -> { preview, at }
+  const noteEarlyPreview = (id, preview) => {
+    const waiting = earlyPreviewsRef.current
+    const now = Date.now()
+    for (const [key, entry] of waiting) if (now - entry.at > 30000) waiting.delete(key)
+    waiting.set(String(id), { preview, at: now })
+  }
+
+  const appendHomeMessage = (chatKey, incoming) => {
     const key = chatStorageKey(chatKey)
-    if (!message?.id) return
+    if (!incoming?.id) return
+    const early = earlyPreviewsRef.current.get(String(incoming.id))
+    if (early) earlyPreviewsRef.current.delete(String(incoming.id))
+    const message = early?.preview ? { ...incoming, preview: early.preview } : incoming
     if (holdLiveMessage(key, message)) return
     setHomeMessages((prev) => {
       const existing = prev[key] || []
@@ -3324,7 +3362,9 @@ export default function App() {
     }
   }
 
-  const totalUnreadWithGroups = totalUnreadMessages + Object.values(groupUnread).reduce((a, b) => a + b, 0)
+  // The Messages badge. The DM half comes from the server with muted conversations already left
+  // out; the group half is summed here, and leaves muted groups out the same way.
+  const totalUnreadWithGroups = totalUnreadMessages + unmutedGroupUnread(groupUnread, notificationSettings)
 
   // Apply user settings to CSS variables
   const applySettings = (settings) => {
@@ -3406,6 +3446,8 @@ export default function App() {
     })
     // My block list changed, here or in another window. Only ever sent to the person who blocks.
     s.on('blocks:updated', () => loadBlocks(authToken))
+    // My notification levels changed, here or in another window: the whole set, every time.
+    s.on('notifications:updated', ({ settings } = {}) => applyNotificationSettings(settings))
     s.on('dm:unread-updated', ({ totalUnread, byPeer }) => {
       applyUnreadState(totalUnread, byPeer || [])
       setDmConversations((prev) =>
@@ -3423,7 +3465,10 @@ export default function App() {
       if (fromUsername) clearTyping(`dm:${fromUsername}`, fromUsername)
       const viewingThisDm = homeChatRef.current?.peerUsername === fromUsername &&
         selectedServerIdRef.current === 'home'
-      if (fromUsername && fromUsername !== userName) playUiSound(viewingThisDm && !document.hidden ? 'receive' : 'notify')
+      // A muted conversation makes no sound and raises no notification. It is still delivered,
+      // and still counted on its own row.
+      const muted = isDmMuted(notificationSettingsRef.current, fromUserId)
+      if (fromUsername && fromUsername !== userName && !muted) playUiSound(viewingThisDm && !document.hidden ? 'receive' : 'notify')
       // Open, but on an older stretch: the message was held back, not shown, so it stays unread
       // until the reader returns to the present.
       const heldBack = viewingThisDm && !document.hidden && Boolean(historyMetaRef.current[chatKey]?.detached)
@@ -3433,7 +3478,7 @@ export default function App() {
         markConversationRead(fromUsername, authToken)
       } else {
         loadMessagesData(authToken)
-        maybeNotify('dm', { author: fromUsername, preview: (message?.text || '').slice(0, 120) || 'New direct message' })
+        if (!muted) maybeNotify('dm', { author: fromUsername, preview: (message?.text || '').slice(0, 120) || 'New direct message' })
       }
     })
     s.on('server:state', (data) => {
@@ -3635,7 +3680,9 @@ export default function App() {
         }
       }
       // A message the server marked `blocked` (I blocked its author) is shown collapsed and makes no sound.
-      if (msg && msg.author && msg.author !== userName && !msg.blocked) playUiSound('receive')
+      // Neither does one in a channel I have set to "Nothing", even while I am looking at it.
+      const mutedHere = msg && msg.serverId && channelLevel(notificationSettingsRef.current, msg.serverId, msg.channelId) === 'none'
+      if (msg && msg.author && msg.author !== userName && !msg.blocked && !mutedHere) playUiSound('receive')
       // Their message has arrived, so they are no longer "typing" it.
       if (msg && msg.author) clearTyping(`channel:${msg.serverId}:${msg.channelId}`, msg.author)
       // Looking at an older stretch of this channel: the message waits for "Jump to present".
@@ -3659,6 +3706,9 @@ export default function App() {
         srv[channelId] = (srv[channelId] || 0) + 1
         return { ...prev, [serverId]: srv }
       })
+      // What I asked to hear from this channel (its own level, else its server's). The counts above
+      // and below are kept whatever it is; it decides the sound and the notification.
+      const level = channelLevel(notificationSettingsRef.current, serverId, channelId)
       // Named in a channel I am not looking at: its own badge and its own sound, so it stands out
       // from ordinary chatter (which makes no sound at all from another channel).
       if ((bump.mentions || []).includes(userName)) {
@@ -3667,9 +3717,13 @@ export default function App() {
           srv[channelId] = (srv[channelId] || 0) + 1
           return { ...prev, [serverId]: srv }
         })
-        playUiSound('mention')
+        if (level !== 'none') playUiSound('mention')
+      } else if (level === 'all') {
+        // "All messages": ordinary chatter here is something I asked to be told about.
+        playUiSound('notify')
       }
-      maybeNotify('channel', bump)
+      // "Nothing" means nothing: not even for a mention.
+      if (level !== 'none') maybeNotify('channel', { ...bump, level })
     })
     // Someone started typing in a conversation. Keyed the same way the composer works out which
     // conversation is on screen (see renderComposer), so the line shows only where it belongs.
@@ -3730,6 +3784,39 @@ export default function App() {
     s.on('message:edited', ({ id, text }) => setMessages((prev) =>
       prev.map((m) => (String(m.id) === String(id) ? { ...m, text, edited: true } : m))
     ))
+    // A message's link preview arrived (the server fetched the page after delivering the message)
+    // or was taken off (its author removed it, or edited the link away): `preview` is the card, or
+    // null. The same three shapes as edits: channel, DM, group.
+    const withPreview = (m, preview) => {
+      if (preview) return { ...m, preview }
+      const { preview: _gone, ...rest } = m
+      return rest
+    }
+    s.on('message:preview', ({ id, preview } = {}) => setMessages((prev) =>
+      prev.map((m) => (String(m.id) === String(id) ? withPreview(m, preview) : m))
+    ))
+    s.on('dm:message-preview', ({ id, preview } = {}) => {
+      if (id == null) return
+      noteEarlyPreview(id, preview) // in case it got here before the message did (see appendHomeMessage)
+      setHomeMessages((prev) => {
+        let changed = false
+        const next = {}
+        for (const key of Object.keys(prev)) {
+          if (isGroupChatKey(key)) { next[key] = prev[key]; continue }
+          next[key] = prev[key].map((m) => {
+            if (String(m.id) !== String(id)) return m
+            changed = true
+            return withPreview(m, preview)
+          })
+        }
+        return changed ? next : prev
+      })
+    })
+    s.on('group:message-preview', ({ groupId, id, preview } = {}) => setHomeMessages((prev) => {
+      const key = chatStorageKey(groupId)
+      if (!prev[key]) return prev
+      return { ...prev, [key]: prev[key].map((m) => (String(m.id) === String(id) ? withPreview(m, preview) : m)) }
+    }))
     // A DM was edited — update it in whichever conversation holds it, and refresh the previews.
     s.on('dm:message-edited', ({ id, text }) => {
       setHomeMessages((prev) => {
@@ -3798,7 +3885,10 @@ export default function App() {
       // badge, no notification. The server leaves it out of the group's unread count as well.
       if (message.blocked) return
       const reading = isOpenGroup(groupId) && !document.hidden
-      playUiSound(reading ? 'receive' : 'notify')
+      // A muted group is silent: no sound, no notification. Its unread count is still kept (the
+      // row shows it, dimmed) and stays out of the Messages badge.
+      const muted = isGroupMuted(notificationSettingsRef.current, groupId)
+      if (!muted) playUiSound(reading ? 'receive' : 'notify')
       // Open on an older stretch: held back and not shown, so it is unread until they come back.
       if (reading && historyMetaRef.current[chatStorageKey(groupId)]?.detached) {
         setGroupUnread((prev) => ({ ...prev, [groupId]: (prev[groupId] || 0) + 1 }))
@@ -3811,6 +3901,7 @@ export default function App() {
         return
       }
       setGroupUnread((prev) => ({ ...prev, [groupId]: (prev[groupId] || 0) + 1 }))
+      if (muted) return
       const group = groupChatsRef.current.find((g) => String(g.id) === String(groupId))
       maybeNotify('group', { author: message.author, groupId, groupName: group?.name, preview: (message.text || '').slice(0, 120) || 'Sent an attachment' })
     })
@@ -4655,6 +4746,9 @@ export default function App() {
       const data = await res.json()
       setChannelUnreads(data.unreads || {})
       setChannelMentions(data.mentions || {})
+      // My notification levels ride along with the counts they are read with. (An older server
+      // sends none: leave what we have rather than wiping it.)
+      if (data.notifications) applyNotificationSettings(data.notifications)
     } catch (e) { /* offline — badges just stay stale */ }
   }
 
@@ -4778,11 +4872,15 @@ export default function App() {
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
     const me = localStorage.getItem('lanparty_user')
     const mentioned = (info.mentions || []).includes(me)
+    // A channel I set to "All messages" (info.level, from the caller): its chatter is treated the
+    // way a mention is everywhere else. Muted channels and conversations never get this far.
+    const everything = kind === 'channel' && info.level === 'all'
     // Channel chatter only notifies when hidden; @mentions and DMs also notify while visible.
-    if (kind === 'channel' && !document.hidden && !mentioned) return
-    // With this browser registered for Web Push, the server pushes DMs, group messages and @mentions
-    // whenever no window has focus. Raising our own as well would alert twice for one message.
-    if (pushCovers(kind, mentioned)) return
+    if (kind === 'channel' && !document.hidden && !mentioned && !everything) return
+    // With this browser registered for Web Push, the server pushes DMs, group messages, @mentions
+    // and every message of an "All messages" channel whenever no window has focus. Raising our own
+    // as well would alert twice for one message.
+    if (pushCovers(kind, mentioned || everything)) return
     try {
       const title = kind === 'dm'
         ? `💬 ${info.author}`
@@ -6281,6 +6379,7 @@ export default function App() {
     setTotalUnreadMessages(0)
     setUnreadByChatId({})
     setGroupUnread({})
+    resetNotificationSettings() // the next person to sign in here has levels of their own
     setShowNewChatModal(false)
     setNewChatSelectedIds([])
     setNewChatGroupName('')
@@ -6325,13 +6424,10 @@ export default function App() {
   }
   // Ids of pinned messages in the current channel (for the Pin/Unpin menu toggle).
   const pinnedIdSet = useMemo(() => new Set(channelPins.map((p) => p.id)), [channelPins])
-  // Total unreads per server for the rail badges.
-  const serverUnreadTotals = Object.fromEntries(
-    Object.entries(channelUnreads).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
-  )
-  const serverMentionTotals = Object.fromEntries(
-    Object.entries(channelMentions).map(([sid, chans]) => [sid, Object.values(chans).reduce((a, b) => a + b, 0)])
-  )
+  // Total unreads per server for the rail badges. A channel I set to "Nothing" keeps its own count
+  // on its row, and adds nothing here (notificationLevels.ts).
+  const serverUnreadTotals = badgeTotals(channelUnreads, notificationSettings)
+  const serverMentionTotals = badgeTotals(channelMentions, notificationSettings)
   // ---- Picking up a new deploy without being relaunched ----
   // Reloading is only done on the user's behalf when it costs them nothing: no call or activity to
   // drop, nothing half-typed or half-uploaded, no dialog mid-edit. Anything else gets the bar instead.
@@ -6807,6 +6903,36 @@ export default function App() {
     if (!socket || !messageId) return
     socket.emit('message:delete', { serverId: currentServerId(), channelId: activeChannel, id: messageId })
   }
+
+  // Take the link preview off one of my own messages, for everyone. Nothing changes on screen until
+  // the server says so ('message:preview' / 'dm:message-preview' / 'group:message-preview' with a
+  // null preview, which arrive here like they do for everybody else).
+  const removeChannelPreview = (messageId) => {
+    if (!socket || !messageId) return
+    socket.timeout(8000).emit('message:preview-remove', { id: messageId }, (err, res) => {
+      if (err || !res || !res.ok) setToast("Couldn't remove that preview")
+    })
+  }
+  const removeHomePreview = async (messageId) => {
+    if (!homeChat || !messageId) return
+    const isGroup = homeChat.type === 'group'
+    if (!isGroup && homeChat.type !== 'friend' && homeChat.type !== 'dm') return
+    const path = isGroup
+      ? `/groups/${encodeURIComponent(homeChat.id)}/messages/${encodeURIComponent(messageId)}/preview`
+      : `/messages/${encodeURIComponent(messageId)}/preview`
+    try {
+      const res = await authedFetch(path, { method: 'DELETE' })
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || "Couldn't remove that preview") }
+    } catch (err) {
+      setToast(err.message || "Couldn't remove that preview")
+    }
+  }
+
+  // "Show link previews" (Settings → Messages): whether the cards are drawn on this device, for
+  // whoever is signed in on it (linkPreviews.ts). Read again when the account changes.
+  const [showLinkPreviews, setShowLinkPreviews] = useState(() => readShowLinkPreviews(localStorage.getItem('lanparty_user') || ''))
+  useEffect(() => { setShowLinkPreviews(readShowLinkPreviews(name)) }, [name])
+  const changeShowLinkPreviews = (show) => { setShowLinkPreviews(show); writeShowLinkPreviews(name, show) }
 
   // ---- Pinning (channel messages) ----
   const pinMessage = (messageId) => { if (socket && messageId) socket.emit('message:pin', { id: messageId }) }
@@ -8137,6 +8263,8 @@ export default function App() {
         serverUnreadTotals={serverUnreadTotals}
         channelMentions={channelMentions[selectedServerId] || {}}
         serverMentionTotals={serverMentionTotals}
+        notificationSettings={notificationSettings}
+        onSetNotificationLevel={setNotificationLevel}
       />
 
       <div className="main">
@@ -8238,6 +8366,8 @@ export default function App() {
                         emojiMap={emojiMap}
                         onSaveEmoji={saveCustomEmojiFromChat}
                         onForward={openForward}
+                        showPreviews={showLinkPreviews}
+                        onRemovePreview={removeHomePreview}
                       />
                     )
                     // In a group, a message from someone I blocked is collapsed behind "Show". Not in
@@ -8318,6 +8448,8 @@ export default function App() {
                         onUnpin={unpinMessage}
                         isPinned={pinnedIdSet.has(m.id)}
                         authorColor={nameColors.get(m.author) || null}
+                        showPreviews={showLinkPreviews}
+                        onRemovePreview={removeChannelPreview}
                       />
                     )
                     // From someone I blocked: collapsed behind "Show", one message at a time.
@@ -10242,6 +10374,7 @@ export default function App() {
                 onClose={() => setEditingQuickReaction(null)}
               />
             )}
+            <LinkPreviewSetting show={showLinkPreviews} onChange={changeShowLinkPreviews} />
           </section>
           )}
           {settingsTab === 'messages' && (

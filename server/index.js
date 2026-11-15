@@ -21,7 +21,9 @@ const { userFileStatic, FRAME_ANCESTORS_SELF, frameAncestorsDirective, GIF_TYPES
 const { createMessages } = require('./services/messages');
 const { createSfu } = require('./services/sfu');
 const { createAddressMonitor, fetchPublicAddress } = require('./services/sfuAddress');
-const { createPush, mentionedUsernames, MAX_MENTION_TARGETS } = require('./services/push');
+const { createPush, mentionedUsernames, MAX_MENTION_TARGETS, MAX_LEVEL_TARGETS } = require('./services/push');
+const { createNotificationSettings } = require('./services/notificationSettings');
+const { createLinkPreviews, ownHostnames, IMAGE_DIR: LINK_PREVIEW_DIR } = require('./services/linkPreview');
 const { createInstanceOwners } = require('./services/instanceOwners');
 const { createBlocks } = require('./services/blocks');
 const { createModeration } = require('./services/moderation');
@@ -42,6 +44,7 @@ const { registerInviteRoutes } = require('./routes/invites');
 const { registerLibraryRoutes } = require('./routes/library');
 const { registerPushRoutes } = require('./routes/push');
 const { registerSearchRoutes } = require('./routes/search');
+const { registerNotificationRoutes } = require('./routes/notifications');
 const { PAGE_DEFAULT, fetchPage, channelHistory } = require('./services/history');
 const { rateLimit } = require('./rateLimit');
 
@@ -59,6 +62,9 @@ const PORT = process.env.PORT || 3000;
 //                 already exist, spelled exactly: a listed name can no longer be registered or
 //                 renamed into, and one that matches no account is logged at boot.
 //                 services/instanceOwners.js
+//  LINK_PREVIEWS  set to 0 to stop the server fetching the pages people link to (the preview cards
+//                 under messages). On by default; what is fetched, and the rules it is held to, are
+//                 in services/linkPreview.js. Previews already stored stay on their messages.
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 const CLIENT_DIST = process.env.CLIENT_DIST || path.join(__dirname, '..', 'client', 'dist');
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
@@ -176,6 +182,11 @@ async function main() {
   fs.mkdirSync(avatarsDir, { recursive: true });
   const tileIconsDir = path.join(DATA_DIR, 'tile-icons');
   fs.mkdirSync(tileIconsDir, { recursive: true });
+  // The images of link preview cards (services/linkPreview.js): fetched by the server, stored by
+  // content hash, and served from here so that a reader's browser never asks the linked site for
+  // anything. Outside /uploads: they have a sweep of their own, which keeps what messages still show.
+  const linkPreviewsDir = path.join(DATA_DIR, LINK_PREVIEW_DIR);
+  fs.mkdirSync(linkPreviewsDir, { recursive: true });
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -332,6 +343,12 @@ async function main() {
   app.use('/downloads', express.static(downloadsDir, { redirect: false }));
   // Feedback/bug-report screenshots — linked from Vaultline tickets, so served publicly (read-only).
   app.use('/feedback-media', userFileStatic(feedbackDir, FRAME_ANCESTORS, { redirect: false }));
+  // Link preview images. These bytes came from a site somebody linked to, so they get the same
+  // treatment as anything a person uploads (nosniff, the scriptless sandbox CSP, a versioned ETag),
+  // on top of only ever being stored as PNG, JPEG, GIF or WebP in the first place.
+  app.use('/link-previews', userFileStatic(linkPreviewsDir, FRAME_ANCESTORS, { redirect: false }));
+  // Terminal: an image that has been swept must 404, not hand an <img> the SPA shell with a 200.
+  app.use('/link-previews', (req, res) => res.status(404).type('txt').send('Not found'));
   // Uploaded mini-apps. The CSP `sandbox` directive (WITHOUT allow-same-origin) forces every bundle
   // document into an OPAQUE origin — so its JS can't read LAN Party cookies/localStorage or call the
   // API with the user's session, whether it's loaded in the embed iframe OR opened directly. This
@@ -567,6 +584,16 @@ async function main() {
   const permissions = createPermissions({ db, commonsId: DEMO_ID });
   // Channel order and categories (services/channels.js).
   const channelLists = createChannels({ db });
+  // How loudly each server, channel and conversation may reach each person
+  // (services/notificationSettings.js). Consulted wherever a push is decided.
+  const notificationSettings = createNotificationSettings({ db });
+  // Link preview cards (services/linkPreview.js): the one place the server fetches an address a
+  // member chose. LINK_PREVIEWS=0 turns the fetching off.
+  const linkPreviews = createLinkPreviews({ db, dataDir: DATA_DIR });
+  // The names a link must never be fetched from because they are this server: wherever the request
+  // (or socket handshake) says it was sent, the CLIENT_ORIGIN list, and PUBLIC_APP_URL when set.
+  const ownOriginsForPreviews = [...ownOrigins, ...(process.env.PUBLIC_APP_URL ? [process.env.PUBLIC_APP_URL] : [])];
+  const ownHostsFor = (headers) => ownHostnames(headers, ownOriginsForPreviews);
 
   // Return deduped members for a server: prefer username when available, keep latest connection per key
   function getMembersForServer(serverId) {
@@ -649,7 +676,10 @@ async function main() {
        GROUP BY u.id, u.username`,
       userId
     );
-    const totalUnread = rows.reduce((sum, r) => sum + r.unreadCount, 0);
+    // A muted conversation keeps its own count (the row still shows it, dimmed) but stays out of
+    // the total, which is what the Messages badge shows (services/notificationSettings.js).
+    const muted = await notificationSettings.mutedDmPeers(userId);
+    const totalUnread = rows.reduce((sum, r) => sum + (muted.has(r.peerId) ? 0 : r.unreadCount), 0);
     return { totalUnread, byPeer: rows };
   }
 
@@ -1123,7 +1153,9 @@ async function main() {
       // back into a server, or out of a timeout. So do the records of who placed them, and the
       // audit log's actor and target (which are only ever usernames), so the log goes on naming
       // the account it was about rather than a name someone else may hold later.
-      // Blocks are keyed by user id and need nothing.
+      // Blocks are keyed by user id and need nothing. Neither do notification levels
+      // (notification_settings): they are keyed by user id too, and a muted DM names the other
+      // person by id.
       await db.run('UPDATE server_bans SET username = ? WHERE username = ?', newUsername, oldUsername);
       await db.run('UPDATE server_bans SET banned_by = ? WHERE banned_by = ?', newUsername, oldUsername);
       await db.run('UPDATE server_timeouts SET username = ? WHERE username = ?', newUsername, oldUsername);
@@ -1251,39 +1283,73 @@ async function main() {
       io.to(`user:${m.username}`).emit('unread:bump', payload);
     }
   }
-  // Push the people a channel message @mentions, and nobody else: ordinary channel chatter is what
-  // the unread badge is for, and a phone that buzzed for every line in a busy channel would have its
-  // notifications switched off within the hour. A mention only reaches someone who could open the
-  // channel and read it, so naming a person cannot leak a private channel's contents to them.
-  async function pushMentions({ serverId, channelId, privacy, sender, text, attachment }) {
+  // Push a channel message to the people it should reach while their app is closed. By default
+  // that is the people it @mentions and nobody else: ordinary channel chatter is what the unread
+  // badge is for, and a phone that buzzed for every line in a busy channel would have its
+  // notifications switched off within the hour. Each person can move that line for themselves
+  // (services/notificationSettings.js): "All messages" adds them to every message of the channel,
+  // "Nothing" takes them out of all of it, a mention included.
+  //
+  // A level only says how much someone WANTS to hear. Whether they MAY be pushed is decided by the
+  // same checks for everyone, whatever their level: they can open the channel and read it (so
+  // neither naming a person nor a setting left over from before they lost a channel can leak its
+  // contents), they have not blocked the sender, and the sender is within the push allowances.
+  async function pushChannelMessage({ serverId, channelId, privacy, sender, text, attachment }) {
     if (!push.available()) return;
+    // Who has a level of their own that bears on this channel. Everyone else is at the default.
+    const levels = await notificationSettings.channelLevels(serverId, channelId);
     // Bounded before any lookups, so a wall of @names costs a fixed number of queries.
-    const candidates = mentionedUsernames(text).filter((name) => name !== sender).slice(0, MAX_MENTION_TARGETS * 2);
-    const to = [];
+    const mentionedNames = mentionedUsernames(text).filter((name) => name !== sender).slice(0, MAX_MENTION_TARGETS * 2);
+    const listenerNames = [...levels].filter(([name, level]) => level === 'all' && name !== sender).map(([name]) => name);
+    if (mentionedNames.length === 0 && listenerNames.length === 0) return;
     let senderRow = null;
-    // A mention from someone you have blocked does not reach your phone.
-    const blockers = candidates.length ? await blocks.blockersOf(sender) : new Set();
-    for (const name of candidates) {
-      if (to.length >= MAX_MENTION_TARGETS) break;
-      const user = await getUserByUsername(name);
-      if (!user || to.includes(user.username) || blockers.has(user.username)) continue;
+    // Nothing from someone you have blocked reaches your phone, at any level.
+    const blockers = await blocks.blockersOf(sender);
+    // May this account be pushed about this message at all? The same answer for a mention and for
+    // "All messages".
+    const mayBePushed = async (user) => {
+      if (blockers.has(user.username)) return false;
       const role = await roleOf(serverId, user.username);
-      if (!(await canAccessChannel(serverId, channelId, user.username, privacy, role))) continue;
+      if (!(await canAccessChannel(serverId, channelId, user.username, privacy, role))) return false;
       // The public commons counts every account as a member, so "can open the channel" is no filter
-      // at all there: any stranger could ring any phone. In the commons a mention only pushes someone
+      // at all there: any stranger could ring any phone. In the commons a message only pushes someone
       // the sender could already message directly (a friend, or someone they share a real server
-      // with) — the same line DMs draw. The mention still shows in the channel for everyone.
+      // with) — the same line DMs draw. The message still shows in the channel for everyone.
       if (serverId === DEMO_ID) {
         senderRow = senderRow || await getUserByUsername(sender);
-        if (!senderRow || !(await canDirectMessage(senderRow.id, sender, user.id, user.username))) continue;
+        if (!senderRow || !(await canDirectMessage(senderRow.id, sender, user.id, user.username))) return false;
       }
-      to.push(user.username);
+      return true;
+    };
+    const mentioned = [];
+    for (const name of mentionedNames) {
+      if (mentioned.length >= MAX_MENTION_TARGETS) break;
+      const user = await getUserByUsername(name);
+      if (!user || mentioned.includes(user.username)) continue;
+      // Muted here: not even a mention gets through.
+      if (levels.get(user.username) === 'none') continue;
+      if (await mayBePushed(user)) mentioned.push(user.username);
     }
-    if (to.length === 0) return;
-    if (!push.allowMentionPush(sender)) return;
+    // The people listening to everything in this channel. Capped like the mentions are, and
+    // looked up no more than twice the cap.
+    const listening = [];
+    for (const name of listenerNames.slice(0, MAX_LEVEL_TARGETS * 2)) {
+      if (listening.length >= MAX_LEVEL_TARGETS) break;
+      const user = await getUserByUsername(name);
+      if (user && await mayBePushed(user)) listening.push(user.username);
+    }
+    // Two allowances, asked separately: a busy channel with listeners in it must not be able to
+    // use up what lets a mention through (services/push.js). Someone who is both mentioned and
+    // listening is pushed once, as a mention.
+    const pushMentioned = mentioned.length > 0 && push.allowMentionPush(sender);
+    const listeners = pushMentioned ? listening.filter((name) => !mentioned.includes(name)) : listening;
+    const pushListeners = listeners.length > 0 && push.allowChannelPush(sender);
+    if (!pushMentioned && !pushListeners) return;
     const srv = await db.get('SELECT name FROM servers WHERE id = ?', serverId);
     const ch = await db.get('SELECT name FROM channels WHERE id = ?', channelId);
-    await push.notifyMention({ serverId, channelId, serverName: srv?.name, channelName: ch?.name, from: sender, to, text, attachment });
+    const about = { serverId, channelId, serverName: srv?.name, channelName: ch?.name, from: sender, text, attachment };
+    if (pushMentioned) await push.notifyMention({ ...about, to: mentioned });
+    if (pushListeners) await push.notifyChannelMessage({ ...about, to: listeners });
   }
 
   // Broadcast a server's state to everyone in its room, filtered per-socket (private channels are
@@ -1323,7 +1389,7 @@ async function main() {
   // Servers / channels / membership (routes/servers.js).
   // What a change that takes access away from someone has to do afterwards (services/accessChanges.js).
   const accessChanges = createAccessChanges({ db, permissions, appRooms, enforceVoiceAccess, enforceTextAccess });
-  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, channelLists, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks });
+  const { removeMemberFromServer } = registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, permissions, channelLists, accessChanges, mapMessageRow, broadcastServerState, validate, inviteInput, receiveTileIcon, removeTileIconFile, appRooms, endAppActivitiesInServer, enforceVoiceAccess, enforceTextAccess, moderation, blocks, notificationSettings });
 
   // Shareable invite links (routes/invites.js).
   registerInviteRoutes({ app, db, io, authMiddleware, DEMO_ID, permissions, broadcastServerState, validate, inviteLinkInput, moderation });
@@ -1346,10 +1412,12 @@ async function main() {
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins });
 
   // Presence / friends / direct messages (routes/social.js).
-  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks });
-  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks });
+  registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor });
+  const groups = registerGroupRoutes({ app, db, io, authMiddleware, getUserByUsername, canDirectMessage, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor });
   // Blocking another account (routes/blocks.js).
   registerBlockRoutes({ app, db, io, authMiddleware, getUserByUsername, blocks, emitFriendsListUpdate, emitPendingUpdate, emitDmUnreadUpdate });
+  // Notification levels: per server, channel, DM and group (routes/notifications.js).
+  registerNotificationRoutes({ app, db, io, authMiddleware, permissions, notificationSettings, emitDmUnreadUpdate });
   // Vault Player SSO handoff (github.com/enachealex/Vault-Player). Disabled unless
   // VAULT_SSO_SECRET is set; see routes/vault.js for the security model.
   registerVaultRoutes({ app, db, authMiddleware, displayProfileFromSettings, avatarColorForUsername, normalizePresence });
@@ -1825,8 +1893,10 @@ async function main() {
       if (!body && !fileAttachment) return;
       const cleanQuotes = sanitizeQuotes(quotes);
       const ts = Date.now();
-      await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null, cleanQuotes ? JSON.stringify(cleanQuotes) : null);
-      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE rowid = last_insert_rowid()');
+      const inserted = await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null, cleanQuotes ? JSON.stringify(cleanQuotes) : null);
+      // By the id this insert returned. It used to read "the last row inserted on the connection",
+      // which is some other handler's row whenever one of them inserts between the two statements.
+      const msgRow = await db.get('SELECT id, author, text, ts, attachment_json, reactions_json, quotes_json, edited_at FROM messages WHERE id = ?', inserted.lastID);
       // Tag the broadcast with its server/channel so clients can filter (belt & braces on top of rooms).
       // Anyone in the channel who has blocked the author gets their own copy, marked `blocked`, so
       // their client shows it collapsed and stays quiet about it; everyone else gets the plain one.
@@ -1844,8 +1914,15 @@ async function main() {
       }
       // Not awaited: the message is stored and on everyone's screen, and nothing about pushing it to
       // a closed app is allowed to hold up or fail the send.
-      pushMentions({ serverId, channelId, privacy: ch.privacy, sender: socketUser, text: body, attachment: fileAttachment })
-        .catch((err) => console.warn('[push] mention lookup failed:', err && err.message));
+      pushChannelMessage({ serverId, channelId, privacy: ch.privacy, sender: socketUser, text: body, attachment: fileAttachment })
+        .catch((err) => console.warn('[push] channel push lookup failed:', err && err.message));
+      // The same goes for the link preview: the message is out, and the card for its link follows
+      // when (and if) the page has been fetched, to the same room the message went to. Only reached
+      // for a message that was accepted and stored: a refused one above never gets this far.
+      linkPreviews.attachTo({
+        table: 'messages', id: msgRow.id, user: socketUser, ownHosts: ownHostsFor(socket.handshake.headers),
+        emit: (preview) => io.to(channelRoom).emit('message:preview', { id: msgRow.id, serverId, channelId, preview }),
+      });
       await emitUnreadBump(serverId, channelId, ch.privacy, author, body);
     });
 
@@ -1870,7 +1947,7 @@ async function main() {
       const info = clients[socket.id];
       if (!id || !info) return reply({ ok: false, error: 'bad-request' });
       if (!body) return reply({ ok: false, error: 'empty' });
-      const row = await db.get('SELECT author, server_id, channel_id, attachment_json, pinned_at FROM messages WHERE id = ?', id);
+      const row = await db.get('SELECT author, text, server_id, channel_id, attachment_json, pinned_at FROM messages WHERE id = ?', id);
       if (!row) return reply({ ok: false, error: 'not-found' });
       if (row.author !== info.name) return reply({ ok: false, error: 'not-author' });
       if (row.attachment_json) return reply({ ok: false, error: 'has-attachment' });
@@ -1886,6 +1963,29 @@ async function main() {
       // A pinned message shows its text in the pin bar and the View Pins list, so refresh those too.
       if (row.pinned_at) io.to(room).emit('pins:updated', { serverId: row.server_id, channelId: row.channel_id, pins: await channelPins(row.server_id, row.channel_id, socketUser) });
       reply({ ok: true, editedAt });
+      // The preview follows the link, not the edit: nothing is fetched unless the link it is for
+      // changed (services/linkPreview.js).
+      const previewEvent = (preview) => io.to(room).emit('message:preview', { id, serverId: row.server_id, channelId: row.channel_id, preview });
+      linkPreviews.afterEdit({
+        table: 'messages', id, oldText: row.text || '', newText: body, user: socketUser, ownHosts: ownHostsFor(socket.handshake.headers),
+        emit: previewEvent, clear: () => previewEvent(null),
+      });
+    });
+
+    // Take the link preview off a channel message — its author only, like deleting it. It goes for
+    // everyone in the channel, and stays gone: it is only looked at again if the link itself is
+    // edited (afterEdit above).
+    socket.on('message:preview-remove', async ({ id } = {}, ack) => {
+      const reply = typeof ack === 'function' ? ack : () => {};
+      const info = clients[socket.id];
+      if (!id || !info) return reply({ ok: false, error: 'bad-request' });
+      const row = await db.get('SELECT author, server_id, channel_id FROM messages WHERE id = ?', id);
+      if (!row) return reply({ ok: false, error: 'not-found' });
+      if (row.author !== info.name) return reply({ ok: false, error: 'not-author' });
+      if (await linkPreviews.remove('messages', id)) {
+        io.to(`channel:${row.server_id}:${row.channel_id}`).emit('message:preview', { id, serverId: row.server_id, channelId: row.channel_id, preview: null });
+      }
+      return reply({ ok: true });
     });
 
     // Pin / unpin a channel message. Any member who can see the channel may pin (party app). The
@@ -2425,10 +2525,14 @@ async function main() {
     if (removed) console.log(`[avatars] removed ${removed} unreferenced picture(s)`);
   }
 
-  // Sweep expired uploads on startup, then hourly. Orphaned avatars ride the same schedule.
+  // Sweep expired uploads on startup, then hourly. Orphaned avatars and link preview images ride
+  // the same schedule.
   const runSweeps = () => {
     cleanupExpiredUploads().catch((err) => console.warn('upload cleanup failed', err));
     sweepOrphanAvatars().catch((err) => console.warn('avatar cleanup failed', err));
+    // Link preview images nothing shows any more, and cache rows past their time. Runs whether or
+    // not previews are switched on: turning them off must not strand what was stored before.
+    linkPreviews.sweep().catch((err) => console.warn('link preview cleanup failed', err && err.message));
   };
   runSweeps();
   setInterval(runSweeps, CLEANUP_INTERVAL_MS).unref();

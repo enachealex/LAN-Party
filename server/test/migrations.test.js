@@ -162,7 +162,11 @@ describe('schema migrations', () => {
     assert.equal(before.channels.rows.length, 5, 'the two commons channels and the three of srv-1');
     assert.ok(!(await columnNames(db, 'channels')).includes('category_id'));
 
-    await migrate(db); // the boot that picks 0015 up
+    // The boot that picks 0015 up. Run through 0015 and no further, as the 0014 test above does:
+    // this is about what THAT migration does, and a later one is free to add a column to a table
+    // that was here before it (0016 does, and has its own test below).
+    const boot = async () => { await runMigrations(db, MIGRATIONS.slice(0, upTo + 1)); await seedDemo(db); };
+    await boot();
     assert.deepEqual(await snapshot(), before, 'no existing row or column changed');
     assert.deepEqual((await columnNames(db, 'channels')).slice(-2), ADDED_TO_CHANNELS, 'channels gained exactly these, at the end');
     assert.deepEqual(
@@ -196,9 +200,99 @@ describe('schema migrations', () => {
 
     // Running it again (a database that lost its migration record) changes nothing either.
     await db.exec('DROP TABLE schema_migrations');
-    await migrate(db);
+    await boot();
     assert.deepEqual(await snapshot(), before);
     assert.equal((await db.get('SELECT COUNT(*) AS n FROM server_member_roles')).n, 2, 'and keeps what the new tables hold');
+    await db.close();
+  });
+
+  test('0016 (notification levels and link previews) adds two tables and one empty column per message table, and changes no existing row', async () => {
+    // A database as production has it the moment before this migration: everything up to 0015
+    // applied and recorded, with messages of all three kinds, read markers, blocks and roles.
+    const db = await freshDb();
+    const upTo = MIGRATIONS.findIndex((m) => m.name === '0016_notification_levels_and_link_previews');
+    assert.ok(upTo > 0, 'the migration exists, after the ones already shipped');
+    assert.equal(MIGRATIONS[upTo - 1].name, '0015_roles_and_categories', 'appended directly after 0015');
+    assert.equal(upTo, MIGRATIONS.length - 1, 'and it is the one new migration');
+    await runMigrations(db, MIGRATIONS.slice(0, upTo));
+    await seedDemo(db);
+    await db.run("INSERT INTO users (username, email, password_hash, settings) VALUES ('ann', 'ann@example.com', 'hash', '{}'), ('ben', 'ben@example.com', 'hash', '{}'), ('cat', 'cat@example.com', 'hash', '{}')");
+    await db.run("INSERT INTO servers (id, name, owner) VALUES ('srv-1', 'Crew', 'ann')");
+    await db.run("INSERT INTO channels (id, server_id, name, type, privacy, category_id, position) VALUES ('ch-1', 'srv-1', 'general', 'text', 'public', NULL, 2), ('ch-2', 'srv-1', 'staff', 'text', 'private', 'cat-1', NULL)");
+    await db.run("INSERT INTO channel_categories (id, server_id, name, position) VALUES ('cat-1', 'srv-1', 'Staff', 0)");
+    await db.run("INSERT INTO server_members (server_id, username, role) VALUES ('srv-1', 'ann', 'owner'), ('srv-1', 'ben', 'member')");
+    await db.run("INSERT INTO channel_reads (username, server_id, channel_id, last_read_ts) VALUES ('ben', 'srv-1', 'ch-1', 1700000000000)");
+    await db.run(`INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, reactions_json, quotes_json, pinned_at, pinned_by, edited_at)
+      VALUES ('srv-1', 'ch-1', 'ben', 'see https://example.com/page', 1700000000001, NULL, '{"👍":["ann"]}', NULL, 1700000000002, 'ann', 1700000000003),
+             ('srv-1', 'ch-1', 'ann', '', 1700000000004, '{"url":"/uploads/1-ab-shot.png","name":"shot.png"}', NULL, NULL, NULL, NULL, NULL)`);
+    await db.run("INSERT INTO direct_messages (sender_id, recipient_id, body, created_at, read_at, quotes_json, edited_at) VALUES (1, 2, 'psst https://example.com/dm', 1700000000000, NULL, '[{\"id\":\"1\",\"author\":\"ben\",\"text\":\"hi\"}]', 1700000000009)");
+    await db.run("INSERT INTO group_chats (id, name, owner_id, created_at) VALUES ('grp-1', 'Trio', 1, 1700000000000)");
+    await db.run("INSERT INTO group_members (group_id, user_id, joined_at, last_read_at) VALUES ('grp-1', 1, 1700000000000, 5), ('grp-1', 2, 1700000000001, 6), ('grp-1', 3, 1700000000002, 7)");
+    await db.run("INSERT INTO group_messages (group_id, sender_id, body, created_at, reactions_json) VALUES ('grp-1', 2, 'in the group https://example.com/g', 1700000000000, '{\"🎉\":[\"cat\"]}')");
+    await db.run('INSERT INTO user_blocks (blocker_id, blocked_id, created_at) VALUES (3, 2, 1700000000000)');
+    await db.run("INSERT INTO push_subscriptions (endpoint, username, p256dh, auth, created_at) VALUES ('https://push.example.com/x', 'ben', 'p', 'a', 1700000000000)");
+
+    const tables = (await db.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations' ORDER BY name")).map((r) => r.name);
+    const GAINED = ['messages', 'direct_messages', 'group_messages'];
+    // Every existing table as it stands, with the one new column of the three message tables left
+    // out of the comparison (it is checked on its own, below).
+    const snapshot = async () => {
+      const out = {};
+      for (const t of tables) {
+        const columns = (await columnNames(db, t)).filter((c) => !(GAINED.includes(t) && c === 'preview_json'));
+        out[t] = { columns, rows: await db.all(`SELECT ${columns.join(', ')} FROM ${t} ORDER BY rowid`) };
+      }
+      return out;
+    };
+    const before = await snapshot();
+    assert.equal(before.messages.rows.length, 2);
+    for (const t of GAINED) assert.ok(!(await columnNames(db, t)).includes('preview_json'));
+
+    await migrate(db); // the boot that picks 0016 up
+    assert.deepEqual(await snapshot(), before, 'no existing row or column changed');
+    for (const t of GAINED) {
+      assert.equal((await columnNames(db, t)).at(-1), 'preview_json', `${t} gained exactly this, at the end`);
+      assert.deepEqual(await db.all(`SELECT DISTINCT preview_json FROM ${t}`), [{ preview_json: null }], `no existing row of ${t} has a preview`);
+    }
+
+    const NEW = {
+      notification_settings: ['user_id', 'scope', 'target', 'server_id', 'level', 'updated_at'],
+      link_previews: ['url', 'status', 'data', 'fetched_at', 'expires_at'],
+    };
+    for (const [table, columns] of Object.entries(NEW)) {
+      assert.ok(!tables.includes(table), `${table} is new`);
+      assert.deepEqual(await columnNames(db, table), columns);
+      assert.equal((await db.get(`SELECT COUNT(*) AS n FROM ${table}`)).n, 0, `${table} starts empty: nobody has changed a level, and nothing has been fetched`);
+    }
+    // One setting per person per thing, and one cache row per URL.
+    await db.run("INSERT INTO notification_settings (user_id, scope, target, server_id, level, updated_at) VALUES (2, 'channel', 'ch-1', 'srv-1', 'all', 1)");
+    await assert.rejects(() => db.run("INSERT INTO notification_settings (user_id, scope, target, server_id, level, updated_at) VALUES (2, 'channel', 'ch-1', 'srv-1', 'none', 2)"));
+    await db.run("INSERT INTO notification_settings (user_id, scope, target, server_id, level, updated_at) VALUES (2, 'server', 'srv-1', 'srv-1', 'none', 1), (3, 'channel', 'ch-1', 'srv-1', 'none', 1), (2, 'dm', '1', NULL, 'none', 1)");
+    await db.run("INSERT INTO link_previews (url, status, data, fetched_at, expires_at) VALUES ('https://example.com/page', 'ok', '{}', 1, 2)");
+    await assert.rejects(() => db.run("INSERT INTO link_previews (url, status, data, fetched_at, expires_at) VALUES ('https://example.com/page', 'none', NULL, 3, 4)"));
+
+    // With nothing set, everyone is where they were before levels existed.
+    const { createNotificationSettings, effectiveChannelLevel } = require('../services/notificationSettings');
+    const settings = createNotificationSettings({ db });
+    assert.deepEqual(await settings.settingsOf(1), { servers: {}, channels: {}, dms: {}, groups: {} });
+    assert.equal(effectiveChannelLevel(await settings.settingsOf(1), 'srv-1', 'ch-1'), 'mentions');
+    assert.deepEqual(await settings.settingsOf(2), { servers: { 'srv-1': 'none' }, channels: { 'srv-1': { 'ch-1': 'all' } }, dms: { 1: true }, groups: {} });
+    assert.deepEqual([...await settings.channelLevels('srv-1', 'ch-1')].sort(), [['ben', 'all'], ['cat', 'none']], 'a channel\'s own level wins over the server\'s');
+    assert.deepEqual([...await settings.channelLevels('srv-1', 'ch-2')], [['ben', 'none']], 'and a channel with none follows the server');
+    // The old messages read back exactly as they did, with no preview.
+    const { createMessages } = require('../services/messages');
+    const { channelHistory } = require('../services/history');
+    const source = channelHistory('srv-1', 'ch-1');
+    const rows = await db.all(`SELECT ${source.columns} FROM ${source.from} WHERE ${source.where} ORDER BY id`, ...source.params);
+    const mapped = rows.map((r) => createMessages({ db }).mapMessageRow(r, 'ann'));
+    assert.deepEqual(mapped.map((m) => [m.text, 'preview' in m, m.pinnedBy, m.edited]), [['see https://example.com/page', false, 'ann', true], ['', false, null, false]]);
+
+    // Running it again (a database that lost its migration record) changes nothing either.
+    await db.exec('DROP TABLE schema_migrations');
+    await migrate(db);
+    assert.deepEqual(await snapshot(), before);
+    assert.equal((await db.get('SELECT COUNT(*) AS n FROM notification_settings')).n, 4, 'and keeps what the new tables hold');
+    assert.equal((await db.get('SELECT COUNT(*) AS n FROM link_previews')).n, 1);
     await db.close();
   });
 

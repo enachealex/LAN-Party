@@ -15,7 +15,23 @@
 const { parsePageQuery, fetchPage } = require('../services/history');
 
 /** @param {Record<string, any>} deps */
-function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks }) {
+function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, areFriends, canDirectMessage, mayReadDirectMessages, hasPendingRequestBetween, emitPendingUpdate, emitFriendsListUpdate, getDmUnreadSummary, emitDmUnreadUpdate, setUserPresenceByUsername, broadcastPresenceToFriends, normalizePresence, displayProfileFromSettings, avatarColorForUsername, mapMessageRow, normalizeAttachment, sanitizeQuotes, push, blocks, notificationSettings, linkPreviews, ownHostsFor }) {
+  // A direct message's link preview changed (attached once its page was fetched, or taken off): to
+  // both people, like an edit. With a block between the two, only its author is told, for the reason
+  // an edit is not delivered either: nothing new arrives on the other side.
+  async function emitDmPreview(id, preview) {
+    const dm = await db.get(
+      `SELECT dm.sender_id, dm.recipient_id, s.username AS sender, r.username AS recipient
+         FROM direct_messages dm JOIN users s ON s.id = dm.sender_id JOIN users r ON r.id = dm.recipient_id
+        WHERE dm.id = ?`,
+      id
+    );
+    if (!dm) return;
+    const payload = { id, preview };
+    io.to(`user:${dm.sender}`).emit('dm:message-preview', payload);
+    if (!(await blocks.between(dm.sender_id, dm.recipient_id))) io.to(`user:${dm.recipient}`).emit('dm:message-preview', payload);
+  }
+
   app.post('/user/presence', authMiddleware, async (req, res) => {
     const status = normalizePresence(req.body?.status);
     const username = req.user.username;
@@ -313,7 +329,7 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
       await emitDmUnreadUpdate(me.username);
     }
     const { rows, hasMore, hasMoreAfter } = await fetchPage(db, {
-      columns: 'dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, dm.edited_at, s.username AS author',
+      columns: 'dm.id, dm.body AS text, dm.created_at AS ts, dm.attachment_json, dm.reactions_json, dm.quotes_json, dm.preview_json, dm.edited_at, s.username AS author',
       from: 'direct_messages dm JOIN users s ON s.id = dm.sender_id',
       where: '(dm.sender_id = ? AND dm.recipient_id = ?) OR (dm.sender_id = ? AND dm.recipient_id = ?)',
       params: [me.id, peer.id, peer.id, me.id],
@@ -389,7 +405,16 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     await emitDmUnreadUpdate(me.username);
     // For a recipient whose app is closed. Fire-and-forget: the message is already stored and
     // emitted, and a push service being slow or down must not delay or fail the send.
-    push.notifyDirectMessage({ from: me.username, fromUserId: me.id, to: peer.username, text: body, attachment });
+    // Not when they have muted this conversation (services/notificationSettings.js): the message
+    // is delivered and counted as always, it just does not reach their phone.
+    notificationSettings.dmMuted(peer.id, me.id)
+      .then((muted) => { if (!muted) push.notifyDirectMessage({ from: me.username, fromUserId: me.id, to: peer.username, text: body, attachment }); })
+      .catch((err) => console.warn('[push] mute lookup failed:', err && err.message));
+    // The link preview follows, if the message has a link and its page can be fetched.
+    linkPreviews.attachTo({
+      table: 'direct_messages', id: msg.id, user: me.username, ownHosts: ownHostsFor(req.headers),
+      emit: (preview) => emitDmPreview(msg.id, preview),
+    });
     return res.json({ success: true, message: msg });
   });
 
@@ -402,7 +427,7 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     if (!body) return res.status(400).json({ error: 'A message needs some text' });
     const me = await getUserByUsername(req.user.username);
     if (!me) return res.status(404).json({ error: 'User not found' });
-    const dm = await db.get('SELECT sender_id, recipient_id, attachment_json FROM direct_messages WHERE id = ?', id);
+    const dm = await db.get('SELECT sender_id, recipient_id, body, attachment_json FROM direct_messages WHERE id = ?', id);
     if (!dm) return res.status(404).json({ error: 'Message not found' });
     if (dm.sender_id !== me.id) return res.status(403).json({ error: 'You can only edit your own messages' });
     if (dm.attachment_json) return res.status(400).json({ error: "Messages with an attachment can't be edited" });
@@ -414,7 +439,25 @@ function registerSocialRoutes({ app, db, io, authMiddleware, getUserByUsername, 
     // With a block between the two, nothing new is delivered to the other side, and rewritten
     // words are new. The edit itself goes through as always: its author sees no difference.
     if (recipient && !(await blocks.between(me.id, dm.recipient_id))) io.to(`user:${recipient.username}`).emit('dm:message-edited', payload);
+    // The preview is only looked at again if the link it is for changed (services/linkPreview.js).
+    linkPreviews.afterEdit({
+      table: 'direct_messages', id, oldText: dm.body || '', newText: body, user: me.username, ownHosts: ownHostsFor(req.headers),
+      emit: (preview) => emitDmPreview(id, preview), clear: () => emitDmPreview(id, null),
+    });
     return res.json({ success: true, ...payload });
+  });
+
+  // Take the link preview off a direct message — its sender only. It goes for both people.
+  app.delete('/messages/:id/preview', authMiddleware, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid message id' });
+    const me = await getUserByUsername(req.user.username);
+    if (!me) return res.status(404).json({ error: 'User not found' });
+    const dm = await db.get('SELECT sender_id FROM direct_messages WHERE id = ?', id);
+    if (!dm) return res.status(404).json({ error: 'Message not found' });
+    if (dm.sender_id !== me.id) return res.status(403).json({ error: 'You can only remove the preview from your own messages' });
+    if (await linkPreviews.remove('direct_messages', id)) await emitDmPreview(id, null);
+    return res.json({ success: true });
   });
 
   // Delete a direct message — only the sender may delete it. Notify both participants.

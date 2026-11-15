@@ -4,6 +4,8 @@ import HomeLeftPanel from './HomeLeftPanel'
 import FloatingMenu from './FloatingMenu'
 import MemberActionItems from './MemberActionItems'
 import ChannelList from './ChannelList'
+import NotificationLevelItems from './NotificationLevelItems'
+import { NO_NOTIFICATION_SETTINGS, serverLevel, ownChannelLevel, mutedChannelIds, isDmMuted, isGroupMuted } from '../notificationLevels'
 import { effectivePermissions, memberActionsFor, NO_MEMBER_ACTIONS } from '../permissions'
 import { formatMoment } from '../moderation'
 import ProfileAvatar from './ProfileAvatar'
@@ -252,7 +254,14 @@ export default function AppLeftPane({
   onSetChannelCategory,   // (channelId, categoryId | null) => void
   onOpenServerSettings,   // (serverId, serverName) => void — any member; opens on Roles
   onToggleMemberRole,     // (username, roleId, on) => void
+  // Notification levels (notificationLevels.ts): mine, for every server, channel, DM and group.
+  notificationSettings = NO_NOTIFICATION_SETTINGS,
+  onSetNotificationLevel, // (target, level | null) => void — target as PUT /notifications/settings takes it
 }) {
+  // The channels of the server on screen that are muted for me, directly or through the server.
+  const mutedChannels = mutedChannelIds(notificationSettings, serverId, channels.map((c) => c.id))
+  // Muted conversations, by the id their rows are keyed by (a DM's is the other person's user id).
+  const isConversationMuted = (kind, id) => (kind === 'group' ? isGroupMuted(notificationSettings, id) : isDmMuted(notificationSettings, id))
   // Channels: anyone may add one in the public commons; elsewhere it takes manage_channels.
   // Categories and channel order exist in real servers only.
   const canManageChannels = serverId === 'demo' || myPermissions.has('manage_channels')
@@ -493,6 +502,7 @@ export default function AppLeftPane({
                 activeChannel={activeChannel}
                 channelUnreads={channelUnreads}
                 channelMentions={channelMentions}
+                mutedChannels={mutedChannels}
                 canManage={canManageChannels}
                 collapseKey={currentUsername || displayName || 'guest'}
                 inVoice={inVoice}
@@ -538,6 +548,8 @@ export default function AppLeftPane({
               totalUnreadMessages={totalUnreadMessages}
               unreadByChatId={unreadByChatId}
               groupUnread={groupUnread}
+              isConversationMuted={isConversationMuted}
+              onSetConversationMuted={(kind, id, muted) => onSetNotificationLevel?.(kind === 'group' ? { scope: 'group', groupId: String(id) } : { scope: 'dm', userId: String(id) }, muted ? 'none' : null)}
             />
           )}
         </div>
@@ -608,6 +620,16 @@ export default function AppLeftPane({
             // the owner and admins hold them all, a member the ones their roles give them.
             const may = isDemo ? new Set() : permissionsInServer(ctxMenu)
             const items = []
+            // First, and for every member of every server: how much of it I want to hear. It is
+            // mine alone, so it needs no permission. Channels follow it unless they have their own.
+            items.push(
+              <NotificationLevelItems
+                key="notifications"
+                kind="server"
+                own={serverLevel(notificationSettings, ctxMenu.id)}
+                onPick={(level) => { setCtxMenu(null); onSetNotificationLevel?.({ scope: 'server', serverId: ctxMenu.id }, level) }}
+              />
+            )
             if (may.has('manage_server')) {
               items.push(
                 <button key="rename" type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameServer?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename server</button>
@@ -694,10 +716,22 @@ export default function AppLeftPane({
             </>
           )}
 
-          {/* Only opened for someone who manages channels (ChannelList): everything in it is theirs to use. */}
+          {/* A text channel's menu opens for everyone, for its notification level; the rest of it
+              (and the whole of a voice channel's) is channel management, for people who have that. */}
           {ctxMenu.kind === 'channel' && (
             <>
               <div className="dc-ctx-title">#{ctxMenu.name}</div>
+              {ctxMenu.type === 'text' && serverId && (
+                <NotificationLevelItems
+                  kind="channel"
+                  own={ownChannelLevel(notificationSettings, serverId, ctxMenu.id)}
+                  inherited={serverLevel(notificationSettings, serverId)}
+                  onPick={(level) => { setCtxMenu(null); onSetNotificationLevel?.({ scope: 'channel', serverId, channelId: ctxMenu.id }, level) }}
+                />
+              )}
+              {canManageChannels && (
+              <>
+              {ctxMenu.type === 'text' && <div className="dc-ctx-sep" role="separator" />}
               <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onRenameChannel?.(ctxMenu.id, ctxMenu.name) }}>✏️ Rename</button>
               {ctxMenu.privacy === 'private' && canArrangeChannels && (
                 <button type="button" role="menuitem" className="dc-ctx-item" onClick={() => { setCtxMenu(null); onManageAccess?.(ctxMenu.id, ctxMenu.name) }}>🔑 Manage access</button>
@@ -734,6 +768,8 @@ export default function AppLeftPane({
                 </>
               )}
               <button type="button" role="menuitem" className="dc-ctx-item danger" onClick={() => { setCtxMenu(null); onDeleteChannel?.(ctxMenu.id, ctxMenu.name) }}>🗑️ Delete</button>
+              </>
+              )}
             </>
           )}
 

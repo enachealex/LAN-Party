@@ -20,8 +20,17 @@ Trusted Web Activity APK for Android.
 - **Chat**: file uploads (deleted after 7 days), GIFs (Tenor plus your own library), custom emojis,
   reactions with customizable quick reactions, quoted replies, pins, and edits and deletes that are
   saved and shown to everyone.
+- **Link previews**: a message with a link gets a small card (site, title, description, image). The
+  server fetches the page once, by strict rules that keep it away from anything on its own network,
+  and serves the image itself, so opening a channel never sends your browser to the linked site. The
+  author can remove the card (✕) for everyone; each person can hide all cards in Settings → Messages.
 - **Friends, DMs and group chats**: friend requests, presence, direct messages and server-backed
   group chats (rename, add people, leave), with your own sections in the conversation list.
+- **Notification levels**: per server and per channel, choose **All messages**, **Only @mentions**
+  (the default) or **Nothing** from the right-click menu; a channel follows its server unless it
+  has a setting of its own. Mute a DM or a group chat the same way. A muted channel or conversation
+  never alerts, even for a mention, and keeps its unread count without adding to any badge. The
+  levels apply to pushes while the app is closed as well, and follow you across devices.
 - **Blocking**: block anyone from their profile, a member list or a DM. They can no longer message
   you, call you, send you a friend request or add you to a group chat (nor you them, until you
   unblock), and they are not told. In servers and group chats you share, their messages are
