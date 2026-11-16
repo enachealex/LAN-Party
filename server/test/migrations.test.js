@@ -306,7 +306,6 @@ describe('schema migrations', () => {
     const upTo = MIGRATIONS.findIndex((m) => m.name === '0017_two_factor_and_email_verification');
     assert.ok(upTo > 0, 'the migration exists, after the ones already shipped');
     assert.equal(MIGRATIONS[upTo - 1].name, '0016_notification_levels_and_link_previews', 'appended directly after 0016');
-    assert.equal(upTo, MIGRATIONS.length - 1, 'and it is the one new migration');
     await runMigrations(db, MIGRATIONS.slice(0, upTo));
     await seedDemo(db);
     await db.run("INSERT INTO users (username, email, password_hash, settings, presence_status) VALUES ('ann', 'ann@example.com', 'hash-a', '{\"profile\":{}}', 'away'), ('ben', 'ben@example.com', 'hash-b', '{}', 'offline'), ('cat', NULL, 'hash-c', NULL, NULL)");
@@ -322,7 +321,7 @@ describe('schema migrations', () => {
     const snapshot = async () => Object.fromEntries(await Promise.all(others.map(async (t) => [t, await db.all(`SELECT * FROM ${t} ORDER BY rowid`)])));
     const before = await snapshot();
 
-    assert.deepEqual(await runMigrations(db, MIGRATIONS), ['0017_two_factor_and_email_verification']);
+    assert.deepEqual(await runMigrations(db, MIGRATIONS.slice(0, upTo + 1)), ['0017_two_factor_and_email_verification']);
 
     // Grandfathering: everyone who had an account is verified, whatever their row looked like.
     assert.deepEqual(await db.all('SELECT username, email_verified FROM users ORDER BY id'), [
@@ -352,6 +351,25 @@ describe('schema migrations', () => {
     assert.equal((await db.get("SELECT email_verified FROM users WHERE username = 'dee'")).email_verified, 0);
     assert.equal((await db.get("SELECT email_verified FROM users WHERE username = 'ann'")).email_verified, 1);
     assert.equal((await db.get('SELECT COUNT(*) AS n FROM user_two_factor')).n, 1, 'and keeps what the new tables hold');
+    await db.close();
+  });
+
+  test('0018 (GIF library search) adds empty tags and no hash to every GIF, and changes nothing else', async () => {
+    const db = await freshDb();
+    const upTo = MIGRATIONS.findIndex((m) => m.name === '0018_gif_library_search');
+    assert.equal(MIGRATIONS[upTo - 1].name, '0017_two_factor_and_email_verification', 'appended directly after 0017');
+    assert.equal(upTo, MIGRATIONS.length - 1, 'and it is the one new migration');
+    await runMigrations(db, MIGRATIONS.slice(0, upTo));
+    await db.run("INSERT INTO gifs (name, url, type, created_by, created_at) VALUES ('wave', '/gifs/1-a.gif', 'image/gif', 'ann', 1700000000000), ('nope', '/gifs/2-b.png', 'image/png', 'ben', 1700000000001)");
+    const before = await db.all('SELECT id, name, url, type, created_by, created_at FROM gifs ORDER BY id');
+
+    assert.deepEqual(await runMigrations(db, MIGRATIONS), ['0018_gif_library_search']);
+    assert.deepEqual(await db.all('SELECT id, name, url, type, created_by, created_at FROM gifs ORDER BY id'), before);
+    assert.deepEqual(await db.all('SELECT tags, sha256 FROM gifs ORDER BY id'), [{ tags: '', sha256: null }, { tags: '', sha256: null }]);
+    // Run again (a lost migration record): nothing breaks and nothing changes.
+    await db.exec('DROP TABLE schema_migrations');
+    await migrate(db);
+    assert.equal((await db.get('SELECT COUNT(*) AS n FROM gifs')).n, 2);
     await db.close();
   });
 

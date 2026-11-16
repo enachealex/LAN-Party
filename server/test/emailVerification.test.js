@@ -203,6 +203,7 @@ describe('email verification: an instance that can send email', () => {
       refused(await rookie.call('POST', '/apps', { name: 'My app', url: 'https://example.com/' }, rookie.token), 'a link app');
       refused(await rookie.call('POST', '/apps/bundle', pngUpload(), rookie.token), 'an app bundle');
       refused(await rookie.call('PUT', '/apps/any-app/bundle', pngUpload(), rookie.token), 'replacing an app bundle');
+      refused(await rookie.call('PATCH', '/apps/any-app', { url: 'https://example.com/elsewhere' }, rookie.token), "changing an app's address or details");
       assert.deepEqual(await dbAll(server.dataDir, 'SELECT * FROM server_emojis'), []);
       assert.deepEqual(await dbAll(server.dataDir, "SELECT * FROM apps WHERE created_by = 'rookie'"), []);
     });

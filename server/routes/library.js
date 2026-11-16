@@ -5,10 +5,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { extractBundle } = require('../services/appBundles');
+const gifLibrary = require('../services/gifLibrary');
 const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl } = require('../services/hostedApps');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [], requireVerified, permissions, moderation }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [], requireVerified, permissions, moderation, uploadDir }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -267,7 +268,9 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   // nobody else to ask and keeps its status; and any room running it is told it ended, because it
   // is running the old address. A review in progress is not fooled either: approve has to name what
   // it is about (see the handler).
-  app.patch('/apps/:id', authMiddleware, async (req, res) => {
+  //
+  // requireVerified, like adding an app: everything edited here is shown in the public directory.
+  app.patch('/apps/:id', authMiddleware, requireVerified, async (req, res) => {
     const found = await loadApp(req, res);
     if (!found) return;
     const { id, row, me, isOwner, isUploader } = found;
@@ -520,16 +523,26 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
     return res.json({ success: true, apps: await listApps(me, isOwner) });
   });
 
-  // --- Shared GIF library ---
-  // List all GIFs (newest first).
+  // --- Shared GIF library (services/gifLibrary.js) ---
+  // Everyone signed in can search it and post from it. Adding waits for a confirmed email (the
+  // library is shared with everyone). Renaming, retagging and removing a GIF is for whoever added
+  // it, and the instance owners.
+  const mayManageGif = async (row, username) => row.created_by === username || (await isInstanceOwner(username));
+  const presentAll = async (rows, username) => {
+    const owner = await isInstanceOwner(username);
+    return rows.map((row) => gifLibrary.present(row, owner || row.created_by === username));
+  };
+
+  // One page, newest first: ?q= words to match against name and tags, ?before= the `next` of the
+  // previous page, ?limit=.
   app.get('/gifs', authMiddleware, async (req, res) => {
-    const gifs = await db.all('SELECT id, name, url, type, created_by AS createdBy, created_at AS createdAt FROM gifs ORDER BY created_at DESC');
-    return res.json({ gifs });
+    const { rows, next } = await gifLibrary.searchGifs(db, { q: req.query.q, before: req.query.before, limit: req.query.limit });
+    return res.json({ gifs: await presentAll(rows, req.user.username), next });
   });
 
-  // Add a GIF to the shared library (multipart upload -> persistent /gifs storage).
-  // requireVerified (here and on /sounds): the libraries are shared with everyone, so adding to
-  // them waits for a confirmed email. Checked before the upload is read.
+  // Upload into the library. The file lands in gifsDir under multer's name, then addGifFile checks
+  // what it really is, drops it if the same picture is already there, and renames it.
+  // requireVerified (here and on /sounds) is checked before the upload is read.
   app.post('/gifs', authMiddleware, requireVerified, (req, res) => {
     gifUpload.single('file')(req, res, async (err) => {
       if (err) {
@@ -537,34 +550,61 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
         return res.status(400).json({ error: err.message || 'Upload failed' });
       }
       if (!req.file) return res.status(400).json({ error: 'Missing file' });
-      const type = req.file.mimetype || 'image/gif';
-      if (!type.startsWith('image/')) {
-        fs.promises.unlink(req.file.path).catch(() => {});
-        return res.status(400).json({ error: 'Only image files can be added to the GIF library' });
-      }
-      const rawName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-      const name = (rawName || req.file.originalname || 'GIF').slice(0, 80);
-      const url = `/gifs/${req.file.filename}`;
-      await db.run(
-        'INSERT INTO gifs (name, url, type, created_by, created_at) VALUES (?, ?, ?, ?, ?)',
-        name, url, type, req.user.username, Date.now()
-      );
-      const gifs = await db.all('SELECT id, name, url, type, created_by AS createdBy, created_at AS createdAt FROM gifs ORDER BY created_at DESC');
-      return res.json({ success: true, gifs });
+      const added = await gifLibrary.addGifFile(db, {
+        gifsDir, source: req.file.path, move: true, createdBy: req.user.username,
+        name: req.body?.name || gifLibrary.nameFromFilename(req.file.originalname), tags: req.body?.tags,
+      });
+      if ('error' in added) return res.status(400).json({ error: added.error });
+      const [gif] = await presentAll([added.row], req.user.username);
+      return res.json({ success: true, gif, duplicate: added.duplicate });
     });
   });
 
-  // Remove a GIF from the library (and delete its file).
+  // Save an image someone posted in chat. It is COPIED out of /uploads, which is emptied after 7
+  // days; the library keeps it for good. Only a file this server stored is accepted.
+  app.post('/gifs/from-upload', authMiddleware, requireVerified, async (req, res) => {
+    const url = typeof req.body?.url === 'string' ? req.body.url : '';
+    let stored = '';
+    try { stored = url.startsWith('/uploads/') ? path.basename(decodeURIComponent(url.slice('/uploads/'.length).split(/[?#]/)[0])) : ''; } catch { /* malformed escape */ }
+    if (!stored || stored.startsWith('.')) return res.status(400).json({ error: 'Only a file posted here can be saved to the GIF library' });
+    const source = path.join(uploadDir, stored);
+    if (!fs.existsSync(source)) return res.status(404).json({ error: 'That file has expired and is no longer on the server' });
+    const added = await gifLibrary.addGifFile(db, {
+      gifsDir, source, createdBy: req.user.username,
+      name: req.body?.name || gifLibrary.nameFromFilename(stored), tags: req.body?.tags,
+    });
+    if ('error' in added) return res.status(400).json({ error: added.error });
+    const [gif] = await presentAll([added.row], req.user.username);
+    return res.json({ success: true, gif, duplicate: added.duplicate });
+  });
+
+  // Rename or retag. Shown in everyone's picker, so only whoever added it, or an instance owner.
+  app.patch('/gifs/:id', authMiddleware, requireVerified, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const row = id ? await db.get('SELECT * FROM gifs WHERE id = ?', id) : null;
+    if (!row) return res.status(404).json({ error: 'GIF not found' });
+    if (!(await mayManageGif(row, req.user.username))) return res.status(403).json({ error: 'Only whoever added this GIF can change it' });
+    const body = req.body || {};
+    const name = body.name !== undefined ? gifLibrary.cleanName(body.name) : row.name;
+    if (!name) return res.status(400).json({ error: 'A GIF needs a name' });
+    const tags = body.tags !== undefined ? gifLibrary.normalizeTags(body.tags).join(' ') : row.tags;
+    await db.run('UPDATE gifs SET name = ?, tags = ? WHERE id = ?', name, tags, id);
+    const [gif] = await presentAll([await db.get('SELECT * FROM gifs WHERE id = ?', id)], req.user.username);
+    return res.json({ success: true, gif });
+  });
+
+  // Remove a GIF (and its file): whoever added it, or an instance owner. Before, anyone could.
   app.delete('/gifs/:id', authMiddleware, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid gif id' });
-    const gif = await db.get('SELECT url FROM gifs WHERE id = ?', id);
-    if (gif && typeof gif.url === 'string' && gif.url.startsWith('/gifs/')) {
+    const gif = await db.get('SELECT id, url, created_by FROM gifs WHERE id = ?', id);
+    if (!gif) return res.status(404).json({ error: 'GIF not found' });
+    if (!(await mayManageGif(gif, req.user.username))) return res.status(403).json({ error: 'Only whoever added this GIF can remove it' });
+    if (typeof gif.url === 'string' && gif.url.startsWith('/gifs/')) {
       fs.promises.unlink(path.join(gifsDir, path.basename(gif.url))).catch(() => {});
     }
     await db.run('DELETE FROM gifs WHERE id = ?', id);
-    const gifs = await db.all('SELECT id, name, url, type, created_by AS createdBy, created_at AS createdAt FROM gifs ORDER BY created_at DESC');
-    return res.json({ success: true, gifs });
+    return res.json({ success: true, id });
   });
 
   // --- Shared soundboard ---

@@ -1,6 +1,7 @@
-// Media proxies: the Giphy search proxy, YouTube search + yt-dlp audio streaming, saved playlists,
+// Media proxies: YouTube search + yt-dlp audio streaming, saved playlists,
 // and the Spotify OAuth + search flow. API keys stay server-side (env vars or server/*.key files);
 // clients only ever see proxied results.
+// (GIFs are not here: LAN Party keeps its own library, routes/library.js. There is no Tenor or Giphy.)
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -11,67 +12,6 @@ const SERVER_DIR = path.join(__dirname, '..'); // *.key files live in server/, n
 
 /** @param {{ app: any, db: any, authMiddleware: any, io: any, JWT_SECRET: string, ownOrigins?: string[] }} deps */
 function registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins = [] }) {
-  // --- Tenor proxy (Google Tenor API v2) ---
-  // The Tenor API key comes from the TENOR_API_KEY env var, or a `server/tenor.key` file.
-  // The key stays server-side; clients only ever see the normalized, proxied results.
-  function getTenorKey() {
-    if (process.env.TENOR_API_KEY && process.env.TENOR_API_KEY.trim()) return process.env.TENOR_API_KEY.trim();
-    try { return fs.readFileSync(path.join(SERVER_DIR, 'tenor.key'), 'utf8').trim(); } catch { return ''; }
-  }
-
-  app.get('/tenor/status', authMiddleware, (req, res) => res.json({ configured: !!getTenorKey() }));
-
-  // Normalize a Tenor result into the minimal shape our own GIF grid renders: a small preview
-  // for the cell, a full-size url to send, and a name for the alt text / hover tooltip.
-  function mapTenorResult(r) {
-    const f = (r && r.media_formats) || {};
-    const full = f.mediumgif?.url || f.gif?.url || f.tinygif?.url || '';
-    if (!full) return null;
-    return {
-      id: r.id,
-      url: full,
-      preview: f.tinygif?.url || f.nanogif?.url || full,
-      description: r.content_description || r.title || 'GIF',
-    };
-  }
-
-  // Featured (trending) + search. Tenor paginates with an opaque `pos` cursor (not a numeric
-  // offset); we echo it back to the client as `next` so infinite scroll can resume.
-  async function proxyTenor(res, endpoint, params) {
-    const key = getTenorKey();
-    if (!key) return res.status(503).json({ error: 'Tenor is not configured', configured: false });
-    const qs = new URLSearchParams({
-      key,
-      client_key: 'lanparty',
-      contentfilter: 'medium', // roughly pg-13
-      media_filter: 'gif,mediumgif,tinygif,nanogif',
-      ...params,
-    }).toString();
-    try {
-      const r = await fetch(`https://tenor.googleapis.com/v2/${endpoint}?${qs}`);
-      const data = await r.json();
-      if (!r.ok) return res.status(502).json({ error: data?.error?.message || data?.error || 'Tenor error' });
-      const results = (data.results || []).map(mapTenorResult).filter(Boolean);
-      return res.json({ results, next: data.next || '' });
-    } catch (err) {
-      return res.status(502).json({ error: 'Tenor request failed' });
-    }
-  }
-
-  app.get('/tenor/featured', authMiddleware, async (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
-    const pos = (req.query.pos || '').toString();
-    return proxyTenor(res, 'featured', pos ? { limit, pos } : { limit });
-  });
-
-  app.get('/tenor/search', authMiddleware, async (req, res) => {
-    const q = (req.query.q || '').toString().trim();
-    if (!q) return res.json({ results: [], next: '' });
-    const limit = Math.min(parseInt(req.query.limit, 10) || 24, 50);
-    const pos = (req.query.pos || '').toString();
-    return proxyTenor(res, 'search', pos ? { q, limit, pos } : { q, limit });
-  });
-
   // --- Music (YouTube) — ported from DiscordMusicActivity ---
   // Search uses the YouTube Data API (key from YOUTUBE_API_KEY env or `server/youtube.key`).
   // Playback: yt-dlp resolves a signed audio-only URL (cached ~55 min) which we proxy as a

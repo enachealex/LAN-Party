@@ -190,7 +190,6 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web Push (notifications while the app is closed). All optional: with none set, a keypair is generated on first boot and kept in `DATA_DIR/vapid.json`, and the subject is `mailto:admin@<CLIENT_ORIGIN host>`. See below. |
 | `LINK_PREVIEWS` | Optional. Set to `0` to stop the server fetching the pages people link to (the preview cards under messages). On when unset. See "Link previews" below. |
 | `LINK_PREVIEW_DEBUG` | Optional. Set to anything to log why a link got no preview, or a preview no image: one line with the host name and a short reason code (`[link-preview] no preview: example.com (timeout)`). Never the rest of the URL, and nothing about who posted it. Off when unset. |
-| `TENOR_API_KEY` / `tenor.key` | GIF search |
 | `YOUTUBE_API_KEY` / `youtube.key` | Watch Together search |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI` / `spotify.key` | Spotify |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_SECURE` / `smtp.key` | Transactional email (shared Gmail SMTP). Whether this is set also decides whether new accounts must verify their email: see "Email verification" below. |
@@ -311,6 +310,30 @@ private services:
 - `DATA_DIR/link-previews/` holds at most 512 MB (past that, new cards go without an image until
   the sweep frees room). It is disposable: it does not need backing up, and deleting it only costs
   the images on existing cards.
+
+## GIF library
+
+LAN Party keeps its own GIF library; no outside GIF service is used. Files are in
+`DATA_DIR/gifs` (outside `/uploads`, so the 7-day sweep never touches them), listed in the `gifs`
+table with a name, tags and a hash so the same picture is kept once.
+
+People add GIFs from the picker (+), or by right-clicking an image in chat and choosing **Add to
+GIF library** (the file is copied out of `/uploads`). Whoever added a GIF, and the instance
+owners, can rename, retag or remove it.
+
+**Bulk import from a folder on the box.** Put the GIFs in a folder; subfolder names become tags
+(`reactions/happy/big_smile.gif` is "big smile", tagged reactions and happy). Then, from
+`/srv/apps/lan-party/server`:
+
+```
+mkdir -p /mnt/data/lan-party/gif-import            # copy files in here (scp, rsync, a share)
+DATA_DIR=/mnt/data/lan-party/data node scripts/import-gifs.js /mnt/data/lan-party/gif-import --by romokid64 --dry-run
+DATA_DIR=/mnt/data/lan-party/data node scripts/import-gifs.js /mnt/data/lan-party/gif-import --by romokid64
+```
+
+The dry run lists what would be added. The import copies (the folder is left as it was), skips
+anything already in the library, refuses files that are not really images, and is safe while the
+server runs. Run it again after adding more files.
 
 ## Scale
 

@@ -452,7 +452,7 @@ export default function HomeLeftPanel({
   const renderPendingRequestRow = (req, index) => (
     <li
       key={req.id}
-      className={`dc-pending-request-row ${pendingDragOverIndex === index ? 'drag-over' : ''}`}
+      className={`dc-pending-request-row dc-incoming-request-row ${pendingDragOverIndex === index ? 'drag-over' : ''}`}
       draggable
       onDragStart={() => setPendingDragIndex(index)}
       onDragEnd={() => { setPendingDragIndex(null); setPendingDragOverIndex(null) }}
@@ -466,26 +466,34 @@ export default function HomeLeftPanel({
     >
       <span className="dc-pending-drag-handle" aria-hidden="true" title="Drag to reorder">⋮⋮</span>
       <DmAvatar name={req.fromUsername} color={req.avatar || '#5865f2'} status="online" />
+      {/* The name has the whole first line; the answer buttons sit on the second, beside what it
+          is. Side by side with the name, worded buttons left room for one letter of it. */}
       <span className="dc-dm-meta">
-        <span className="dc-dm-name">{req.fromUsername}</span>
-        <span className="dc-dm-activity">Incoming friend request</span>
+        <span className="dc-dm-name" title={req.fromUsername}>{req.fromUsername}</span>
+        <span className="dc-pending-subline">
+          <span className="dc-dm-activity">Friend request</span>
+          <span className="dc-pending-actions">
+            <button
+              type="button"
+              className="dc-pending-icon dc-pending-icon-accept"
+              title={`Accept ${req.fromUsername}`}
+              aria-label={`Accept friend request from ${req.fromUsername}`}
+              onClick={() => onAcceptFriendRequest?.(req.id)}
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            </button>
+            <button
+              type="button"
+              className="dc-pending-icon dc-pending-icon-decline"
+              title={`Decline ${req.fromUsername}`}
+              aria-label={`Decline friend request from ${req.fromUsername}`}
+              onClick={() => onDeclineFriendRequest?.(req.id)}
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" /></svg>
+            </button>
+          </span>
+        </span>
       </span>
-      <div className="dc-pending-actions">
-        <button
-          type="button"
-          className="dc-pending-accept"
-          onClick={() => onAcceptFriendRequest?.(req.id)}
-        >
-          Accept
-        </button>
-        <button
-          type="button"
-          className="dc-pending-decline"
-          onClick={() => onDeclineFriendRequest?.(req.id)}
-        >
-          Decline
-        </button>
-      </div>
     </li>
   )
 

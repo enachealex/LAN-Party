@@ -177,14 +177,15 @@ describe('uploaded files and framing (server)', () => {
       assert.equal(res.status, 400, filename);
       assert.match(res.data.error, /GIF library/);
     }
-    // HTML claiming to be a PNG, under an .html name: stored as .png, served as one.
+    // HTML claiming to be a PNG, under an .html name: the library reads the bytes, not the label,
+    // so it is refused and nothing is kept (services/gifLibrary.js sniffImage).
+    const before = fs.readdirSync(path.join(server.dataDir, 'gifs')).length;
     const res = await call('POST', '/gifs', form('file', HTML, 'image/png', 'evil.html'), token);
-    assert.equal(res.status, 200);
-    const evil = res.data.gifs.find((g) => g.name === 'evil.html');
-    assert.match(evil.url, /^\/gifs\/\d+-[a-z0-9]+\.png$/);
-    assertInline(await served(evil.url), 'image/png', 'html-as-png');
+    assert.equal(res.status, 400);
+    assert.equal(fs.readdirSync(path.join(server.dataDir, 'gifs')).length, before, 'the upload was deleted');
     const real = await call('POST', '/gifs', form('file', GIF, 'image/gif', 'dance.gif', { name: 'Dance' }), token);
-    const dance = real.data.gifs.find((g) => g.name === 'Dance');
+    const dance = real.data.gif;
+    assert.equal(dance.name, 'Dance');
     assert.match(dance.url, /\.gif$/);
     assertInline(await served(dance.url), 'image/gif', 'gif');
     const files = fs.readdirSync(path.join(server.dataDir, 'gifs'));

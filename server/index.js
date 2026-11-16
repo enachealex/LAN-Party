@@ -14,6 +14,7 @@ const mailer = require('./email');
 const vaultline = require('./vaultline');
 const { feedbackInput, inviteInput, inviteLinkInput, pushSubscribeInput, pushUnsubscribeInput, validate } = require('./validation');
 const { migrate } = require('./db/schema');
+const gifLibrary = require('./services/gifLibrary');
 const { createActivities } = require('./services/activities');
 const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl, createAppRoomKeys, appFrameOrigin } = require('./services/hostedApps');
 const { createAppRooms } = require('./services/appRooms');
@@ -463,6 +464,11 @@ async function main() {
 
   const db = await open({ filename: path.join(DATA_DIR, 'data.sqlite'), driver: sqlite3.Database });
   await migrate(db);
+  // GIFs added before the library kept hashes get one now, so re-adding one is caught as a
+  // duplicate (services/gifLibrary.js). In the background: boot does not wait on hashing files.
+  gifLibrary.backfillHashes(db, gifsDir)
+    .then((n) => { if (n) console.log(`[gifs] hashed ${n} existing GIF${n === 1 ? '' : 's'}`); })
+    .catch((err) => console.warn('[gifs] could not hash existing GIFs:', err.message));
   // Who runs this instance (services/instanceOwners.js). Always asked with a username the server
   // established itself (a verified token), never one a client sent.
   const { instanceOwners, isInstanceOwner, isReservedName: isReservedOwnerName, isListedName: isListedOwnerName, configProblems: instanceOwnerProblems } = createInstanceOwners({ db });
@@ -1453,9 +1459,9 @@ async function main() {
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins, requireVerified, permissions, moderation });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins, requireVerified, permissions, moderation, uploadDir });
 
-  // Tenor / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
+  // YouTube+yt-dlp / playlists / Spotify (routes/media.js).
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins });
 
   // Presence / friends / direct messages (routes/social.js).

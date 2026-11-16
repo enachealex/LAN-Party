@@ -595,6 +595,20 @@ const MIGRATIONS = [
       )`);
     },
   },
+  {
+    // The GIF library becomes searchable and keeps each picture once (services/gifLibrary.js).
+    //
+    // gifs.tags    lowercase words, space-separated; '' for every GIF already there.
+    // gifs.sha256  of the file's bytes. NULL for every GIF already there: the server fills it in
+    //              at boot from the file (backfillHashes), since a migration does not know where
+    //              the files live.
+    name: '0018_gif_library_search',
+    up: async (db) => {
+      await addColumn(db, 'gifs', 'tags', "TEXT NOT NULL DEFAULT ''");
+      await addColumn(db, 'gifs', 'sha256', 'TEXT');
+      await db.exec('CREATE INDEX IF NOT EXISTS idx_gifs_sha256 ON gifs(sha256)');
+    },
+  },
 ];
 
 /**

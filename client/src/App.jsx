@@ -665,7 +665,7 @@ function pinPreview(m) {
   return m.text || '(empty message)'
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null, showPreviews = true, onRemovePreview, isBlockedAuthor = null }) {
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onSaveGif, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null, showPreviews = true, onRemovePreview, isBlockedAuthor = null }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
   const [reactionPickerPos, setReactionPickerPos] = useState(null) // { left, top } for the full-library picker
@@ -709,6 +709,9 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
   const collabImage = (message.attachment && isImageAttachment(message.attachment) && !isGifAttachment(message.attachment)) ? message.attachment
     : (textMedia && isImageAttachment(textMedia) && !isGifAttachment(textMedia)) ? textMedia : null
   const handleCollab = () => { if (collabImage) onCollab?.(attachmentUrl(collabImage)); setMenuOpen(false) }
+  // An image posted here (a file this server stored, not a link) can be kept in the GIF library.
+  const savableImage = (message.attachment && isImageAttachment(message.attachment) && String(message.attachment.url || '').startsWith('/uploads/')) ? message.attachment : null
+  const handleSaveGif = () => { if (savableImage) onSaveGif?.(savableImage); setMenuOpen(false) }
   const startEdit = () => {
     setEditText(message.text || '')
     setEditing(true)
@@ -863,6 +866,7 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
             {onReply && <button type="button" role="menuitem" onClick={() => { onReply(message); setMenuOpen(false) }}>Reply</button>}
             {canEdit && <button type="button" role="menuitem" onClick={startEdit}>Edit</button>}
             {collabImage && onCollab && <button type="button" role="menuitem" onClick={handleCollab}>Edit together</button>}
+            {savableImage && onSaveGif && <button type="button" role="menuitem" onClick={handleSaveGif}>Add to GIF library</button>}
             {onForward && <button type="button" role="menuitem" onClick={() => { onForward(message); setMenuOpen(false) }}>Forward</button>}
             <button type="button" role="menuitem" onClick={copyMessage}>Copy</button>
             {(onPin || onUnpin) && (
@@ -1596,7 +1600,6 @@ export default function App() {
   const [emojiSkinTones, setEmojiSkinTones] = useState({}) // { '👍': 'dark', ... }
   const [serverEmojis, setServerEmojis] = useState({}) // { [serverId]: [{ name, url }] }
   // Shared GIF library (surfaced as a tab inside the emoji board): list of [{ id, name, url, type }].
-  const [gifLibrary, setGifLibrary] = useState([])
   // Soundboard: open state, shared clip library, playback volume, and currently-playing pad ids.
   const [showSoundboard, setShowSoundboard] = useState(false)
   const [soundLibrary, setSoundLibrary] = useState([])
@@ -7721,45 +7724,73 @@ export default function App() {
     }
   }
 
-  // ---- Shared GIF library ----
-  const loadGifs = async () => {
-    const t = token || localStorage.getItem('lanparty_token')
-    if (!t) return
-    try {
-      const res = await fetch(`${SERVER_URL}/gifs`, { headers: { Authorization: `Bearer ${t}` } })
-      if (res.ok) { const data = await res.json(); setGifLibrary(data.gifs || []) }
-    } catch (err) {
-      console.warn('loadGifs failed', err)
-    }
+  // ---- GIF library (LAN Party's own: server/services/gifLibrary.js) ----
+  // One page of the library, newest first, matching every word of `q` against names and tags.
+  const searchGifs = async (q, before) => {
+    const params = new URLSearchParams({ limit: '60' })
+    if (q) params.set('q', q)
+    if (before != null) params.set('before', String(before))
+    const res = await authedFetch(`/gifs?${params}`)
+    if (!res.ok) return { gifs: [], next: null }
+    const data = await res.json()
+    return { gifs: data.gifs || [], next: data.next ?? null }
   }
 
-  const uploadGif = async (file, name) => {
-    const t = token || localStorage.getItem('lanparty_token')
-    if (!t || !file) return
-    if (file.size > MAX_FILE_SIZE) { setUploadError('File is larger than 100 MB.'); return }
+  // Tags are asked for before the upload; cancelling the question cancels the upload. The name is
+  // the file's, and can be changed afterwards (right-click > Edit name and tags).
+  const uploadGif = async (file) => {
+    if (!file) return null
+    if (file.size > MAX_FILE_SIZE) { showError('File is larger than 100 MB.'); return null }
+    const name = (file.name || 'GIF').replace(/\.[^.]+$/, '').replace(/[_.]+/g, ' ').trim()
+    const tags = await askPrompt({ title: `Add “${name}” to the GIF library`, label: 'Tags, to find it by (optional)', placeholder: 'e.g. happy, dance, reaction', submitLabel: 'Add GIF' })
+    if (tags == null) return null
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('name', name)
+    formData.append('tags', tags)
     try {
-      const formData = new FormData()
-      formData.append('file', file)
-      if (name) formData.append('name', name)
+      // Not authedFetch: it sends a JSON Content-Type, and multipart needs the browser's own.
+      const t = token || localStorage.getItem('lanparty_token')
       const res = await fetch(`${SERVER_URL}/gifs`, { method: 'POST', headers: { Authorization: `Bearer ${t}` }, body: formData })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || 'Failed to add GIF')
-      setGifLibrary(data.gifs || [])
+      setToast(data.duplicate ? `That GIF is already in the library, as “${data.gif.name}”` : `Added “${data.gif.name}” to the GIF library`)
+      return data.gif
     } catch (err) {
-      setUploadError(err.message)
+      showError(err.message)
+      return null
     }
   }
 
-  const deleteGif = async (id) => {
-    const t = token || localStorage.getItem('lanparty_token')
-    if (!t || !id) return
-    try {
-      const res = await fetch(`${SERVER_URL}/gifs/${encodeURIComponent(id)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${t}` } })
-      const data = await res.json()
-      if (res.ok) setGifLibrary(data.gifs || [])
-    } catch (err) {
-      console.warn('deleteGif failed', err)
-    }
+  const editGif = async (gif) => {
+    if (!gif?.id) return null
+    const name = await askPrompt({ title: 'Rename GIF', label: 'Name', initial: gif.name || '', submitLabel: 'Next' })
+    if (name == null) return null
+    const tags = await askPrompt({ title: `Tags for “${name.trim() || gif.name}”`, label: 'Tags, to find it by', initial: (gif.tags || []).join(' '), placeholder: 'e.g. happy, dance, reaction', submitLabel: 'Save' })
+    if (tags == null) return null
+    const res = await authedFetch(`/gifs/${encodeURIComponent(gif.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, tags }) })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showError(data.error || 'Could not change that GIF'); return null }
+    return data.gif
+  }
+
+  const deleteGif = async (gif) => {
+    if (!gif?.id) return false
+    const ok = await askConfirm({ title: `Remove “${gif.name || 'GIF'}”?`, message: 'It is removed from the GIF library for everyone. Messages it was already sent in keep showing it until its file is gone.', submitLabel: 'Remove' })
+    if (!ok) return false
+    const res = await authedFetch(`/gifs/${encodeURIComponent(gif.id)}`, { method: 'DELETE' })
+    if (!res.ok) { showError((await res.json().catch(() => ({}))).error || 'Could not remove that GIF'); return false }
+    return true
+  }
+
+  // Keep an image someone posted: the server copies it into the library, out of reach of the
+  // 7-day upload sweep.
+  const saveGifFromChat = async (attachment) => {
+    if (!attachment?.url) return
+    const res = await authedFetch('/gifs/from-upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: attachment.url, name: (attachment.name || '').replace(/\.[^.]+$/, '') }) })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showError(data.error || 'Could not add that to the GIF library'); return }
+    setToast(data.duplicate ? `Already in the GIF library, as “${data.gif.name}”` : `Added “${data.gif.name}” to the GIF library`)
   }
 
   // Stage a picked GIF as the next block in the composer stack. Whatever is currently typed is
@@ -7842,41 +7873,6 @@ export default function App() {
       return
     }
     if (socket) socket.emit('message', { serverId: currentServerId(), channelId: activeChannel, text: body, attachment })
-  }
-
-  // Is Tenor configured on the server (has an API key)?
-  const tenorStatus = async () => {
-    const t = token || localStorage.getItem('lanparty_token')
-    if (!t) return false
-    try {
-      const res = await fetch(`${SERVER_URL}/tenor/status`, { headers: { Authorization: `Bearer ${t}` } })
-      if (!res.ok) return false
-      const data = await res.json()
-      return !!data.configured
-    } catch {
-      return false
-    }
-  }
-
-  // Fetch a page of Tenor results (featured/trending when query is empty) via our server proxy.
-  // Tenor paginates with an opaque `pos` cursor, echoed back as `next` for infinite scroll.
-  // Returns { results: [{ id, url, preview, description }], next }.
-  const fetchTenor = async (query, pos = '') => {
-    const empty = { results: [], next: '' }
-    const t = token || localStorage.getItem('lanparty_token')
-    if (!t) return empty
-    const q = (query || '').trim()
-    const params = new URLSearchParams(pos ? { pos } : {})
-    if (q) params.set('q', q)
-    const path = `${q ? '/tenor/search' : '/tenor/featured'}${params.toString() ? `?${params}` : ''}`
-    try {
-      const res = await fetch(`${SERVER_URL}${path}`, { headers: { Authorization: `Bearer ${t}` } })
-      if (!res.ok) return empty
-      const data = await res.json()
-      return { results: data.results || [], next: data.next || '' }
-    } catch {
-      return empty
-    }
   }
 
   // ---- Shared soundboard ----
@@ -8279,12 +8275,11 @@ export default function App() {
         )}
         {showGifPicker && (
           <GifPicker
-            gifs={gifLibrary}
             resolveSrc={emojiSrc}
             onSelectGif={stageGif}
-            onFetchTenor={fetchTenor}
-            onTenorStatus={tenorStatus}
+            onSearchGifs={searchGifs}
             onUploadGif={uploadGif}
+            onEditGif={editGif}
             onDeleteGif={deleteGif}
             onClose={() => setShowGifPicker(false)}
           />
@@ -8333,7 +8328,7 @@ export default function App() {
           <button type="button" className="attach" onClick={() => fileInputRef.current?.click()} title="Attach file" aria-label="Attach file">
             <PaperclipIcon />
           </button>
-          <button type="button" className="attach gif-toggle" onClick={() => { setShowEmojiPicker(false); setShowGifPicker((open) => { if (!open) loadGifs(); return !open }) }} title="GIF" aria-label="GIF" aria-expanded={showGifPicker}>
+          <button type="button" className="attach gif-toggle" onClick={() => { setShowEmojiPicker(false); setShowGifPicker((open) => !open) }} title="GIF" aria-label="GIF" aria-expanded={showGifPicker}>
             <span className="gif-toggle-label">GIF</span>
           </button>
           <button type="button" className="attach emoji-toggle" onClick={() => { setShowGifPicker(false); setShowEmojiPicker((open) => { if (!open) loadServerEmojis(currentServerId()); return !open }) }} title="Emoji" aria-label="Emoji" aria-expanded={showEmojiPicker}>
@@ -8662,6 +8657,7 @@ export default function App() {
                         onEdit={editHomeMessage}
                         onDelete={deleteHomeMessage}
                         onCollab={startCollab}
+                        onSaveGif={saveGifFromChat}
                         activeReactionMessageId={activeReactionMessageId}
                         setActiveReactionMessageId={setActiveReactionMessageId}
                         quickReactions={quickReactions}
@@ -8760,6 +8756,7 @@ export default function App() {
                         onEdit={editChannelMessage}
                         onDelete={deleteChannelMessage}
                         onCollab={startCollab}
+                        onSaveGif={saveGifFromChat}
                         activeReactionMessageId={activeReactionMessageId}
                         setActiveReactionMessageId={setActiveReactionMessageId}
                         quickReactions={quickReactions}

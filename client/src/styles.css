@@ -239,6 +239,17 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 .dc-outgoing-request-row{cursor:default}
 .dc-pending-request-row .dc-dm-meta{flex:1;min-width:0}
 .dc-pending-actions{display:flex;gap:6px;flex-shrink:0}
+/* An incoming request is answered with two round icons (✓ accept, ✕ decline), not worded buttons:
+   the worded pair took the sidebar's width and left room for one letter of the name. */
+.dc-pending-icon{width:24px;height:24px;border-radius:50%;border:none;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0;flex-shrink:0;transition:background .12s,color .12s}
+.dc-pending-icon-accept{background:rgba(35,165,89,.16);color:#23a559}
+.dc-pending-icon-accept:hover{background:#23a559;color:#fff}
+.dc-pending-icon-decline{background:rgba(242,63,67,.14);color:#f23f43}
+.dc-pending-icon-decline:hover{background:#f23f43;color:#fff}
+.dc-pending-icon:focus-visible{outline:2px solid #5865f2;outline-offset:2px}
+.dc-pending-subline{display:flex;align-items:center;gap:6px;min-width:0;margin-top:2px}
+.dc-pending-subline .dc-dm-activity{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dc-pending-subline .dc-pending-actions{gap:6px}
 .dc-pending-accept,.dc-pending-decline{padding:4px 10px;border-radius:4px;border:none;font-size:12px;font-weight:600;cursor:pointer}
 .dc-pending-accept{background:#23a559;color:#fff}
 .dc-pending-accept:hover{background:#1a8f4a}
@@ -632,15 +643,8 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 .gif-cell{position:relative;width:100%;aspect-ratio:1;border:1px solid rgba(255,255,255,.08);background:#000;border-radius:8px;overflow:hidden;cursor:pointer;padding:0}
 .gif-cell:hover{outline:2px solid var(--accent-end)}
 .gif-cell img{width:100%;height:100%;object-fit:cover;display:block}
-.gif-sections{display:flex;gap:6px;margin:2px 0 8px}
-.gif-section-tab{flex:1;padding:6px 10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--muted);border-radius:8px;font-size:12px;font-weight:700;cursor:pointer}
-.gif-section-tab:hover{background:rgba(255,255,255,.08);color:var(--text)}
-.gif-section-tab.active{background:var(--accent-end);border-color:var(--accent-end);color:#021022}
 .gif-custom-head{display:flex;align-items:center;gap:8px;margin:6px 0 8px}
 .gif-custom-head .gif-search{flex:1;width:auto;margin:0}
-.giphy-grid-wrap{margin-top:2px}
-.gif-name-tooltip{position:absolute;transform:translateX(-50%);max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:#13202c;border:1px solid rgba(255,255,255,.14);border-radius:7px;padding:4px 8px;font-size:11px;color:var(--text);box-shadow:0 6px 18px rgba(0,0,0,.45);pointer-events:none;z-index:5}
-.giphy-attribution{font-size:10px;color:var(--muted);text-align:center;padding:6px 0 2px;letter-spacing:.5px;text-transform:uppercase}
 .sb-name-count{font-weight:600;color:var(--muted);font-size:11px;margin-left:6px}
 
 /* Soundboard */

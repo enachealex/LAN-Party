@@ -17,7 +17,7 @@ Trusted Web Activity APK for Android.
   A private channel can list roles as well as members, and losing the role closes it at once.
   Channels can be grouped under collapsible categories and reordered; a category is only a
   heading and never changes who can open a channel.
-- **Chat**: file uploads (deleted after 7 days), GIFs (Tenor plus your own library), custom emojis,
+- **Chat**: file uploads (deleted after 7 days), GIFs (your own library on the server: search by name and tag, save from chat, bulk import), custom emojis,
   reactions with customizable quick reactions, quoted replies, pins, and edits and deletes that are
   saved and shown to everyone.
 - **Link previews**: a message with a link gets a small card (site, title, description, image). The
@@ -69,8 +69,7 @@ cd client && npm install && npm run dev
 ```
 
 Register an account at http://localhost:5173 and you're in. Optional integrations read a key file
-next to the server or an env var: `server/tenor.key` (`TENOR_API_KEY`) for GIF search,
-`youtube.key`, `spotify.key`, `smtp.key`, `vaultline.key`. See [DEPLOY.md](DEPLOY.md).
+next to the server or an env var: `server/youtube.key`, `spotify.key`, `smtp.key`, `vaultline.key`. See [DEPLOY.md](DEPLOY.md).
 
 The first account registered is the instance owner: uploaded apps start as drafts, and the
 instance owner publishes them to everyone. Set `INSTANCE_OWNERS` (comma-separated usernames of
