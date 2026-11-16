@@ -100,7 +100,7 @@ function sendVerifyEmail(username, to, token) {
   const link = `${APP_URL}/app/?verify=${encodeURIComponent(token)}`;
   return send(to, `Confirm your email for ${APP_NAME}`, wrap(`
     <h1 style="margin:0 0 12px;color:#f0a070;font-size:22px;">Confirm your email</h1>
-    <p style="line-height:1.6;margin:0 0 16px;">Hi ${esc(username)}, confirm this address to finish setting up your ${APP_NAME} account. Until then you can look around, but not post, message, call or upload. This link expires in 24 hours.</p>
+    <p style="line-height:1.6;margin:0 0 16px;">Hi ${esc(username)}, confirm this address to finish setting up your ${APP_NAME} account. You can sign in once it is confirmed. This link expires in 24 hours.</p>
     <p style="margin:0 0 20px;">${btn(link, 'Confirm email')}</p>
     <p style="color:#9a8078;font-size:13px;margin:0;">If you didn't create this account, you can ignore this email.</p>`));
 }

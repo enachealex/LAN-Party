@@ -118,7 +118,7 @@ describe('email verification: an instance that can send email', () => {
     assert.match(server.log(), /\[email\] new accounts must verify their email address/);
   });
 
-  test('registering emails a link, signs nobody in, and leaves the account unverified but able to sign in and look around', async () => {
+  test('registering emails a link, signs nobody in, and refuses sign-in until the link is opened (a session from before that rule can still look around)', async () => {
     const newbie = await account(server, 'newbie');
     assert.deepEqual(newbie.registered, { success: true, verificationSent: true });
     assert.equal(await verifiedFlag(server, 'newbie'), 0);
