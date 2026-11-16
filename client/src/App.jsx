@@ -53,7 +53,7 @@ import BlockedPeopleSection from './components/BlockedPeopleSection'
 import { TimeoutNotice, BlockedNotice } from './components/ComposerNotice'
 import TwoFactorLogin from './components/TwoFactorLogin'
 import SecuritySettings from './components/SecuritySettings'
-import { VerifyEmailBanner, UnverifiedNotice, VerifyLinkDialog, resendVerification, confirmEmailToken, EMAIL_UNVERIFIED, VERIFY_FIRST } from './components/EmailVerification'
+import { VerifyEmailBanner, UnverifiedNotice, VerifyLinkDialog, VerifyBeforeSignIn, resendVerification, changeUnverifiedEmail, confirmEmailToken, EMAIL_UNVERIFIED, VERIFY_FIRST } from './components/EmailVerification'
 import { useExpiry, formatMoment, formatDuration as formatMinutes } from './moderation'
 import { syncPush, stopPush, pushSupported, pushCovers, windowFocused, useNotificationTarget } from './push'
 import { badgeTotals, channelLevel, isDmMuted, isGroupMuted, unmutedGroupUnread } from './notificationLevels'
@@ -1259,6 +1259,9 @@ export default function App() {
   // public server, direct messages, friend requests, invites, uploads and calls; this only decides
   // what to show. The ref is for socket handlers, which are bound once.
   const [emailVerified, setEmailVerified] = useState(true)
+  // A sign-in refused because the account has not opened its verification link: who, the password
+  // they typed (kept only in memory, for Resend / Wrong address? on that panel) and the address.
+  const [unverifiedSignIn, setUnverifiedSignIn] = useState(null)
   const emailVerifiedRef = useRef(true)
   useEffect(() => { emailVerifiedRef.current = emailVerified }, [emailVerified])
   const [verifyBannerDismissed, setVerifyBannerDismissed] = useState(false) // for this session only
@@ -4068,6 +4071,8 @@ export default function App() {
       setEmailVerified(true)
       setToast('Email verified. Everything is unlocked.')
     })
+    // The unverified address was corrected in another window.
+    s.on('account:email-changed', ({ email } = {}) => { if (typeof email === 'string') setUserEmail(email) })
     s.on('call:handled', () => onCallHandledElsewhere())
     s.on('call:signal', ({ from, signal }) => handleCallSignal(from, signal))
     s.on('voice:peer-left', ({ id }) => { forgetPeer(id); playUiSound('peerLeave'); setPeerNames((prev) => { const c = { ...prev }; delete c[id]; return c }); setScreenSharingPeers((prev) => { const c = { ...prev }; delete c[id]; return c }) })
@@ -4158,6 +4163,11 @@ export default function App() {
         body: JSON.stringify({ username: loginUsername, password: loginPassword, remember: rememberMe })
       })
       const data = await res.json()
+      // Right password, but the email is not verified yet: no session. Show what to do instead.
+      if (res.status === 403 && data.code === EMAIL_UNVERIFIED) {
+        setUnverifiedSignIn({ username: loginUsername, password: loginPassword, email: data.email || '' })
+        return
+      }
       if (!res.ok) throw new Error(data.error || 'Login failed')
       // Two-step sign-in is on for this account: the password got a ticket, not a session. Show
       // the code step; finishSignIn runs when that returns the real sign-in response.
@@ -4177,6 +4187,7 @@ export default function App() {
   const finishSignIn = async (data) => {
     try {
       setTwoFactorChallenge(null)
+      setUnverifiedSignIn(null)
       setAuthError(null)
       // success: store token and user
       setIsAuthenticated(true)
@@ -4237,6 +4248,15 @@ export default function App() {
     if (alreadyVerified) setEmailVerified(true)
     return message
   }
+  // A signed-in session correcting a mistyped, unverified address (Settings > Security).
+  const changeVerificationEmail = async (nextEmail, password) => {
+    const t = token || localStorage.getItem('lanparty_token')
+    if (!t) return { email: null, message: 'Sign in first.' }
+    const result = await changeUnverifiedEmail(SERVER_URL, t, nextEmail, password)
+    if (result.email) setUserEmail(result.email)
+    if (result.alreadyVerified) setEmailVerified(true)
+    return result
+  }
   // Ask the server again whether this account is verified (after a link was opened in this browser).
   const refreshEmailVerified = async () => {
     const t = token || localStorage.getItem('lanparty_token')
@@ -4283,8 +4303,9 @@ export default function App() {
       // On success, switch to login and prefill
       setAuthMode('login')
       clearRegisterForm()
+      // Named, so a typo in it is noticed now rather than after waiting for an email that never comes.
       setAuthError(data.verificationSent
-        ? 'Account created. We emailed you a link to verify your address. You can log in now and look around.'
+        ? `Account created. We emailed a link to ${regEmail.trim()}. Open it to confirm your address, then log in.`
         : 'Account created. Please log in.')
     } catch (err) {
       setAuthError(err instanceof TypeError ? "Couldn't reach the server. Please try again." : (err.message || 'Register failed'))
@@ -9177,7 +9198,7 @@ export default function App() {
       {toast && <div className="app-toast" role="status">{toast}</div>}
       {/* An account that has not opened its verification link yet. Dismissed for this session only. */}
       {isAuthenticated && !emailVerified && !verifyBannerDismissed && (
-        <VerifyEmailBanner email={userEmail} onResend={resendVerificationEmail} onDismiss={() => setVerifyBannerDismissed(true)} />
+        <VerifyEmailBanner email={userEmail} onResend={resendVerificationEmail} onFixAddress={() => { openSettings(); setSettingsTab('security') }} onDismiss={() => setVerifyBannerDismissed(true)} />
       )}
       {/* Opened from an emailed verification link (works signed in or out). */}
       {verifyLink && <VerifyLinkDialog result={verifyLink} signedIn={isAuthenticated} onClose={() => setVerifyLink(null)} />}
@@ -9722,7 +9743,7 @@ export default function App() {
             <InviteJoinNotice invite={inviteJoin.state} onDismiss={inviteJoin.dismiss} onRetry={inviteJoin.retry} resolveSrc={emojiSrc} />
             <div className="auth-tabs">
               <button className={authMode==='login' ? 'active' : ''} onClick={() => setAuthMode('login')}>Log in</button>
-              <button className={authMode==='register' ? 'active' : ''} onClick={() => { setAuthMode('register'); clearRegisterForm(); }}>Register Account</button>
+              <button className={authMode==='register' ? 'active' : ''} onClick={() => { setAuthMode('register'); setUnverifiedSignIn(null); clearRegisterForm(); }}>Register Account</button>
             </div>
 
             {authMode === 'login' && twoFactorChallenge && (
@@ -9733,7 +9754,15 @@ export default function App() {
                 onCancel={(message) => { setTwoFactorChallenge(null); setAuthError(message || null) }}
               />
             )}
-            {authMode === 'login' && !twoFactorChallenge && (
+            {authMode === 'login' && !twoFactorChallenge && unverifiedSignIn && (
+              <VerifyBeforeSignIn
+                serverUrl={SERVER_URL}
+                signIn={unverifiedSignIn}
+                onEmailChanged={(email) => setUnverifiedSignIn((prev) => (prev ? { ...prev, email } : prev))}
+                onBack={() => { setUnverifiedSignIn(null); setAuthError(null) }}
+              />
+            )}
+            {authMode === 'login' && !twoFactorChallenge && !unverifiedSignIn && (
               <form onSubmit={handleLogin} className="auth-form">
                 {authError && <div className="auth-error">{authError}</div>}
                 <label>Username</label>
@@ -10726,6 +10755,7 @@ export default function App() {
               email={userEmail}
               emailVerified={emailVerified}
               onResendVerification={resendVerificationEmail}
+              onChangeEmail={changeVerificationEmail}
               instanceOwner={instanceOwner}
               askConfirm={askConfirm}
             />

@@ -6,6 +6,10 @@
 // Exactly one function in this file signs one (issueSession, below) and it is reached two ways:
 //   POST /auth/login       password correct AND the account has no two-factor. With two-factor on,
 //                          this route answers { twoFactorRequired, ticket } and no session.
+//                          While the instance can send email, an account that has not opened its
+//                          verification link gets neither: 403 { code: 'email-unverified', email }
+//                          (services/emailVerification.js; the sign-in form can resend the link or
+//                          correct the address with the same username and password).
 //   POST /auth/login/2fa   a ticket from the step above plus a current code or a recovery code.
 // Nothing else here signs in: registering, resetting a password and confirming an email address
 // all answer { success } and send the person to the sign-in form, so a reset link in a stolen
@@ -17,6 +21,7 @@ const { rateLimit } = require('../rateLimit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const mailer = require('../email');
+const { REFUSAL_CODE } = require('../services/emailVerification');
 
 /** @param {{ app: any, db: any, authMiddleware: any, twoFactor: ReturnType<typeof import('../services/twoFactor').createTwoFactor>, emailVerification: ReturnType<typeof import('../services/emailVerification').createEmailVerification>, JWT_SECRET: string, isStrongPassword: (pw: string) => boolean, isInstanceOwner: (username: string) => Promise<boolean>, isReservedOwnerName: (name: unknown) => boolean, appRooms: { rotate: (serverId: string) => Promise<number | null> }, endAppActivitiesInServer: (serverId: string, reason?: string | null) => void }} deps */
 function registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerification, JWT_SECRET, isStrongPassword, isInstanceOwner, isReservedOwnerName, appRooms, endAppActivitiesInServer }) {
@@ -77,6 +82,10 @@ function registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerificat
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    // Not verified yet: no session, and no second step either. The password was right, so the
+    // answer names the address the link went to (a typo there is the usual reason it never came)
+    // and the sign-in form offers to resend it or correct the address, with the same password.
+    if (!emailVerification.rowIsVerified(user)) return res.status(403).json(unverifiedRefusal(user));
     // Two-factor on: the password is only half. Hand back a ticket for the second step and NO
     // session. The ticket is useless anywhere else (services/twoFactor.js).
     if (await twoFactor.isEnabled(user.id)) {
@@ -111,6 +120,7 @@ function registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerificat
       }
       const user = await db.get('SELECT * FROM users WHERE id = ?', result.userId);
       if (!user) return res.status(401).json(FAILED_SECOND_STEP);
+      if (!emailVerification.rowIsVerified(user)) return res.status(403).json(unverifiedRefusal(user));
       const body = await issueSession(user, result.remember);
       // A recovery code is gone once used; say how many are left so the client can nudge.
       if (result.method === 'recovery') body.recoveryCodesRemaining = (await twoFactor.statusOf(user.id)).recoveryCodesRemaining;
@@ -135,10 +145,20 @@ function registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerificat
     };
   }
 
+  /** The sign-in answer for a right password on an account whose email is not verified yet. */
+  const unverifiedRefusal = (/** @type {any} */ user) => ({
+    error: 'Confirm your email before signing in: open the link we emailed you.',
+    code: REFUSAL_CODE,
+    email: user.email || '',
+  });
+
   // THE place a sign-in becomes a session. Callers have already checked the password and, when the
   // account has it, the second factor.
   /** @param {any} user a users row @param {boolean} remember @returns {Promise<Record<string, any>>} */
   async function issueSession(user, remember) {
+    // An account that has not verified its address never gets one: the login route answers with
+    // unverifiedRefusal before the second step, and this is the backstop for any other caller.
+    if (!emailVerification.rowIsVerified(user)) throw new Error('issueSession: email not verified');
     const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: remember ? '90d' : '7d' });
     return { success: true, token, user: await describeUser(user) };
   }
@@ -175,7 +195,9 @@ function registerAuthRoutes({ app, db, authMiddleware, twoFactor, emailVerificat
     if (!row || row.purpose !== 'reset' || row.expires_at < Date.now()) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
     const user = await db.get('SELECT id, email FROM users WHERE id = ?', row.user_id);
     if (!user || user.email !== email) return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
-    await db.run('UPDATE users SET password_hash = ? WHERE id = ?', await bcrypt.hash(password, 10), user.id);
+    // The reset link was opened from the account's mailbox, which proves the address as well as
+    // the verification link would: an account that never opened that one is verified now too.
+    await db.run('UPDATE users SET password_hash = ?, email_verified = 1 WHERE id = ?', await bcrypt.hash(password, 10), user.id);
     await db.run('DELETE FROM auth_tokens WHERE token = ?', token);
     // Deliberately no session and no change to two-factor: the new password is the first step
     // only, and an account with two-factor on still needs its code to sign in. Someone who has

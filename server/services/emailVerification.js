@@ -88,6 +88,26 @@ function createEmailVerification({ db, mailer, now = Date.now }) {
   }
 
   /**
+   * Correct the address of an account that has not verified it yet (a typo at sign-up would
+   * otherwise leave it stuck: every resend goes to the same wrong address), then email a fresh
+   * link to the new one. A verified address is not changed here.
+   *
+   * Links already mailed to the old address stop working: the verification link (sendLink
+   * replaces it) and any password-reset or deactivation link, which went to an address that was
+   * never shown to be theirs.
+   * @param {{ id: number, username: string }} user
+   * @param {string} email the new address, already checked for shape and for being free
+   * @returns {Promise<{ ok: true, sent: boolean } | { ok: false }>} not ok when the account is verified (or gone)
+   */
+  async function changeAddress(user, email) {
+    const changed = await db.run('UPDATE users SET email = ? WHERE id = ? AND email_verified = 0', email, user.id);
+    if (!changed || changed.changes !== 1) return { ok: false };
+    await db.run("DELETE FROM auth_tokens WHERE user_id = ? AND purpose IN ('reset', 'deactivate')", user.id);
+    const sent = await sendLink({ id: user.id, username: user.username, email });
+    return { ok: true, sent };
+  }
+
+  /**
    * Spend an emailed token. Marks the account verified; it does not sign anyone in.
    * @param {unknown} token
    * @returns {Promise<{ ok: true, username: string } | { ok: false }>}
@@ -105,7 +125,7 @@ function createEmailVerification({ db, mailer, now = Date.now }) {
     return { ok: true, username: user.username };
   }
 
-  return { required, initialFlag, rowIsVerified, isVerified, refusalFor, requireVerified, sendLink, confirm };
+  return { required, initialFlag, rowIsVerified, isVerified, refusalFor, requireVerified, sendLink, changeAddress, confirm };
 }
 
 module.exports = { createEmailVerification, TOKEN_PURPOSE, TOKEN_TTL_MS, REFUSAL_CODE, REFUSAL_MESSAGE };

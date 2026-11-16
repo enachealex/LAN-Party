@@ -9,7 +9,11 @@
 //                                                    recovery codes. Written to the server log.
 //   verification   POST /auth/verify-email           the token from the emailed link (no session
 //                                                    needed, none given)
-//                  POST /auth/verify-email/resend    signed in: send the link again
+//                  POST /auth/verify-email/resend    send the link again
+//                  POST /auth/verify-email/change    unverified, password: correct a mistyped
+//                                                    address and send the link there
+//                  Both take a session OR { username, password } (the sign-in form: an
+//                  unverified account gets no session, see auth.js).
 //
 // The second step of signing in itself is POST /auth/login/2fa, next to /auth/login in auth.js.
 // Storage, encryption and the limits on wrong codes are services/twoFactor.js; who counts as
@@ -135,11 +139,30 @@ function registerSecurityRoutes({ app, db, io, authMiddleware, twoFactor, emailV
     return res.json({ success: true });
   });
 
+  // Resend and correct-the-address are used from two places: signed in (a session from before
+  // sign-in required a verified address) and from the sign-in form, where an unverified account
+  // gets no session (auth.js) and proves itself with the username and password instead. Either
+  // way req.user is the account, read from the session or from the checked password.
+  const sessionOrPassword = async (/** @type {any} */ req, /** @type {any} */ res, /** @type {Function} */ next) => {
+    if (req.headers.authorization) return authMiddleware(req, res, next);
+    const { username, password } = req.body || {};
+    if (typeof username !== 'string' || !username || typeof password !== 'string' || !password) return res.status(401).json({ error: 'Sign in first' });
+    try {
+      const row = await db.get('SELECT username, password_hash FROM users WHERE username = ?', username);
+      if (!row || !(await bcrypt.compare(password, row.password_hash || ''))) return res.status(401).json({ error: 'Invalid credentials' });
+      req.user = { username: row.username };
+      return next();
+    } catch (err) {
+      console.error('verify-email sign-in check failed', err && /** @type {any} */ (err).message);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  };
+
   // Send the link again. Three an hour per account and ten per address: enough for a mistyped
   // spam filter, not enough to use the server as a way of mailing someone repeatedly.
   app.post('/auth/verify-email/resend',
     rateLimit({ id: 'verify-resend', windowMs: 60 * 60_000, max: 10, message: 'Too many emails requested — try again later.' }),
-    authMiddleware,
+    sessionOrPassword,
     async (req, res, next) => {
       // Nothing to send to an account that is already verified, and that must not use up its quota.
       const user = await me(req);
@@ -153,6 +176,34 @@ function registerSecurityRoutes({ app, db, io, authMiddleware, twoFactor, emailV
       const sent = await emailVerification.sendLink(req.account);
       if (!sent) return res.status(502).json({ error: 'The email could not be sent. Try again in a little while.' });
       return res.json({ success: true, sent: true });
+    });
+
+  // A typo at sign-up: put the right address on an account that has not verified one yet, and send
+  // the link there. Asks for the password, like the two-factor routes: a session left open must not
+  // be enough to point the account's emails (and so its password resets) somewhere else. Once an
+  // address is verified it is not changed here.
+  app.post('/auth/verify-email/change',
+    rateLimit({ id: 'verify-change', windowMs: 60 * 60_000, max: 10, message: 'Too many attempts — try again later.' }),
+    sessionOrPassword,
+    rateLimit({ id: 'verify-change-account', windowMs: 60 * 60_000, max: 5, message: 'Too many attempts — try again later.', keyOf: byAccount }),
+    async (req, res) => {
+      const user = await me(req);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+      if (emailVerification.rowIsVerified(user)) return res.status(409).json({ error: 'Your email is already verified.', alreadyVerified: true });
+      const { password } = req.body || {};
+      const email = typeof (req.body || {}).email === 'string' ? req.body.email.trim() : '';
+      if (typeof password !== 'string' || !password || !email) return res.status(400).json({ error: 'Enter the new address and your password' });
+      if (email.length > 254 || !/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Invalid email address', field: 'email' });
+      if (!(await bcrypt.compare(password, user.password_hash || ''))) return res.status(403).json({ error: 'That password is not right.', code: 'wrong-password' });
+      if (email === user.email) return res.status(400).json({ error: 'That is the address you already have. Use Resend to get the link again.', field: 'email' });
+      const taken = await db.get('SELECT id FROM users WHERE email = ? AND id != ?', email, user.id);
+      if (taken) return res.status(409).json({ error: 'Email already exists', field: 'email' });
+      const result = await emailVerification.changeAddress(user, email);
+      if (!result.ok) return res.status(409).json({ error: 'Your email is already verified.', alreadyVerified: true });
+      console.log(`[email] ${user.username} corrected their unverified address`);
+      // The account's other open windows show the new address without a reload.
+      io.to(`user:${user.username}`).emit('account:email-changed', { email });
+      return res.json({ success: true, email, sent: result.sent });
     });
 }
 

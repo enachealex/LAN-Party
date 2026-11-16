@@ -37,9 +37,19 @@ async function account(server, username, email = `${username}@example.com`) {
   const call = clientFor(server);
   const reg = await call('POST', '/auth/register', { username, email, password: PASSWORD, passwordConfirm: PASSWORD });
   assert.equal(reg.status, 200, JSON.stringify(reg.data));
-  const login = await call('POST', '/auth/login', { username, password: PASSWORD });
+  let login = await call('POST', '/auth/login', { username, password: PASSWORD });
+  // An unverified account is refused a session (auth.js). The gates tested below exist for the
+  // sessions that predate that rule, so the test makes one the way it came about: signed in while
+  // the account counted as verified, then the flag back to 0.
+  let refusedLogin = null;
+  if (login.status === 403) {
+    refusedLogin = login;
+    await dbAll(server.dataDir, 'UPDATE users SET email_verified = 1 WHERE username = ?', [username]);
+    login = await call('POST', '/auth/login', { username, password: PASSWORD });
+    await dbAll(server.dataDir, 'UPDATE users SET email_verified = 0 WHERE username = ?', [username]);
+  }
   assert.equal(login.status, 200, JSON.stringify(login.data));
-  return { username, email, call, token: login.data.token, registered: reg.data, login: login.data };
+  return { username, email, call, token: login.data.token, registered: reg.data, login: login.data, refusedLogin };
 }
 
 /** Every message the fake mailer was handed, oldest first. */
@@ -123,8 +133,12 @@ describe('email verification: an instance that can send email', () => {
     const mail = outbox(server).find((m) => m.to === newbie.email && /Confirm your email/.test(m.subject));
     assert.match(mail.html, /href="[^"]+\/app\/\?verify=/, 'the link opens the app, like the reset and invite links');
 
-    // Signed in, and told so.
-    assert.equal(newbie.login.user.emailVerified, false);
+    // The password is right but there is no session until the link is opened, and the answer
+    // names the address the link went to.
+    assert.equal(newbie.refusedLogin?.status, 403);
+    assert.deepEqual(newbie.refusedLogin.data, { error: 'Confirm your email before signing in: open the link we emailed you.', code: 'email-unverified', email: newbie.email });
+    // A session from before that rule (see account()) is told it is unverified...
+    assert.equal(newbie.login.user.emailVerified, true, '(it was signed in while the flag was 1)');
     assert.equal((await newbie.call('GET', '/auth/me', undefined, newbie.token)).data.user.emailVerified, false);
     const sync = await newbie.call('GET', '/user/sync', undefined, newbie.token);
     assert.equal(sync.status, 200);
@@ -340,7 +354,9 @@ describe('email verification: an instance that can send email', () => {
       const [verify] = await emailedTokens(server, acct.email);
       assert.equal((await acct.call('POST', '/auth/reset', { token: verify, email: acct.email, password: 'Other9!newpw', passwordConfirm: 'Other9!newpw' })).status, 400);
       assert.equal((await acct.call('POST', '/account/deactivate/confirm', { token: verify })).status, 400);
-      assert.equal((await acct.call('POST', '/auth/login', { username: 'linkother', password: PASSWORD })).status, 200, 'the password is unchanged');
+      const login = await acct.call('POST', '/auth/login', { username: 'linkother', password: PASSWORD });
+      assert.equal(login.status, 403, 'the password is unchanged (still right, still unverified)');
+      assert.equal(login.data.code, 'email-unverified');
     });
 
     test('never signs anyone in: no token in the answer, and the answer is the same signed in or out', async () => {
@@ -417,6 +433,131 @@ describe('email verification: an instance that can send email', () => {
     });
   });
 
+  describe('correcting a mistyped address', () => {
+    const change = (acct, body, call = acct.call) => call('POST', '/auth/verify-email/change', body, acct.token);
+    const storedEmail = async (username) => (await dbAll(server.dataDir, 'SELECT email FROM users WHERE username = ?', [username]))[0].email;
+
+    test('moves the account to the new address, sends the link there, and kills every link sent to the old one', async () => {
+      const acct = await account(server, 'typoann', 'typoan@example.com');
+      const [oldLink] = await emailedTokens(server, acct.email);
+      // A reset link mailed to the wrong address too, before the mistake was noticed.
+      assert.equal((await acct.call('POST', '/auth/forgot', { email: acct.email })).status, 200);
+      const resets = () => dbAll(server.dataDir, "SELECT t.token FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE u.username = 'typoann' AND t.purpose = 'reset'");
+      assert.equal((await resets()).length, 1);
+      const socket = await open(acct.token);
+      const announced = once(socket, 'account:email-changed');
+
+      const res = await change(acct, { email: ' typoann@example.com ', password: PASSWORD });
+      assert.equal(res.status, 200, JSON.stringify(res.data));
+      assert.deepEqual(res.data, { success: true, email: 'typoann@example.com', sent: true });
+      assert.deepEqual(await announced, { email: 'typoann@example.com' }, 'their other windows are told');
+      assert.equal(await storedEmail('typoann'), 'typoann@example.com');
+      assert.equal((await acct.call('GET', '/auth/me', undefined, acct.token)).data.user.email, 'typoann@example.com');
+      assert.equal((await resets()).length, 0, 'the reset link that went to the wrong address no longer works');
+
+      const [newLink] = await emailedTokens(server, 'typoann@example.com');
+      assert.ok(newLink, 'the link went to the corrected address');
+      assert.equal((await acct.call('POST', '/auth/verify-email', { token: oldLink })).status, 400, 'the link sent to the old address is dead');
+      assert.equal((await acct.call('POST', '/auth/verify-email', { token: newLink })).status, 200);
+      assert.equal(await verifiedFlag(server, 'typoann'), 1);
+    });
+
+    test('needs the password, a real address, and one that is new and free; a refusal changes and sends nothing', async () => {
+      const acct = await account(server, 'typobob', 'typobo@example.com');
+      await emailedTokens(server, acct.email);
+      const sentBefore = outbox(server).length;
+      const wrong = await change(acct, { email: 'typobob@example.com', password: 'Not-the-password1!' });
+      assert.equal(wrong.status, 403, 'a wrong password is 403, so the client does not treat it as a dead session');
+      assert.equal(wrong.data.code, 'wrong-password');
+      assert.equal((await change(acct, { email: 'typobob@example.com' })).status, 400);
+      assert.equal((await change(acct, { email: 'not-an-address', password: PASSWORD })).status, 400);
+      assert.equal((await change(acct, { email: 'typobo@example.com', password: PASSWORD })).status, 400, 'the same address: that is what Resend is for');
+      const taken = await change(acct, { email: veteran.email, password: PASSWORD });
+      assert.equal(taken.status, 409);
+      assert.equal(taken.data.field, 'email');
+      assert.equal(await storedEmail('typobob'), 'typobo@example.com');
+      assert.equal(outbox(server).length, sentBefore);
+      assert.equal((await clientFor(server)('POST', '/auth/verify-email/change', { email: 'x@example.com', password: PASSWORD })).status, 401, 'and a session');
+    });
+
+    test('a verified address is not changed here', async () => {
+      const res = await change(veteran, { email: 'elsewhere@example.com', password: PASSWORD });
+      assert.equal(res.status, 409);
+      assert.equal(res.data.alreadyVerified, true);
+      assert.equal(await storedEmail('veteran'), veteran.email);
+    });
+
+    test('is limited to five tries an hour per account, from any address', async () => {
+      const acct = await account(server, 'typolimit');
+      for (let i = 1; i <= 5; i++) {
+        assert.equal((await change(acct, { email: `typolimit${i}@example.com`, password: PASSWORD }, clientFor(server))).status, 200, `change ${i}`);
+      }
+      const sixth = await change(acct, { email: 'typolimit6@example.com', password: PASSWORD }, clientFor(server));
+      assert.equal(sixth.status, 429);
+      assert.equal(await storedEmail('typolimit'), 'typolimit5@example.com');
+    });
+
+    test('a new address the mail server refuses is still saved, and the answer says nothing was sent', async () => {
+      const acct = await account(server, 'typobounce');
+      const res = await change(acct, { email: 'bounce-typobounce@example.com', password: PASSWORD });
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.data, { success: true, email: 'bounce-typobounce@example.com', sent: false });
+      assert.equal(await storedEmail('typobounce'), 'bounce-typobounce@example.com');
+    });
+  });
+
+  describe('signing in before verifying', () => {
+    const register = async (username, email = `${username}@example.com`) => {
+      const call = clientFor(server);
+      assert.equal((await call('POST', '/auth/register', { username, email, password: PASSWORD, passwordConfirm: PASSWORD })).status, 200);
+      return call;
+    };
+
+    test('is refused with the address on file; a wrong password says only that, and leaks neither', async () => {
+      const call = await register('gateann');
+      const refused = await call('POST', '/auth/login', { username: 'gateann', password: PASSWORD });
+      assert.equal(refused.status, 403);
+      assert.equal(refused.data.code, 'email-unverified');
+      assert.equal(refused.data.email, 'gateann@example.com');
+      assert.equal(refused.data.token, undefined);
+      const wrong = await call('POST', '/auth/login', { username: 'gateann', password: 'Not-the-password1!' });
+      assert.deepEqual([wrong.status, wrong.data], [401, { error: 'Invalid credentials' }]);
+    });
+
+    test('the sign-in form can resend the link with the username and password, and opening it lets them in', async () => {
+      const call = await register('gatebob');
+      await emailedTokens(server, 'gatebob@example.com');
+      assert.equal((await call('POST', '/auth/verify-email/resend', { username: 'gatebob', password: 'Not-the-password1!' })).status, 401);
+      const resent = await call('POST', '/auth/verify-email/resend', { username: 'gatebob', password: PASSWORD });
+      assert.deepEqual([resent.status, resent.data], [200, { success: true, sent: true }]);
+      const tokens = await emailedTokens(server, 'gatebob@example.com', 2);
+      assert.equal((await call('POST', '/auth/verify-email', { token: tokens[1] })).status, 200);
+      const login = await call('POST', '/auth/login', { username: 'gatebob', password: PASSWORD });
+      assert.equal(login.status, 200);
+      assert.equal(login.data.user.emailVerified, true);
+    });
+
+    test('the sign-in form can correct a mistyped address, and the link sent there lets them in', async () => {
+      const call = await register('gatecat', 'gatcat@example.com');
+      const fixed = await call('POST', '/auth/verify-email/change', { username: 'gatecat', password: PASSWORD, email: 'gatecat@example.com' });
+      assert.deepEqual([fixed.status, fixed.data], [200, { success: true, email: 'gatecat@example.com', sent: true }]);
+      const again = await call('POST', '/auth/login', { username: 'gatecat', password: PASSWORD });
+      assert.deepEqual([again.status, again.data.email], [403, 'gatecat@example.com'], 'still not in, but the new address is what they see');
+      const [token] = await emailedTokens(server, 'gatecat@example.com');
+      assert.equal((await call('POST', '/auth/verify-email', { token })).status, 200);
+      assert.equal((await call('POST', '/auth/login', { username: 'gatecat', password: PASSWORD })).status, 200);
+    });
+
+    test('resetting the password from the emailed link proves the address too', async () => {
+      const call = await register('gatedan');
+      assert.equal((await call('POST', '/auth/forgot', { email: 'gatedan@example.com' })).status, 200);
+      const [reset] = await dbAll(server.dataDir, "SELECT t.token FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE u.username = 'gatedan' AND t.purpose = 'reset'");
+      assert.equal((await call('POST', '/auth/reset', { token: reset.token, email: 'gatedan@example.com', password: 'Fresh9!password', passwordConfirm: 'Fresh9!password' })).status, 200);
+      assert.equal(await verifiedFlag(server, 'gatedan'), 1);
+      assert.equal((await call('POST', '/auth/login', { username: 'gatedan', password: 'Fresh9!password' })).status, 200);
+    });
+  });
+
   test('two-factor and verification are independent: an unverified account can protect itself', async () => {
     const acct = await account(server, 'bothann');
     const totp = require('../services/totp');
@@ -424,7 +565,12 @@ describe('email verification: an instance that can send email', () => {
     assert.equal(started.status, 200);
     const done = await acct.call('POST', '/auth/2fa/confirm', { code: totp.totp(totp.base32Decode(started.data.secret)) }, acct.token);
     assert.equal(done.status, 200);
-    // Verifying the address is not a way in: signing in still takes both steps.
+    // Two-factor is not a way round verification: no ticket for the second step until it is done...
+    const early = await acct.call('POST', '/auth/login', { username: 'bothann', password: PASSWORD });
+    assert.equal(early.status, 403);
+    assert.equal(early.data.code, 'email-unverified');
+    assert.equal(early.data.ticket, undefined);
+    // ...and verifying the address is not a way in either: signing in still takes both steps.
     const [token] = await emailedTokens(server, acct.email);
     assert.deepEqual((await acct.call('POST', '/auth/verify-email', { token })).data, { success: true });
     const login = await acct.call('POST', '/auth/login', { username: 'bothann', password: PASSWORD });

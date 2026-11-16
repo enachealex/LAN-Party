@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import qrcode from 'qrcode-generator'
+import { ChangeEmailForm } from './EmailVerification'
 
 /** The API helper App.jsx already uses for every authenticated call. */
 type AuthedFetch = (path: string, opts?: RequestInit) => Promise<Response>
@@ -26,6 +27,8 @@ interface SecuritySettingsProps {
   emailVerified: boolean
   /** Ask the server to email the verification link again; resolves to what to tell the person. */
   onResendVerification: () => Promise<string>
+  /** Correct a mistyped, unverified address; resolves to the saved address (or null) and what to say. */
+  onChangeEmail: (email: string, password: string) => Promise<{ email: string | null; message: string }>
   /** Instance owners get the "clear someone's two-step sign-in" tool. Shown, not trusted: the server checks. */
   instanceOwner: boolean
   /** The app's in-app confirm dialog (window.confirm does nothing in the desktop app). */
@@ -132,7 +135,8 @@ function RecoveryCodes({ codes, username, onDone }: { codes: string[]; username:
  * turn off) and, for an instance owner, clearing it for someone who is locked out. All of it is
  * enforced by the server (routes/security.js); this is only the forms.
  */
-export default function SecuritySettings({ authedFetch, username, email, emailVerified, onResendVerification, instanceOwner, askConfirm, onTwoFactorChange }: SecuritySettingsProps) {
+export default function SecuritySettings({ authedFetch, username, email, emailVerified, onResendVerification, onChangeEmail, instanceOwner, askConfirm, onTwoFactorChange }: SecuritySettingsProps) {
+  const [changingEmail, setChangingEmail] = useState(false)
   const [status, setStatus] = useState<TwoFactorStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   // Which form is open: none, the password that starts setup, the QR + confirm step, the forms
@@ -289,9 +293,21 @@ export default function SecuritySettings({ authedFetch, username, email, emailVe
               <br />
               Until you open the link we emailed you, you can look around but not post in the public server, send direct messages or friend requests, create invites, upload files or make calls.
             </p>
-            <div className="security-actions start">
-              <button type="button" className="feedback-btn primary" onClick={resend} disabled={resending}>{resending ? 'Sending...' : 'Resend the email'}</button>
-            </div>
+            {changingEmail ? (
+              <ChangeEmailForm
+                onCancel={() => setChangingEmail(false)}
+                onSubmit={async (next, pw) => {
+                  const result = await onChangeEmail(next, pw)
+                  if (result.email) { setChangingEmail(false); setResendNote(result.message) }
+                  return result
+                }}
+              />
+            ) : (
+              <div className="security-actions start">
+                <button type="button" className="feedback-btn primary" onClick={resend} disabled={resending}>{resending ? 'Sending...' : 'Resend the email'}</button>
+                <button type="button" className="feedback-btn ghost" onClick={() => { setResendNote(null); setChangingEmail(true) }}>Wrong address?</button>
+              </div>
+            )}
             {resendNote && <p className="profile-settings-note security-after" role="status">{resendNote}</p>}
           </>
         )}
