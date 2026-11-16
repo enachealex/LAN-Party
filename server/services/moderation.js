@@ -1,7 +1,15 @@
 // @ts-check
 // Server moderation: bans, timeouts and the audit log. The storage and the rules; the routes are
 // routes/moderation.js, and the socket layer (index.js) asks timeoutOf() before it lets a member
-// write, react, pin, drive an activity or join voice.
+// write, react, pin, drive an activity, join voice, or start, join or draw on a channel's shared
+// image canvas (collab:*). Camera and screen state for Discover need the socket to be in the voice
+// room it names, which a timeout already takes away.
+//
+// WHAT A TIMEOUT DOES NOT COVER, on purpose: things that belong to no server. An external stream
+// announcement (stream:announce) names no server or channel; the shared GIF and sound libraries
+// (routes/library.js) are instance-wide, uploads included; direct messages, group chats and calls
+// are between people. A timeout means "no taking part in THIS server", and there is no server in
+// any of those for it to apply to. Keeping someone out of them is what a block is for.
 //
 // KICK, BAN, TIMEOUT: three different things.
 //   kick     Out of the server now. Remembered in server_removed so that no invite LINK lets them

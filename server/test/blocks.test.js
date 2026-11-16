@@ -652,3 +652,79 @@ describe('a blocked person in servers and groups you share', () => {
     assert.ok((await channelMessages(tok.ann)).data.messages.every((m) => !('blocked' in m)), 'the old ones are unmarked too');
   });
 });
+
+describe('added to a server by someone you blocked', () => {
+  // ben runs a server and is blocked by ann. Refusing to let him add her would tell him about the
+  // block, so the add goes through as it would for anyone; it is the "you were added" alert that
+  // she is spared. cat, whom she has not blocked, is the control.
+  let server, call;
+  const tok = {};
+  const sock = {};
+  const serverNames = async (token) => (await call('GET', '/servers', undefined, token)).data.servers.map((s) => s.name).sort();
+
+  before(async () => {
+    server = await startServer();
+    call = apiFor(server.base);
+    for (const name of ['ann', 'ben', 'cat', 'dee']) tok[name] = await makeUser(server.base, name);
+    assert.equal((await call('POST', '/blocks/ben', undefined, tok.ann)).status, 200);
+    for (const name of ['ann', 'ben']) sock[name] = await connect(server.base, tok[name]);
+  });
+  after(async () => {
+    for (const s of Object.values(sock)) s.close();
+    await server.stop();
+  });
+
+  test('ben\'s add goes through and is answered as any add is; ann\'s list updates, with no alert', async () => {
+    const bensId = (await call('POST', '/servers', { name: 'Bens Place' }, tok.ben)).data.server.id;
+    const listRefreshed = once(sock.ann, 'servers:updated');
+    const noAlert = never(sock.ann, 'server:invited');
+    const res = await call('POST', `/servers/${bensId}/invite`, { username: 'ann' }, tok.ben);
+    // The same answer cat gets below for an account that has blocked nobody.
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.data, { success: true });
+    await listRefreshed;
+    assert.ok(await noAlert, 'no "you were added" for an add by someone she blocked');
+    assert.deepEqual(await serverNames(tok.ann), ['Bens Place']);
+    const roster = (await call('GET', `/servers/${bensId}/members`, undefined, tok.ben)).data.members.map((m) => m.username).sort();
+    assert.deepEqual(roster, ['ann', 'ben'], 'ben sees her added, as he would anyone');
+    // She can walk out again.
+    assert.equal((await call('POST', `/servers/${bensId}/leave`, undefined, tok.ann)).status, 200);
+    assert.deepEqual(await serverNames(tok.ann), []);
+  });
+
+  test('the same holds when he is an admin of someone else\'s server', async () => {
+    const deesId = (await call('POST', '/servers', { name: 'Dees Den' }, tok.dee)).data.server.id;
+    assert.equal((await call('POST', `/servers/${deesId}/invite`, { username: 'ben' }, tok.dee)).status, 200);
+    assert.equal((await call('PATCH', `/servers/${deesId}/members/ben`, { role: 'admin' }, tok.dee)).status, 200);
+    const listRefreshed = once(sock.ann, 'servers:updated');
+    const noAlert = never(sock.ann, 'server:invited');
+    assert.equal((await call('POST', `/servers/${deesId}/invite`, { username: 'ann' }, tok.ben)).status, 200);
+    await listRefreshed;
+    assert.ok(await noAlert);
+    assert.deepEqual(await serverNames(tok.ann), ['Dees Den']);
+  });
+
+  test('an add by someone she has not blocked still alerts her, naming who did it', async () => {
+    const catsId = (await call('POST', '/servers', { name: 'Cats Corner' }, tok.cat)).data.server.id;
+    const alert = once(sock.ann, 'server:invited');
+    const res = await call('POST', `/servers/${catsId}/invite`, { username: 'ann' }, tok.cat);
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.data, { success: true });
+    assert.deepEqual(await alert, { serverId: catsId, name: 'Cats Corner', by: 'cat' });
+  });
+
+  test('the block is one way: ann adding ben to her server still alerts him', async () => {
+    const annsId = (await call('POST', '/servers', { name: 'Anns Attic' }, tok.ann)).data.server.id;
+    const alert = once(sock.ben, 'server:invited');
+    assert.equal((await call('POST', `/servers/${annsId}/invite`, { username: 'ben' }, tok.ann)).status, 200);
+    assert.equal((await alert).by, 'ann');
+  });
+
+  test('once unblocked, his adds alert her again', async () => {
+    assert.equal((await call('DELETE', '/blocks/ben', undefined, tok.ann)).status, 200);
+    const bensId = (await call('POST', '/servers', { name: 'Bens Second' }, tok.ben)).data.server.id;
+    const alert = once(sock.ann, 'server:invited');
+    assert.equal((await call('POST', `/servers/${bensId}/invite`, { username: 'ann' }, tok.ben)).status, 200);
+    assert.equal((await alert).by, 'ben');
+  });
+});

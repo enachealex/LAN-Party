@@ -20,6 +20,8 @@ interface InviteLink {
 interface InviteLinkSectionProps {
   serverId: string
   authedFetch: AuthedFetch
+  /** App.jsx's in-app yes/no dialog. window.confirm returns at once in the desktop app. */
+  askConfirm: (opts: { title?: string; message?: string; submitLabel?: string }) => Promise<true | null>
 }
 
 // The three choices offered. The server accepts any whole number of hours up to 30 days; these are
@@ -78,7 +80,7 @@ async function copyText(text: string): Promise<boolean> {
  * and see or revoke the ones still live. Adding a friend by name (the list above this) needs them to
  * have an account already; a link works for anyone it is sent to.
  */
-export default function InviteLinkSection({ serverId, authedFetch }: InviteLinkSectionProps) {
+export default function InviteLinkSection({ serverId, authedFetch, askConfirm }: InviteLinkSectionProps) {
   const [links, setLinks] = useState<InviteLink[]>([])
   const [loading, setLoading] = useState(true)
   const [expiry, setExpiry] = useState<ExpiryId>('168')
@@ -169,7 +171,12 @@ export default function InviteLinkSection({ serverId, authedFetch }: InviteLinkS
   }
 
   const revoke = async (link: InviteLink) => {
-    if (!window.confirm('Revoke this invite link? Anyone who has it will no longer be able to join with it.')) return
+    const ok = await askConfirm({
+      title: 'Revoke this invite link?',
+      message: 'Anyone who has it will no longer be able to join with it. People who already joined through it stay. This cannot be undone, but you can make a new link.',
+      submitLabel: 'Revoke link',
+    })
+    if (!ok) return
     setError(null)
     setRevoking((prev) => new Set(prev).add(link.code))
     try {

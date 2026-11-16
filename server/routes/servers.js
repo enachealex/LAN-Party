@@ -421,7 +421,14 @@ function registerServerRoutes({ app, db, io, authMiddleware, DEMO_ID, newId, per
     // keeps a removed person from rejoining through an invite link.
     await db.run('DELETE FROM server_removed WHERE server_id = ? AND username = ?', serverId, target);
     io.to(`user:${target}`).emit('servers:updated');
-    io.to(`user:${target}`).emit('server:invited', { serverId, name: srv.name, by: req.user.username });
+    // Someone they have blocked can still add them, as staff of a server: refusing would tell the
+    // inviter they are blocked (services/blocks.js: nothing they ask may answer differently). What
+    // the block does do is keep the inviter from reaching them, so the add is silent: no "you were
+    // added" alert. servers:updated above still runs, so the server simply appears in their list,
+    // and they can leave it like any other.
+    if (!(await blocks.blockedBy(target)).has(req.user.username)) {
+      io.to(`user:${target}`).emit('server:invited', { serverId, name: srv.name, by: req.user.username });
+    }
     await broadcastServerState(serverId);
     await audit(serverId, req.user.username, AUDIT.invited, target);
     return res.json({ success: true });

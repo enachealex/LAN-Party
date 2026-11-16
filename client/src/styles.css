@@ -709,6 +709,8 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 /* Members panel (right side overlay) */
 .members-btn{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--text);padding:6px 8px;border-radius:8px;cursor:pointer}
 .create-app-btn{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--text);padding:6px 8px;border-radius:8px;cursor:pointer}
+/* "Open in the app" is a link (an intent: URL) wearing the same look. */
+a.create-app-btn{text-decoration:none;font-size:13.33px;line-height:normal;display:inline-flex;align-items:center}
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,0.35);opacity:0;pointer-events:none;transition:opacity 160ms}
 .overlay.open{opacity:1;pointer-events:auto}
 .members-panel{position:fixed;right:16px;top:72px;width:300px;bottom:16px;background:var(--sidebar-bg);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.6);transform:translateY(-8px);opacity:0;pointer-events:none;transition:all 160ms}
@@ -2083,6 +2085,8 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   color:#fff;font-size:16px;font-weight:800;font-family:inherit;margin-bottom:20px;
 }
 .install-gate-btn:disabled{opacity:.65}
+/* "Open the app" is a link (an intent: URL), drawn as the same button. */
+a.install-gate-btn{display:flex;align-items:center;justify-content:center;box-sizing:border-box;text-decoration:none}
 .install-gate-steps{
   margin:0 0 18px;padding:16px 16px 16px 34px;text-align:left;
   background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:12px;
@@ -2668,6 +2672,13 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
 .blocked-msg-toggle{flex-shrink:0;border:none;background:transparent;color:var(--accent-start);font:inherit;font-weight:700;cursor:pointer;padding:2px 4px;border-radius:5px}
 .blocked-msg-toggle:hover{background:rgba(255,255,255,.08)}
 .blocked-msg-open{display:flex;flex-direction:column;opacity:.82}
+/* The same collapse for a quote inside someone else's message, and for a pin. */
+.msg-quote-blocked{margin:2px 0}
+.msg-quote-blocked .blocked-msg{margin:0}
+.pin-bar-row{display:flex;align-items:stretch;flex:none;background:#141b24;border-bottom:1px solid rgba(255,255,255,.08)}
+.pin-bar-row .pin-bar{flex:1;min-width:0;border-bottom:none}
+.pin-bar-reveal{margin:0 10px 0 0;align-self:center}
+.pins-item-reveal{flex-shrink:0;align-self:center}
 
 /* Where the message box would be: timed out in this server, or a conversation with someone blocked. */
 .composer-notice{display:flex;align-items:flex-start;gap:12px;margin-top:12px;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text)}

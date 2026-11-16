@@ -8,7 +8,7 @@ const { extractBundle } = require('../services/appBundles');
 const { isHostedApp, ownHostKeys, servedFromLoopback, checkHostedUrl } = require('../services/hostedApps');
 
 /** @param {Record<string, any>} deps */
-function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [], requireVerified }) {
+function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins = [], requireVerified, permissions, moderation }) {
   // --- Server custom emojis ---
   function slugifyEmojiName(raw) {
     const base = String(raw || 'emoji').replace(/\.[^.]+$/, '').toLowerCase()
@@ -26,7 +26,9 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   });
 
   // Add a custom emoji to a server (url comes from a prior /files/upload).
-  app.post('/servers/:serverId/emojis', authMiddleware, async (req, res) => {
+  // Only a member of the server may add one, and not while timed out there; the email check matches
+  // the upload it points at (POST /files/upload asks the same).
+  app.post('/servers/:serverId/emojis', authMiddleware, requireVerified, async (req, res) => {
     const serverId = req.params.serverId;
     const { url } = req.body || {};
     if (typeof url !== 'string' || !url.startsWith('/uploads/')) {
@@ -34,6 +36,12 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
     }
     const server = await db.get('SELECT id FROM servers WHERE id = ?', serverId);
     if (!server) return res.status(404).json({ error: 'Server not found' });
+    if (!(await permissions.isMember(serverId, req.user.username))) {
+      return res.status(403).json({ error: 'Only members of this server can add its emoji' });
+    }
+    if (await moderation.timeoutOf(serverId, req.user.username)) {
+      return res.status(403).json({ error: 'You are timed out in this server' });
+    }
     // Ensure a unique name within the server.
     let base = slugifyEmojiName(req.body?.name);
     let name = base;
@@ -50,8 +58,15 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   });
 
   // Remove a custom emoji from a server.
+  // Whoever added it may take it back; anyone else needs manage_server in that server.
   app.delete('/servers/:serverId/emojis/:name', authMiddleware, async (req, res) => {
     const { serverId, name } = req.params;
+    const emoji = await db.get('SELECT created_by FROM server_emojis WHERE server_id = ? AND name = ?', serverId, name);
+    if (!emoji) return res.status(404).json({ error: 'Emoji not found' });
+    const mine = emoji.created_by === req.user.username && (await permissions.isMember(serverId, req.user.username));
+    if (!mine && !(await permissions.can(serverId, req.user.username, 'manage_server'))) {
+      return res.status(403).json({ error: 'Only whoever added this emoji, or a server admin, can remove it' });
+    }
     await db.run('DELETE FROM server_emojis WHERE server_id = ? AND name = ?', serverId, name);
     const emojis = await db.all('SELECT name, url, created_by FROM server_emojis WHERE server_id = ? ORDER BY created_at ASC', serverId);
     return res.json({ success: true, emojis });
@@ -181,7 +196,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   // Add a link-style app (external URL). A draft until an instance owner publishes it.
   // With `embed: true` it is a hosted app from the start, and its address has to pass the checks
   // for one; without it the url is kept as typed, as it always was.
-  app.post('/apps', authMiddleware, async (req, res) => {
+  app.post('/apps', authMiddleware, requireVerified, async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!name) return res.status(400).json({ error: 'App name is required' });
     const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 500) : '';
@@ -213,7 +228,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
 
   // Upload a self-contained mini-app (single .html or a .zip). The server extracts it into a private
   // per-app folder and serves it sandboxed at /app-bundles/<dir>/ — so it embeds in the in-app viewer.
-  app.post('/apps/bundle', authMiddleware, (req, res) => {
+  app.post('/apps/bundle', authMiddleware, requireVerified, (req, res) => {
     bundleUpload.single('bundle')(req, res, async (err) => {
       if (err) {
         if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Bundle is larger than 15 MB' });
@@ -437,7 +452,7 @@ function registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload,
   // The new files get a new folder, so the app's url changes with them. The old one is deleted
   // rather than overwritten in place: these files are cacheable, and a browser (or a room) still
   // holding the old url must stop getting an app at it, not get a mix of old and new files.
-  app.put('/apps/:id/bundle', authMiddleware, async (req, res) => {
+  app.put('/apps/:id/bundle', authMiddleware, requireVerified, async (req, res) => {
     // Who is asking is settled before the upload is read, so a stranger cannot make the server
     // buffer 15 MB for an app that is not theirs.
     const found = await loadApp(req, res);

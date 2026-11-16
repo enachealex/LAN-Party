@@ -1,24 +1,18 @@
 import React, { useEffect, useState } from 'react'
+import { androidAppIntentUrl } from '../installContext'
 
 // Phones and tablets are steered to the installed (home-screen) app rather than the browser tab:
 // standalone mode gets a real app icon, no URL bar stealing vertical space, better background audio
-// behaviour, and notification support. This gate is shown on mobile browsers only — never in
-// standalone mode, never in the Electron shell, and never on desktop browsers.
+// behaviour, and notification support. This gate is shown on mobile browsers only — never inside
+// any installed app (the Android app, the Windows app, an installed web app: installContext.ts)
+// and never on desktop browsers. On a phone that already has the Android app it says so and offers
+// to open it, instead of asking for an install that has already happened.
 //
 // Install is only actually possible in some browsers, so the gate always keeps a "continue anyway"
 // escape: blocking outright would lock out anyone in an in-app webview (Instagram/Facebook links)
 // or a browser without PWA support.
 
 const DISMISS_KEY = 'lanparty_install_gate_dismissed'
-
-/** Is the page already running as an installed app? */
-export function isStandalone() {
-  if (typeof window === 'undefined') return false
-  const mm = window.matchMedia
-  const modes = ['standalone', 'minimal-ui', 'fullscreen']
-  if (mm && modes.some((m) => mm(`(display-mode: ${m})`).matches)) return true
-  return window.navigator.standalone === true // iOS Safari
-}
 
 /** Platform facts that decide which instructions to show. */
 export function detectPlatform() {
@@ -33,7 +27,7 @@ export function detectPlatform() {
   return { isIOS, isAndroid, iosNonSafari, inAppBrowser, isMobile: isIOS || isAndroid }
 }
 
-export default function MobileInstallGate({ deferredPrompt, onInstalled, onDismiss }) {
+export default function MobileInstallGate({ deferredPrompt, onInstalled, onDismiss, androidAppOnDevice = false }) {
   const [platform] = useState(detectPlatform)
   const [installing, setInstalling] = useState(false)
   const [promptFailed, setPromptFailed] = useState(false)
@@ -62,6 +56,14 @@ export default function MobileInstallGate({ deferredPrompt, onInstalled, onDismi
 
   // What the user should actually do, per platform.
   const steps = (() => {
+    if (androidAppOnDevice && platform.isAndroid && !platform.inAppBrowser) {
+      return {
+        title: 'Open the LAN Party app',
+        lines: ['The LAN Party app is on this phone, so there is nothing to install.',
+                'Tap Open the app below, or open LAN Party from your home screen.'],
+        openApp: true,
+      }
+    }
     if (platform.inAppBrowser) {
       return {
         title: 'Open in your browser first',
@@ -91,10 +93,11 @@ export default function MobileInstallGate({ deferredPrompt, onInstalled, onDismi
     }
   })()
 
-  const canPrompt = !!deferredPrompt && !platform.isIOS
+  // With the app already on the phone, installing the web app as well would only add a second icon.
+  const canPrompt = !!deferredPrompt && !platform.isIOS && !steps.openApp
 
   return (
-    <div className="install-gate" role="dialog" aria-modal="true" aria-label="Install LAN Party">
+    <div className="install-gate" role="dialog" aria-modal="true" aria-label={steps.openApp ? 'Open LAN Party' : 'Install LAN Party'}>
       <div className="install-gate-card">
         <img className="install-gate-logo" src="icons/logo-192.png" alt="" />
         <h1 className="install-gate-title">{steps.title}</h1>
@@ -102,6 +105,10 @@ export default function MobileInstallGate({ deferredPrompt, onInstalled, onDismi
           LAN Party works best as an installed app — full screen, its own icon, and voice chat that
           keeps running while you switch away.
         </p>
+
+        {steps.openApp && (
+          <a className="install-gate-btn" href={androidAppIntentUrl()}>Open the app</a>
+        )}
 
         {canPrompt && (
           <button type="button" className="install-gate-btn" onClick={install} disabled={installing}>

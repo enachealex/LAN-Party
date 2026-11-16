@@ -510,7 +510,12 @@ async function main() {
   await rescueLegacyAvatars();
 
   const clients = {}; // socketId -> { name, username, serverId }
-  const collabSessions = {}; // sessionId (image url) -> { imageUrl, segments: [] } for shared image editing
+  // Shared image editing, keyed by the session's socket room (collabRoom in the connection handler):
+  // room -> { sessionId, imageUrl, segments: [], serverId, channelId }. A session started in a
+  // channel belongs to it (serverId/channelId set) and is held to that channel's rules; one opened
+  // from a direct conversation has neither and is just the image url. No prototype: every socket
+  // room name is looked up here, and none of them may find an inherited property.
+  const collabSessions = Object.create(null);
   const liveStreams = {}; // socketId -> { name, serverId, channelId, camera, screen } for Watch/Discover
   const externalStreams = {}; // socketId -> { name, platform, channel, title, game } — "I'm live on Twitch/YouTube/Kik"
   const EXTERNAL_PLATFORMS = ['twitch', 'youtube', 'kik'];
@@ -1448,7 +1453,7 @@ async function main() {
   registerPushRoutes({ app, authMiddleware, push, validate, pushSubscribeInput, pushUnsubscribeInput });
 
   // Emojis / app directory / GIF library / soundboard (routes/library.js).
-  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins, requireVerified });
+  registerLibraryRoutes({ app, db, io, authMiddleware, upload, gifUpload, soundUpload, gifsDir, soundsDir, SOUND_NAME_MAX, bundleUpload, appBundlesDir, endAppActivities, approveAppActivities, isInstanceOwner, instanceOwners, ownOrigins, requireVerified, permissions, moderation });
 
   // Tenor / YouTube+yt-dlp / playlists / Spotify (routes/media.js).
   registerMediaRoutes({ app, db, authMiddleware, io, JWT_SECRET, ownOrigins });
@@ -1709,6 +1714,36 @@ async function main() {
     return timeout ? { serverId, channelId, reason: 'timeout', until: timeout.until } : { serverId, channelId };
   }
 
+  // May this account draw on a channel's shared image (collab:*)? The same rule as anything else
+  // sent into a channel: a member, who may open the channel, and not timed out in its server.
+  // Unlike a voice room the channel must exist even in the commons: the canvas is announced to
+  // that channel's room, and a made-up name has nobody in it to announce to.
+  async function mayCollabIn(username, serverId, channelId) {
+    if (typeof serverId !== 'string' || typeof channelId !== 'string') return false;
+    const role = await roleOf(serverId, username);
+    if (!role) return false;
+    if (await moderation.timeoutOf(serverId, username)) return false; // never one in the commons
+    const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
+    return !!ch && !!(await canAccessChannel(serverId, channelId, username, ch.privacy, role));
+  }
+  // Someone just lost access in this server (or was timed out): take their sockets out of every
+  // shared canvas of its channels they may no longer use, and say why, so the client closes it.
+  // Their strokes are only relayed while their socket is in the session's room, so this is what
+  // stops them; nothing is asked of the database per stroke.
+  async function enforceCollabAccess(username, serverId) {
+    for (const sock of io.sockets.sockets.values()) {
+      if (sock.data?.username !== username) continue;
+      for (const room of [...sock.rooms]) {
+        const sess = collabSessions[room];
+        if (!sess || sess.serverId !== serverId) continue;
+        if (await mayCollabIn(username, serverId, sess.channelId)) continue;
+        sock.leave(room);
+        const timeout = await moderation.timeoutOf(serverId, username);
+        sock.emit('collab:removed', { sessionId: sess.sessionId, serverId, channelId: sess.channelId, ...(timeout ? { reason: 'timeout', until: timeout.until } : {}) });
+      }
+    }
+  }
+
   // Someone just lost access here (kicked, left, taken off a private channel's list, demoted,
   // timed out). Their sockets are still sitting in the voice rooms they had joined, hearing the
   // call: the membership check happens at the door, not afterwards. So after access is taken away,
@@ -1729,6 +1764,10 @@ async function main() {
         sock.emit('voice:removed', told); // the client hangs up its side
       }
     }
+    // The shared image canvases of the server's channels go by the same rule. Done from here
+    // because every path that takes access away (kick, ban, leave, a timeout, a private channel's
+    // list or a role changing) already ends by calling this.
+    await enforceCollabAccess(username, serverId);
   }
 
   // The same for the TEXT rooms. A socket joins `server:<id>` and one `channel:<id>:<channel>` when
@@ -2137,15 +2176,31 @@ async function main() {
 
     // Tell the voice room whether this peer is currently sharing their screen (so others can
     // offer a "view full screen" affordance only for screen shares).
-    socket.on('voice:screenshare-state', ({ serverId = 'demo', channelId = 'voice1', sharing } = {}) => {
+    // Camera and screen state name a voice room, and only someone IN that room may speak for it.
+    // Being in it already says they passed the door (a member, allowed in the channel, not timed
+    // out: mayBeInVoice), and anything that takes them out again (enforceVoiceAccess, a timeout
+    // included) drops their Discover entry with them (dropFromVoiceRoom). Without this, any socket
+    // could tell a room it was sharing its screen, or put itself on everyone's Discover list as
+    // live in a server it was timed out of, or not even in. The client announces its camera right
+    // after asking to join, so a join still being decided is waited for first.
+    const inVoiceRoom = async (serverId, channelId) => {
+      const pending = pendingVoiceJoin();
+      if (pending) await pending;
+      return typeof serverId === 'string' && typeof channelId === 'string' && socket.rooms.has(`voice:${serverId}:${channelId}`);
+    };
+    socket.on('voice:screenshare-state', async ({ serverId = 'demo', channelId = 'voice1', sharing } = {}) => {
+      if (!(await inVoiceRoom(serverId, channelId))) return;
       socket.to(`voice:${serverId}:${channelId}`).emit('voice:screenshare-state', { id: socket.id, sharing: !!sharing });
     });
 
     // Global stream state for Watch/Discover: is this user currently sending camera and/or screen?
-    socket.on('voice:stream-state', ({ serverId = 'demo', channelId = 'voice1', camera, screen, genres } = {}) => {
+    socket.on('voice:stream-state', async ({ serverId = 'demo', channelId = 'voice1', camera, screen, genres } = {}) => {
       if (camera || screen) {
+        if (!(await inVoiceRoom(serverId, channelId))) return;
         liveStreams[socket.id] = { name: clients[socket.id]?.name || 'Anon', serverId, channelId, camera: !!camera, screen: !!screen, genres: Array.isArray(genres) ? genres.slice(0, 12) : [] };
       } else {
+        // Turning it off is always allowed: it can only take an entry away.
+        if (!liveStreams[socket.id]) return;
         delete liveStreams[socket.id];
       }
       broadcastDiscover();
@@ -2155,6 +2210,9 @@ async function main() {
     socket.on('discover:list', () => socket.emit('discover:update', discoverList()));
 
     // "I'm live on Twitch/YouTube/Kik" — announce an external stream so friends can watch in-app.
+    // Not held to any server's timeout: the announcement names no server or channel, it goes on
+    // the instance-wide Discover list, and nobody can watch it inside a server's rooms. A timeout
+    // is "no taking part in THIS server", and there is no server here to apply it to.
     socket.on('stream:announce', ({ platform, channel, title, game, genres } = {}) => {
       if (!EXTERNAL_PLATFORMS.includes(platform)) return;
       const ch = String(channel || '').trim().slice(0, 120);
@@ -2327,39 +2385,76 @@ async function main() {
     });
 
     // --- Collaborative image editing (shared annotation canvas, session keyed by image url) ---
+    //
+    // A session started in a channel belongs to that channel: its room is named after the server,
+    // the channel and the image, and only someone who may use the channel right now (mayCollabIn:
+    // a member, allowed in the channel, not timed out in the server) gets into it. A session opened
+    // from a direct conversation names no channel and keeps its old room, the image url alone; it
+    // never shares a room, a stroke or an invitation with a channel's session of the same image.
+    // Strokes and clears go only to the session the sending socket is IN, never to one it merely
+    // names, so the door is the one place access is decided; enforceCollabAccess takes a socket
+    // back out when its access ends (a timeout included).
+    const COLLAB_ID_MAX = 2048; // the session id is an image url
+    // Two prefixes, and the ids encoded, so that no session id can be chosen to spell another
+    // session's room: a direct conversation's id is not a way into a channel's canvas.
+    const collabRoom = (serverId, channelId, sessionId) => (serverId === undefined && channelId === undefined
+      ? `collab-dm:${sessionId}`
+      : `collab:${encodeURIComponent(serverId)}:${encodeURIComponent(channelId)}:${sessionId}`);
+    const validSessionId = (sessionId) => typeof sessionId === 'string' && sessionId.length > 0 && sessionId.length <= COLLAB_ID_MAX;
+    // The session room this socket has joined for that id, or null.
+    const joinedCollab = (sessionId) => {
+      if (!validSessionId(sessionId)) return null;
+      for (const room of socket.rooms) {
+        const sess = collabSessions[room];
+        if (sess && sess.sessionId === sessionId) return { room, sess };
+      }
+      return null;
+    };
+    const refuseCollab = async (sessionId, serverId, channelId) => {
+      const timeout = typeof serverId === 'string' ? await timedOutIn(serverId) : null;
+      socket.emit('collab:removed', { sessionId, serverId, channelId, ...(timeout ? { reason: 'timeout', until: timeout.until } : {}) });
+    };
     // Announce a collaboration so others in the channel can join.
-    // Held to the channel's access rules like anything else sent into one: this used to relay the
-    // invitation to whichever channel room was named, a private one the sender cannot open included.
     socket.on('collab:start', async ({ serverId = 'demo', channelId = 'general', sessionId, imageUrl } = {}) => {
-      if (!sessionId) return;
-      const ch = await db.get("SELECT COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
-      if (!ch || !(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, await roleOf(serverId, socketUser)))) return;
-      if (!collabSessions[sessionId]) collabSessions[sessionId] = { imageUrl, segments: [] };
+      if (!validSessionId(sessionId)) return;
+      if (!(await mayCollabIn(socketUser, serverId, channelId))) { await refuseCollab(sessionId, serverId, channelId); return; }
+      const room = collabRoom(serverId, channelId, sessionId);
+      if (!collabSessions[room]) collabSessions[room] = { sessionId, imageUrl, segments: [], serverId, channelId };
       const by = clients[socket.id]?.name || 'Anon';
-      socket.to(`channel:${serverId}:${channelId}`).emit('collab:invite', { sessionId, imageUrl, by });
+      socket.to(`channel:${serverId}:${channelId}`).emit('collab:invite', { sessionId, imageUrl, by, serverId, channelId });
     });
-    // Join a session and receive the current canvas state.
-    socket.on('collab:join', ({ sessionId, imageUrl } = {}) => {
-      if (!sessionId) return;
-      socket.join(`collab:${sessionId}`);
-      const sess = collabSessions[sessionId] || (collabSessions[sessionId] = { imageUrl, segments: [] });
+    // Join a session and receive the current canvas state. With a server and channel, the channel's
+    // session (asked of the database); without, a direct conversation's.
+    socket.on('collab:join', async ({ sessionId, imageUrl, serverId, channelId } = {}) => {
+      if (!validSessionId(sessionId)) return;
+      const scoped = serverId !== undefined || channelId !== undefined;
+      if (scoped && !(await mayCollabIn(socketUser, serverId, channelId))) { await refuseCollab(sessionId, serverId, channelId); return; }
+      const room = collabRoom(scoped ? serverId : undefined, scoped ? channelId : undefined, sessionId);
+      // One canvas at a time: the client shows one, and a stroke must not land on an old one too.
+      for (const r of [...socket.rooms]) if (r !== room && collabSessions[r]) socket.leave(r);
+      socket.join(room);
+      const sess = collabSessions[room] || (collabSessions[room] = { sessionId, imageUrl, segments: [], ...(scoped ? { serverId, channelId } : {}) });
       socket.emit('collab:state', { sessionId, segments: sess.segments });
     });
     // A drawn segment: store it and relay to everyone else in the session.
     socket.on('collab:draw', ({ sessionId, segment } = {}) => {
-      const sess = collabSessions[sessionId];
-      if (!sess || !segment || typeof segment !== 'object') return;
+      const joined = joinedCollab(sessionId);
+      if (!joined || !segment || typeof segment !== 'object') return;
+      const { room, sess } = joined;
       sess.segments.push(segment);
       if (sess.segments.length > 20000) sess.segments.splice(0, sess.segments.length - 20000); // cap memory
-      socket.to(`collab:${sessionId}`).emit('collab:draw', { segment });
+      socket.to(room).emit('collab:draw', { segment });
     });
     socket.on('collab:clear', ({ sessionId } = {}) => {
-      const sess = collabSessions[sessionId];
-      if (!sess) return;
-      sess.segments = [];
-      socket.to(`collab:${sessionId}`).emit('collab:clear');
+      const joined = joinedCollab(sessionId);
+      if (!joined) return;
+      joined.sess.segments = [];
+      socket.to(joined.room).emit('collab:clear');
     });
-    socket.on('collab:leave', ({ sessionId } = {}) => { if (sessionId) socket.leave(`collab:${sessionId}`); });
+    socket.on('collab:leave', ({ sessionId } = {}) => {
+      const joined = joinedCollab(sessionId);
+      if (joined) socket.leave(joined.room);
+    });
 
     // Voice signaling: simple mesh signaling via server
     // `mode` is how this client will carry its media ('sfu' or 'mesh', see VOICE_MODES) and

@@ -184,6 +184,15 @@ describe('email verification: an instance that can send email', () => {
       assert.deepEqual(await dbAll(server.dataDir, 'SELECT * FROM sounds'), []);
     });
 
+    test('HTTP: custom emoji and community apps, even in a server they own', async () => {
+      refused(await rookie.call('POST', `/servers/${rookieServerId}/emojis`, { url: '/uploads/1700000000000-cat.png', name: 'cat' }, rookie.token), 'a custom emoji');
+      refused(await rookie.call('POST', '/apps', { name: 'My app', url: 'https://example.com/' }, rookie.token), 'a link app');
+      refused(await rookie.call('POST', '/apps/bundle', pngUpload(), rookie.token), 'an app bundle');
+      refused(await rookie.call('PUT', '/apps/any-app/bundle', pngUpload(), rookie.token), 'replacing an app bundle');
+      assert.deepEqual(await dbAll(server.dataDir, 'SELECT * FROM server_emojis'), []);
+      assert.deepEqual(await dbAll(server.dataDir, "SELECT * FROM apps WHERE created_by = 'rookie'"), []);
+    });
+
     test('socket: a message to the public commons is refused, with the text handed back', async () => {
       const joined = once(rookieSocket, 'channel:joined');
       rookieSocket.emit('join', { serverId: 'demo', name: 'rookie' });

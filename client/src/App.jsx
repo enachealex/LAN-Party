@@ -29,7 +29,8 @@ import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSo
 import { findNewerBuild, alreadyReloadedFor, reloadForBuild } from './appUpdate'
 import { hostedAppFrame } from './appBridge'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
-import MobileInstallGate, { detectPlatform, isStandalone, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
+import MobileInstallGate, { detectPlatform, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
+import { detectInstallContext, findInstalledAndroidApp, androidAppIntentUrl } from './installContext'
 import MicTest from './components/MicTest'
 import ConnectionCheck from './components/ConnectionCheck'
 import VoiceConnectionPanel from './components/VoiceConnectionPanel'
@@ -664,7 +665,7 @@ function pinPreview(m) {
   return m.text || '(empty message)'
 }
 
-function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null, showPreviews = true, onRemovePreview }) {
+function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, setActiveReactionMessageId, onOpenMedia, emojiMap, onSaveEmoji, onEdit, onDelete, onCollab, onPin, onUnpin, onForward, onReply, isPinned, quickReactions = MESSAGE_REACTIONS, skinTones, authorColor = null, showPreviews = true, onRemovePreview, isBlockedAuthor = null }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuPos, setMenuPos] = useState(null) // { left, top } for the portal menu
   const [reactionPickerPos, setReactionPickerPos] = useState(null) // { left, top } for the full-library picker
@@ -891,15 +892,28 @@ function ChatMessage({ message, currentUser, onReact, activeReactionMessageId, s
           {!isOutgoing && <div className="msg-author" style={authorColor ? { color: authorColor } : undefined}>{message.author}</div>}
           {Array.isArray(message.quotes) && message.quotes.length > 0 && (
             <div className="msg-quotes">
-              {message.quotes.map((q, i) => (
-                <div className="msg-quote" key={`${q.id ?? 'q'}-${i}`}>
-                  <div className="msg-quote-head">
-                    <span className="msg-quote-author">{q.author}</span>
-                    {formatMessageTime(q.ts) && <span className="msg-quote-time">{formatMessageTime(q.ts)}</span>}
+              {message.quotes.map((q, i) => {
+                const key = `${q.id ?? 'q'}-${i}`
+                const quote = (
+                  <div className="msg-quote" key={key}>
+                    <div className="msg-quote-head">
+                      <span className="msg-quote-author">{q.author}</span>
+                      {formatMessageTime(q.ts) && <span className="msg-quote-time">{formatMessageTime(q.ts)}</span>}
+                    </div>
+                    <QuoteBody text={q.text} className="msg-quote-text" />
                   </div>
-                  <QuoteBody text={q.text} className="msg-quote-text" />
-                </div>
-              ))}
+                )
+                // A quote is a snapshot of someone's words inside another person's message, so the
+                // server cannot mark it per reader the way it marks a message. Collapsed here, from
+                // the reader's own block list, exactly like a message from that person. Clicks on
+                // its Show/Hide stay inside it: the bubble around it toggles the timestamp.
+                if (!isBlockedAuthor || !isBlockedAuthor(q.author)) return quote
+                return (
+                  <div key={key} className="msg-quote-blocked" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                    <BlockedMessage author={q.author}>{quote}</BlockedMessage>
+                  </div>
+                )
+              })}
             </div>
           )}
           {editing ? (
@@ -1161,6 +1175,9 @@ export default function App() {
   const [collab, setCollab] = useState(null)
   const [collabInvite, setCollabInvite] = useState(null)
   const collabCanvasRef = useRef(null)
+  // The open session's id, for the socket handlers (bound once, so they cannot read `collab`).
+  const collabSessionRef = useRef(null)
+  collabSessionRef.current = collab ? collab.sessionId : null
   const [voiceRailTarget, setVoiceRailTarget] = useState(null) // 'home' | server id when in voice
   // Refs mirror socket + local stream so WebRTC callbacks never read stale closure state.
   const socketRef = useRef(null)
@@ -1199,8 +1216,22 @@ export default function App() {
   ])
   const [deferredPrompt, setDeferredPrompt] = useState(null)
   const [showInstallPanel, setShowInstallPanel] = useState(false)
-  // Hide browser "Download App" / PWA install UI when already running inside the Electron desktop shell.
-  const isDesktopApp = typeof window !== 'undefined' && !!window.desktop?.isElectron
+  // Where this page runs (installContext.ts). Inside any installed app (the Android app, the
+  // Windows app, an installed web app) no download or install prompt is shown at all. In a phone
+  // browser that has the Android app, the prompt becomes "Open in the app". Read once, at the
+  // first render: it also records the Android app's launch, which only the first document can see.
+  const [installContext] = useState(detectInstallContext)
+  const inInstalledApp = installContext.installedIn !== null
+  // The browser's own answer (getInstalledRelatedApps), which arrives a moment later.
+  const [androidAppReported, setAndroidAppReported] = useState(false)
+  const androidAppOnDevice = !inInstalledApp && (installContext.androidAppOnDevice || androidAppReported)
+  const hideDownloadPrompts = inInstalledApp || androidAppOnDevice
+  useEffect(() => {
+    if (inInstalledApp || !detectPlatform().isAndroid) return undefined
+    let cancelled = false
+    findInstalledAndroidApp().then((found) => { if (found && !cancelled) setAndroidAppReported(true) })
+    return () => { cancelled = true }
+  }, [inInstalledApp])
   // Settings panel: the long editors stay collapsed so the panel reads as a summary until the user
   // opts into editing. Each closes again on its own button.
   const [editGenresOpen, setEditGenresOpen] = useState(false)
@@ -1490,6 +1521,9 @@ export default function App() {
   const [mentionDismissedFor, setMentionDismissedFor] = useState(null)
   // Pinned messages of the currently-viewed channel, newest pin first (from pins:updated).
   const [channelPins, setChannelPins] = useState([])
+  // Pinned messages from someone I blocked that I chose to see anyway (by message id), shared by the
+  // pin bar and the pins list so "Show" in one is shown in the other.
+  const [revealedPins, setRevealedPins] = useState(() => new Set())
   const [showPinsModal, setShowPinsModal] = useState(false)   // "View Pins" list
   const [pinBarMenu, setPinBarMenu] = useState(null)          // right-click menu on the pin bar: {x,y}
   // Opened by right-click on desktop and long-press on touch, so both paths share one definition
@@ -2607,7 +2641,7 @@ export default function App() {
       playUiSound('success')
       setToast('Entrance sound saved')
     } catch (err) {
-      alert(err.message || 'Could not save the entrance clip')
+      showError(err.message || 'Could not save the entrance clip')
     } finally {
       setEntranceBusy(false)
     }
@@ -4070,10 +4104,20 @@ export default function App() {
     refreshIceServers(true)
 
     // Collaborative image editing
-    s.on('collab:invite', ({ sessionId, imageUrl, by }) => setCollabInvite({ sessionId, imageUrl, by }))
+    s.on('collab:invite', ({ sessionId, imageUrl, by, serverId, channelId }) => setCollabInvite({ sessionId, imageUrl, by, serverId, channelId }))
     s.on('collab:state', ({ segments }) => collabCanvasRef.current?.loadSegments(segments || []))
     s.on('collab:draw', ({ segment }) => collabCanvasRef.current?.drawSegment(segment))
     s.on('collab:clear', () => collabCanvasRef.current?.clearCanvas())
+    // Refused at the door, or taken out (timed out, or no longer allowed in that channel). What is
+    // drawn from here on would reach nobody, so the canvas closes and says why.
+    s.on('collab:removed', ({ sessionId, reason, until } = {}) => {
+      setCollabInvite((inv) => (inv && inv.sessionId === sessionId ? null : inv))
+      if (!sessionId || collabSessionRef.current !== sessionId) return
+      setCollab(null)
+      setToast(reason === 'timeout'
+        ? `You are timed out here${typeof until === 'number' ? ` until ${formatMoment(until)}` : ''}, so you can't edit images together`
+        : 'You no longer have access to that shared image')
+    })
   }
 
   // First-login onboarding: show the welcome + gaming-profile flow only for brand-new accounts.
@@ -4292,7 +4336,12 @@ export default function App() {
 
   // Start deactivation from Settings → emails a confirmation link.
   const requestDeactivate = async () => {
-    if (!window.confirm('Delete your account? We’ll email a confirmation link. Confirming permanently deletes your account and all its data.')) return
+    const ok = await askConfirm({
+      title: 'Delete your account?',
+      message: 'We’ll email you a confirmation link, valid for one hour. Nothing is deleted until you open it and confirm. Confirming permanently deletes your account and all its data, and that cannot be undone.',
+      submitLabel: 'Email me the link',
+    })
+    if (!ok) return
     try {
       const t = token || localStorage.getItem('lanparty_token')
       const res = await fetch(`${SERVER_URL}/account/deactivate`, { method: 'POST', headers: { Authorization: `Bearer ${t}` } })
@@ -4373,6 +4422,25 @@ export default function App() {
       resolve,
     })
   })
+  // The same modal with a single OK: in place of window.alert (which also does nothing in the
+  // desktop app) for a message that has to be read before carrying on, such as how to unblock
+  // notifications. Anything shorter, like a refusal from the server, is a toast (showError).
+  const askNotice = (opts = {}) => new Promise((resolve) => {
+    setPromptModal({
+      title: opts.title || 'Notice',
+      message: opts.message || '',
+      confirmOnly: true,
+      noticeOnly: true,
+      submitLabel: opts.submitLabel || 'OK',
+      resolve,
+    })
+  })
+  // An error or warning for the user: the toast, with the error sound every window.alert used to
+  // make (the app wrapped alert() to beep on all of them).
+  const showError = (message) => {
+    playUiSound('error')
+    setToast(message)
+  }
 
   const createServer = async () => {
     const serverName = ((await askPrompt({ title: 'Create a server', label: 'Server name', placeholder: 'e.g. Game Night', submitLabel: 'Create' })) || '').trim()
@@ -4385,7 +4453,7 @@ export default function App() {
       await loadServers()
       handleSelectServer(data.server.id)
     } catch (err) {
-      alert(err.message || 'Could not create server')
+      showError(err.message || 'Could not create server')
     }
   }
 
@@ -4410,7 +4478,7 @@ export default function App() {
       // server:state broadcast updates the sidebar; jump into new text channels right away
       if (type === 'text') joinChannel(data.channel.id)
     } catch (err) {
-      alert(err.message || 'Could not create channel')
+      showError(err.message || 'Could not create channel')
     }
   }
 
@@ -4446,13 +4514,18 @@ export default function App() {
     const name2 = ((await askPrompt({ title: 'Rename server', label: 'Server name', initial: oldName || '', submitLabel: 'Rename' })) || '').trim()
     if (!name2 || name2 === oldName) return
     const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) })
-    if (!res.ok) alert((await res.json()).error || 'Rename failed')
+    if (!res.ok) showError((await res.json().catch(() => ({}))).error || 'Rename failed')
   }
 
   const deleteServer = async (serverId, serverName2) => {
-    if (!window.confirm(`Delete "${serverName2}"? All of its channels and messages will be permanently removed.`)) return
+    const ok = await askConfirm({
+      title: `Delete “${serverName2}”?`,
+      message: 'The server, all of its channels and every message in them are permanently removed for everyone in it. This cannot be undone.',
+      submitLabel: 'Delete server',
+    })
+    if (!ok) return
     const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' })
-    if (!res.ok) { alert((await res.json()).error || 'Delete failed'); return }
+    if (!res.ok) { showError((await res.json().catch(() => ({}))).error || 'Delete failed'); return }
     if (selectedServerId === serverId) setSelectedServerId('home')
   }
 
@@ -4478,13 +4551,19 @@ export default function App() {
     const name2 = ((await askPrompt({ title: 'Rename channel', label: 'Channel name', initial: oldName || '', submitLabel: 'Rename' })) || '').trim()
     if (!name2 || name2 === oldName) return
     const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/channels/${encodeURIComponent(channelId)}`, { method: 'PATCH', body: JSON.stringify({ name: name2 }) })
-    if (!res.ok) alert((await res.json()).error || 'Rename failed')
+    if (!res.ok) showError((await res.json().catch(() => ({}))).error || 'Rename failed')
   }
 
   const deleteChannel = async (channelId, chName) => {
-    if (!window.confirm(`Delete #${chName}? Its messages will be permanently removed.`)) return
-    const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/channels/${encodeURIComponent(channelId)}`, { method: 'DELETE' })
-    if (!res.ok) alert((await res.json()).error || 'Delete failed')
+    const sid = currentServerId() // read before the question: the answer is about this server
+    const ok = await askConfirm({
+      title: `Delete #${chName}?`,
+      message: 'The channel and every message in it are permanently removed for everyone in the server. This cannot be undone.',
+      submitLabel: 'Delete channel',
+    })
+    if (!ok) return
+    const res = await authedFetch(`/servers/${encodeURIComponent(sid)}/channels/${encodeURIComponent(channelId)}`, { method: 'DELETE' })
+    if (!res.ok) showError((await res.json().catch(() => ({}))).error || 'Delete failed')
   }
 
   // ---- Categories, channel order and roles. Each asks the server and shows its answer if it is
@@ -4586,9 +4665,14 @@ export default function App() {
     setToast(joined.alreadyMember ? `You’re already in ${joined.server.name}` : `Joined ${joined.server.name}`)
   }
   const leaveServer = async (serverId, serverName2) => {
-    if (!window.confirm(`Leave "${serverName2}"? You'll need a new invite to rejoin.`)) return
+    const ok = await askConfirm({
+      title: `Leave “${serverName2}”?`,
+      message: 'You stop seeing its channels straight away. To come back you need an invite link or to be added again by someone who can invite. Any invite links you made for it stop working.',
+      submitLabel: 'Leave server',
+    })
+    if (!ok) return
     const res = await authedFetch(`/servers/${encodeURIComponent(serverId)}/leave`, { method: 'POST' })
-    if (!res.ok) { alert((await res.json()).error || 'Could not leave'); return }
+    if (!res.ok) { showError((await res.json().catch(() => ({}))).error || 'Could not leave'); return }
     if (selectedServerId === serverId) setSelectedServerId('home')
   }
   // Kick: out now, and an admin can simply invite them back. Asked in-app (window.confirm does
@@ -4691,7 +4775,7 @@ export default function App() {
   const setMemberRole = async (username, role) => {
     const res = await authedFetch(`/servers/${encodeURIComponent(currentServerId())}/members/${encodeURIComponent(username)}`, { method: 'PATCH', body: JSON.stringify({ role }) })
     if (res.ok) setToast(`${username} is now ${role === 'admin' ? 'an admin' : 'a member'}`)
-    else alert((await res.json()).error || 'Could not change role')
+    else showError((await res.json().catch(() => ({}))).error || 'Could not change role')
   }
 
   // ---- Direct 1:1 friend calls (WebRTC, separate from server voice channels) ----
@@ -4747,7 +4831,7 @@ export default function App() {
     if (!emailVerified) { setToast(VERIFY_FIRST); return }
     let stream
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: withVideo }) }
-    catch (e) { alert('Microphone access is required to call.'); return }
+    catch (e) { showError('Microphone access is required to call.'); return }
     callLocalStreamRef.current = stream
     await refreshIceServers()
     setCall({ status: 'outgoing', peer: peerUsername, peerSocket: null, video: withVideo })
@@ -4987,14 +5071,11 @@ export default function App() {
     const onKeyDown = () => unlockUiSounds()
     document.addEventListener('pointerdown', onPointerDown, true)
     document.addEventListener('keydown', onKeyDown, true)
-    // Every alert() in the app is an error/warning to the user, so beep on all of them. Wrap rather
-    // than touch dozens of call sites; restore the original on unmount.
-    const origAlert = window.alert
-    window.alert = (...args) => { playUiSound('error'); return origAlert.apply(window, args) }
+    // Errors used to go through window.alert, wrapped here to beep. The app no longer calls it (it
+    // does nothing in the desktop app); showError makes the same sound with a toast instead.
     return () => {
       document.removeEventListener('pointerdown', onPointerDown, true)
       document.removeEventListener('keydown', onKeyDown, true)
-      window.alert = origAlert
     }
   }, [])
 
@@ -5038,10 +5119,18 @@ export default function App() {
       stopPush(authedFetch)
       return
     }
-    if (typeof Notification === 'undefined') { alert('This browser does not support desktop notifications.'); return }
+    if (typeof Notification === 'undefined') { showError('This browser does not support desktop notifications.'); return }
     let perm = Notification.permission
     if (perm === 'default') perm = await Notification.requestPermission()
-    if (perm !== 'granted') { alert('Notifications are blocked for this site — allow them in your browser settings, then try again.'); return }
+    if (perm !== 'granted') {
+      // Instructions, not just a refusal: kept on screen until it has been read.
+      playUiSound('error')
+      await askNotice({
+        title: 'Notifications are blocked',
+        message: 'Notifications are blocked for this site. Allow them in your browser settings, then turn this on again.',
+      })
+      return
+    }
     setNotifyEnabled(true)
     localStorage.setItem('lanparty_notify', '1')
     // Registering for push happens in the effect below, the same way it does at login.
@@ -5475,7 +5564,7 @@ export default function App() {
         localStreamRef.current = s
         setLocalStream(s)
       } catch (err) {
-        alert('Microphone access denied')
+        showError('Microphone access denied')
         return
       }
     }
@@ -5704,7 +5793,12 @@ export default function App() {
   const removeFriend = async (friend) => {
     const username = friend?.peerUsername || friend?.name
     if (!username) return
-    if (!window.confirm(`Remove ${username} from your friends? You can send them a new request later.`)) return
+    const ok = await askConfirm({
+      title: `Remove ${username} from your friends?`,
+      message: 'You stop being friends on both sides. Your message history is kept, and either of you can send a new friend request later.',
+      submitLabel: 'Remove friend',
+    })
+    if (!ok) return
     try {
       const res = await authedFetch(`/friends/${encodeURIComponent(username)}`, { method: 'DELETE' })
       if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || 'Could not remove friend') }
@@ -5721,7 +5815,7 @@ export default function App() {
   // --- External streams (Twitch / YouTube / Kik) ---
   const announceStream = () => {
     const f = announceForm
-    if (!f.channel.trim()) { alert('Enter your channel name or stream link first.') ; return }
+    if (!f.channel.trim()) { showError('Enter your channel name or stream link first.'); return }
     socketRef.current?.emit('stream:announce', { platform: f.platform, channel: f.channel.trim(), title: f.title.trim(), game: f.game.trim(), genres: userSettings?.gamingProfile?.genres || [] })
     setMyExternalStream({ ...f })
     setShowAnnounceForm(false)
@@ -6657,6 +6751,18 @@ export default function App() {
   // Is this a message to collapse? The server marks the ones written by someone I had blocked when
   // it sent them (`blocked`); the block list covers what was already on screen when I blocked them.
   const isBlockedMessage = (m) => Boolean(m && m.author && m.author !== name && (m.blocked || blockedNames.has(m.author)))
+  // The same question for a name alone: an author quoted inside someone else's message, or the
+  // author of a pinned message. Neither carries a mark from the server (a quote is a snapshot in
+  // another person's message; pins are sent to the whole channel at once), so the block list
+  // decides, which also means a block or unblock takes effect on them at once.
+  const isBlockedName = (author) => Boolean(author && author !== name && blockedNames.has(author))
+  // A pin from someone I blocked, shown only once "Show" is pressed on it (revealedPins).
+  const setPinRevealed = (id, shown) => setRevealedPins((prev) => {
+    const next = new Set(prev)
+    if (shown) next.add(id); else next.delete(id)
+    return next
+  })
+  const pinHidden = (p) => isBlockedMessage(p) && !revealedPins.has(p.id)
   // My own timeout in the server on screen, while it lasts: what puts the banner where the message box is.
   const activeTimeout = !isHomeView && myTimeouts[selectedServerId]?.until > moderationNow ? myTimeouts[selectedServerId] : null
   const membersPanelUsers = isHomeView ? groupParticipants : serverMembers
@@ -6793,7 +6899,12 @@ export default function App() {
 
   const leaveGroup = async (group) => {
     if (!group) return
-    if (!window.confirm(`Leave ${group.name}? You won't see its messages any more unless someone adds you back.`)) return
+    const ok = await askConfirm({
+      title: `Leave ${group.name}?`,
+      message: 'You stop seeing it and its messages, unless someone in it adds you back.',
+      submitLabel: 'Leave group',
+    })
+    if (!ok) return
     const me = localStorage.getItem('lanparty_user') || name
     leavingGroupsRef.current.add(String(group.id))
     try {
@@ -6808,7 +6919,12 @@ export default function App() {
 
   const removeFromGroup = async (groupId, username) => {
     if (!groupId || !username) return
-    if (!window.confirm(`Remove ${username} from this group?`)) return
+    const ok = await askConfirm({
+      title: `Remove ${username} from this group?`,
+      message: 'They stop seeing the group and its messages. Anyone in the group can add them back later.',
+      submitLabel: 'Remove',
+    })
+    if (!ok) return
     try {
       await groupRequest('DELETE', `/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(username)}`)
     } catch (err) {
@@ -6916,18 +7032,24 @@ export default function App() {
 
   // ---- Collaborative image editing ----
   // Session is keyed by the (absolute) image URL, so anyone opening the same image collaborates.
+  // In a channel it is that channel's session: the server only lets in people who may use the
+  // channel right now (not someone timed out in the server), so the channel goes with every join.
+  // From a direct conversation there is no channel, and the server keeps that session apart.
   const startCollab = (imageUrl) => {
     if (!imageUrl || !socket) return
+    const scope = showHomeChat ? {} : { serverId: currentServerId(), channelId: activeChannel }
     setCollab({ sessionId: imageUrl, imageUrl })
     setCollabInvite(null)
-    socket.emit('collab:join', { sessionId: imageUrl, imageUrl })
-    if (!showHomeChat) socket.emit('collab:start', { serverId: currentServerId(), channelId: activeChannel, sessionId: imageUrl, imageUrl })
+    socket.emit('collab:join', { sessionId: imageUrl, imageUrl, ...scope })
+    if (!showHomeChat) socket.emit('collab:start', { ...scope, sessionId: imageUrl, imageUrl })
   }
   const joinCollab = (invite) => {
     if (!invite?.sessionId || !socket) return
     setCollab({ sessionId: invite.sessionId, imageUrl: invite.imageUrl })
     setCollabInvite(null)
-    socket.emit('collab:join', { sessionId: invite.sessionId, imageUrl: invite.imageUrl })
+    // An invitation always comes from a channel; an older server sent it without one.
+    const scope = invite.serverId && invite.channelId ? { serverId: invite.serverId, channelId: invite.channelId } : {}
+    socket.emit('collab:join', { sessionId: invite.sessionId, imageUrl: invite.imageUrl, ...scope })
   }
   const closeCollab = () => {
     if (collab && socket) socket.emit('collab:leave', { sessionId: collab.sessionId })
@@ -7572,6 +7694,7 @@ export default function App() {
       })
       const data = await res.json()
       if (res.ok) setServerEmojis((prev) => ({ ...prev, [serverId]: data.emojis || [] }))
+      else showError(data.error || 'Could not remove that emoji')
     } catch (err) {
       console.warn('deleteServerEmoji failed', err)
     }
@@ -8245,9 +8368,10 @@ export default function App() {
     !regUsernameError &&
     !regEmailError;
 
-  // Steer phones/tablets to the installed app. Skipped in the Electron shell, when already running
-  // standalone (installed), and once the user opts to continue in the browser for this session.
-  const showInstallGate = !isDesktopApp && !isStandalone() && !installedNow && !installGateSkipped
+  // Steer phones/tablets to the installed app. Skipped inside any installed app (installContext.ts)
+  // and once the user opts to continue in the browser for this session. On a phone that already has
+  // the Android app it offers to open it rather than to install anything.
+  const showInstallGate = !inInstalledApp && !installedNow && !installGateSkipped
     && detectPlatform().isMobile
 
   return (
@@ -8299,6 +8423,7 @@ export default function App() {
       {showInstallGate && (
         <MobileInstallGate
           deferredPrompt={deferredPrompt}
+          androidAppOnDevice={androidAppOnDevice}
           onInstalled={() => setInstalledNow(true)}
           onDismiss={() => { rememberInstallGateDismissed(); setInstallGateSkipped(true) }}
         />
@@ -8456,7 +8581,11 @@ export default function App() {
                         <path d="M15.5 15.5 21 21" />
                       </svg>
                     </button>
-                    {!isDesktopApp && (
+                    {/* Phone browser with the Android app on it: open that, don't download it again. */}
+                    {androidAppOnDevice && detectPlatform().isAndroid && (
+                      <a className="create-app-btn" href={androidAppIntentUrl()}>Open in the app</a>
+                    )}
+                    {!hideDownloadPrompts && (
                       <button className="create-app-btn" onClick={() => {
                         if (deferredPrompt) {
                           deferredPrompt.prompt()
@@ -8523,6 +8652,7 @@ export default function App() {
                         onForward={openForward}
                         showPreviews={showLinkPreviews}
                         onRemovePreview={removeHomePreview}
+                        isBlockedAuthor={homeChat.type === 'group' ? isBlockedName : null}
                       />
                     )
                     // In a group, a message from someone I blocked is collapsed behind "Show". Not in
@@ -8553,23 +8683,42 @@ export default function App() {
 
           {!isHomeView && activeChannelType === 'text' && (
             <>
-              {channelPins.length > 0 && (
-                <button
-                  type="button"
-                  className="pin-bar"
-                  onClick={() => jumpToMessage(channelPins[0].id)}
-                  onContextMenu={openPinBarMenu}
-                  {...longPressProps(openPinBarMenu)}
-                  title="Tap to view · long-press (or right-click) for options"
-                >
-                  <span className="pin-bar-icon">📌</span>
-                  <span className="pin-bar-body">
-                    <span className="pin-bar-author">{channelPins[0].author}</span>
-                    <span className="pin-bar-text">{pinPreview(channelPins[0])}</span>
-                  </span>
-                  {channelPins.length > 1 && <span className="pin-bar-count">{channelPins.length} pins</span>}
-                </button>
-              )}
+              {channelPins.length > 0 && (() => {
+                const top = channelPins[0]
+                // From someone I blocked: collapsed like the message itself, naming nobody, with
+                // Show beside the bar (a button cannot hold another button).
+                const hidden = pinHidden(top)
+                const bar = (
+                  <button
+                    type="button"
+                    className="pin-bar"
+                    onClick={() => jumpToMessage(top.id)}
+                    onContextMenu={openPinBarMenu}
+                    {...longPressProps(openPinBarMenu)}
+                    title="Tap to view · long-press (or right-click) for options"
+                  >
+                    <span className="pin-bar-icon">📌</span>
+                    <span className="pin-bar-body">
+                      {hidden
+                        ? <span className="pin-bar-text">Blocked message</span>
+                        : <>
+                            <span className="pin-bar-author">{top.author}</span>
+                            <span className="pin-bar-text">{pinPreview(top)}</span>
+                          </>}
+                    </span>
+                    {channelPins.length > 1 && <span className="pin-bar-count">{channelPins.length} pins</span>}
+                  </button>
+                )
+                if (!isBlockedMessage(top)) return bar
+                return (
+                  <div className="pin-bar-row">
+                    {bar}
+                    <button type="button" className="blocked-msg-toggle pin-bar-reveal" onClick={() => setPinRevealed(top.id, hidden)}>
+                      {hidden ? 'Show' : 'Hide'}
+                    </button>
+                  </div>
+                )
+              })()}
               <div ref={messagesListRef} className={`${messages.length === 0 ? 'messages empty' : 'messages'} flow-${messageFlow}`}>
                 {messages.length === 0 ? (
                   <div className="empty-state">
@@ -8605,6 +8754,7 @@ export default function App() {
                         authorColor={nameColors.get(m.author) || null}
                         showPreviews={showLinkPreviews}
                         onRemovePreview={removeChannelPreview}
+                        isBlockedAuthor={isBlockedName}
                       />
                     )
                     // From someone I blocked: collapsed behind "Show", one message at a time.
@@ -9073,16 +9223,30 @@ export default function App() {
             </div>
             <div className="pins-list">
               {channelPins.length === 0 && <div className="pins-empty">No pinned messages.</div>}
-              {channelPins.map((p) => (
-                <div key={p.id} className="pins-item">
-                  <button type="button" className="pins-item-main" onClick={() => jumpToMessage(p.id)}>
-                    <span className="pins-item-author">{p.author}</span>
-                    <span className="pins-item-text">{pinPreview(p)}</span>
-                    {p.pinnedBy && <span className="pins-item-by">pinned by {p.pinnedBy}</span>}
-                  </button>
-                  <button type="button" className="pins-item-unpin" title="Unpin" onClick={() => unpinMessage(p.id)}>✖</button>
-                </div>
-              ))}
+              {channelPins.map((p) => {
+                // From someone I blocked: "Blocked message" until Show, as in the channel itself.
+                const blocked = isBlockedMessage(p)
+                const hidden = blocked && !revealedPins.has(p.id)
+                return (
+                  <div key={p.id} className="pins-item">
+                    <button type="button" className="pins-item-main" onClick={() => jumpToMessage(p.id)}>
+                      {hidden
+                        ? <span className="pins-item-text blocked-msg-label">Blocked message</span>
+                        : <>
+                            <span className="pins-item-author">{p.author}</span>
+                            <span className="pins-item-text">{pinPreview(p)}</span>
+                          </>}
+                      {p.pinnedBy && <span className="pins-item-by">pinned by {p.pinnedBy}</span>}
+                    </button>
+                    {blocked && (
+                      <button type="button" className="pins-item-reveal blocked-msg-toggle" onClick={() => setPinRevealed(p.id, hidden)}>
+                        {hidden ? 'Show' : 'Hide'}
+                      </button>
+                    )}
+                    <button type="button" className="pins-item-unpin" title="Unpin" onClick={() => unpinMessage(p.id)}>✖</button>
+                  </div>
+                )
+              })}
             </div>
           </div>
         </div>,
@@ -9824,9 +9988,10 @@ export default function App() {
               </>
             )}
             <div className="prompt-actions">
-              {/* A question opens on Cancel: Enter or Space must not confirm something by reflex. */}
-              <button className="prompt-btn ghost" autoFocus={!!promptModal.confirmOnly} onClick={() => resolvePrompt(null)}>Cancel</button>
-              <button className="prompt-btn primary" onClick={() => resolvePrompt(promptModal.confirmOnly ? true : promptValue)}>{promptModal.submitLabel}</button>
+              {/* A question opens on Cancel: Enter or Space must not confirm something by reflex.
+                  A notice (askNotice) has nothing to cancel, so it has only OK, focused. */}
+              {!promptModal.noticeOnly && <button className="prompt-btn ghost" autoFocus={!!promptModal.confirmOnly} onClick={() => resolvePrompt(null)}>Cancel</button>}
+              <button className="prompt-btn primary" autoFocus={!!promptModal.noticeOnly} onClick={() => resolvePrompt(promptModal.confirmOnly ? true : promptValue)}>{promptModal.submitLabel}</button>
             </div>
           </div>
         </div>
@@ -9890,7 +10055,7 @@ export default function App() {
 
             {/* Links are minted by owner/admins only; the server enforces it, this just hides the controls. */}
             {inviteModalIsStaff && (emailVerified
-              ? <InviteLinkSection serverId={inviteModal.serverId} authedFetch={authedFetch} />
+              ? <InviteLinkSection serverId={inviteModal.serverId} authedFetch={authedFetch} askConfirm={askConfirm} />
               : <p className="profile-settings-note" role="status">{VERIFY_FIRST} Then you can invite people and create invite links.</p>)}
 
             <div className="invite-actions">
@@ -10013,8 +10178,8 @@ export default function App() {
         }}
       />
 
-      {/* Install panel (fallback) */}
-      <div className={`members-panel install-panel ${showInstallPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showInstallPanel}>
+      {/* Install panel (fallback). Not even in the page where the app is already installed. */}
+      {!hideDownloadPrompts && <div className={`members-panel install-panel ${showInstallPanel ? 'open' : ''}`} role="dialog" aria-hidden={!showInstallPanel}>
         <div className="members-panel-header">
           <div>Install LAN Party</div>
           <button className="members-close" onClick={() => setShowInstallPanel(false)}>✕</button>
@@ -10030,7 +10195,7 @@ export default function App() {
           </a>
           <p className="install-panel-note">Or install it from your browser: look for “Install app” in the address bar or the browser menu.</p>
         </div>
-      </div>
+      </div>}
 
       {/* Profile / Settings — centered modal */}
       <div className={`auth-overlay ${showSettingsPanel ? 'open' : ''}`} onClick={() => setShowSettingsPanel(false)} />
