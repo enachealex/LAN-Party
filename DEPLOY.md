@@ -186,7 +186,7 @@ Set in `ecosystem.config.cjs` on the host. Integrations also accept a key file i
 | `INSTANCE_OWNERS` | Optional. Comma-separated usernames who run the instance; today that means approving uploaded apps for the public app directory. When set and non-empty it replaces the default, which is the oldest account (lowest `users.id`). **The accounts must already exist**, spelled exactly as registered (case matters): a listed name that no account has makes nobody an owner and is logged as a warning at every boot. A listed name is reserved in any capitalisation — it cannot be registered or renamed into — and the list does not follow a rename, so a listed account cannot change its username until this variable is changed (then restart). |
 | `PUBLIC_APP_URL` | Public base URL for links the server hands out, e.g. feedback screenshots in Vaultline tickets |
 | `SFU_ANNOUNCED_IPS`, `SFU_PORT`, `SFU_DISABLED`, `SFU_ADDRESS_CHECK` | Voice networking, above |
-| `STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build |
+| `STUN_URLS`, `TURN_URLS`, `TURN_SECRET`, `TURN_TTL_SECONDS` | ICE servers handed to clients via `/webrtc/ice`; changing them needs no client build. With `TURN_SECRET` (the relay's `static-auth-secret`) every signed-in person gets their own relay credential that expires after `TURN_TTL_SECONDS` (default a day); nobody without a session gets one. `TURN_USERNAME` / `TURN_CREDENTIAL` are the older fixed credential, used only without `TURN_SECRET`. See "TURN relay" below |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | Web Push (notifications while the app is closed). All optional: with none set, a keypair is generated on first boot and kept in `DATA_DIR/vapid.json`, and the subject is `mailto:admin@<CLIENT_ORIGIN host>`. See below. |
 | `LINK_PREVIEWS` | Optional. Set to `0` to stop the server fetching the pages people link to (the preview cards under messages). On when unset. See "Link previews" below. |
 | `LINK_PREVIEW_DEBUG` | Optional. Set to anything to log why a link got no preview, or a preview no image: one line with the host name and a short reason code (`[link-preview] no preview: example.com (timeout)`). Never the rest of the URL, and nothing about who posted it. Off when unset. |
@@ -316,3 +316,26 @@ private services:
 
 SQLite on local disk means one host, by design. High availability would mean Postgres plus object
 storage.
+
+## TURN relay
+
+coturn runs on the host as a system service (`systemctl status coturn`, config `/etc/turnserver.conf`,
+root:turnserver 640) and relays calls for people whose networks cannot reach each other or the voice
+server directly.
+
+- **Listens only on the home-network address** (`listening-ip` / `relay-ip`), on 3478 UDP+TCP, with
+  relay ports 49160-49200 UDP. `external-ip` is the home's public address, the same one
+  `SFU_ANNOUNCED_IPS` starts with: if the public address changes, update both.
+- **Credentials:** shared-secret mode (`lt-cred-mech` + `use-auth-secret` + `static-auth-secret`; the
+  shared-secret mode does not work without `lt-cred-mech`). The same secret is `TURN_SECRET` in the
+  host-only ecosystem file. Rotate by changing both and restarting both.
+- **Never relays into private space:** `denied-peer-ip` covers the home network, this box's Docker
+  bridges and loopback, Tailscale's 100.64/10, link-local and every other non-public range. Check after
+  any change: an allocation that asks for a 192.168.x peer must answer `403 (Forbidden IP)`.
+- **Reachability needs the firewall and the router**, both outside the app: `ufw` allows for 3478 udp/tcp
+  and 49160:49200/udp, and router forwards for the same to the host. Until then the relay works for
+  nobody; the in-app "Check connection" says whether this browser got a relayed address.
+- Test from the host without printing the secret: compute a credential with
+  `openssl dgst -sha1 -hmac "$SECRET" -binary | base64` over `"<expiry>:selftest"` and run
+  `turnutils_uclient -n 1 -m 1 -e <public ip> -r 9 -u <user> -w <pass> 192.168.0.163`
+  (`-e` is needed: the relay refuses `-y`'s private peers by design).

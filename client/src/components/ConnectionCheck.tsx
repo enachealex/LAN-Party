@@ -9,6 +9,8 @@ interface Props {
   socket: Socket | null
   /** GET /webrtc/diagnostics with the caller's sign-in; null when it cannot be had. */
   getDiagnostics: () => Promise<ServerDiagnostics | null>
+  /** The ICE servers a call would use (with this account's relay credential), for the relay test. */
+  getIceServers?: () => Promise<RTCIceServer[] | null>
   /** 'link' sits under the pre-join microphone test; 'button' is the Settings section. */
   variant?: 'button' | 'link'
 }
@@ -18,7 +20,7 @@ interface Props {
  * work?" — not whether the mic is heard, but whether this network can carry a call at all, and by
  * which route. Runs without joining a room, opens no device and plays nothing.
  */
-export default function ConnectionCheck({ socket, getDiagnostics, variant = 'button' }: Props) {
+export default function ConnectionCheck({ socket, getDiagnostics, getIceServers, variant = 'button' }: Props) {
   const [running, setRunning] = useState(false)
   const [report, setReport] = useState<CheckReport | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -32,7 +34,7 @@ export default function ConnectionCheck({ socket, getDiagnostics, variant = 'but
     if (!socket || !socket.connected) { setError('Not connected to the server right now. Try again in a moment.'); return }
     setRunning(true)
     try {
-      const found = await measureConnection(socket, getDiagnostics)
+      const found = await measureConnection(socket, getDiagnostics, getIceServers)
       if (alive.current) setReport(describeConnection(found))
     } catch (_) {
       if (alive.current) setError('The check could not be completed.')

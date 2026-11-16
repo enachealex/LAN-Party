@@ -24,6 +24,8 @@ export interface CheckFindings {
   tcp: ProbeOutcome
   /** true/false: a STUN server did / did not return a public address. null: none to ask. */
   stun: boolean | null
+  /** true/false: the relay did / did not hand out a relayed address. null: no relay to try. */
+  relay: boolean | null
 }
 
 export type CheckStatus = 'pass' | 'fail' | 'skip'
@@ -57,17 +59,49 @@ export function stunReturnsPublicAddress(urls: string[], timeoutMs = 5000): Prom
   })
 }
 
+/**
+ * Ask the TURN relay for a relayed address with this account's credential. A 'relay' candidate comes
+ * back only when the relay was reached AND accepted the credential, so this is the real test of it,
+ * not just whether one is configured. Only relay servers are given, so nothing else can answer.
+ */
+export function relayHandsOutAddress(servers: RTCIceServer[], timeoutMs = 7000): Promise<boolean> {
+  return new Promise((resolve) => {
+    let pc: RTCPeerConnection
+    try { pc = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: 'relay' }) } catch { resolve(false); return }
+    let done = false
+    const finish = (found: boolean) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { pc.close() } catch { /* already closed */ }
+      resolve(found)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) { finish(false); return }
+      if (e.candidate.type === 'relay' || / typ relay /.test(e.candidate.candidate)) finish(true)
+    }
+    pc.createDataChannel('check')
+    pc.createOffer().then((offer) => pc.setLocalDescription(offer)).catch(() => finish(false))
+  })
+}
+
+const relayServers = (servers: RTCIceServer[] | null | undefined) =>
+  (servers || []).filter((s) => [].concat(s.urls as never).some((u: string) => /^turns?:/i.test(String(u))) && s.username && s.credential)
+
 /** Run every measurement. `getDiagnostics` fetches /webrtc/diagnostics (null when it cannot). */
-export async function measureConnection(socket: Socket, getDiagnostics: () => Promise<ServerDiagnostics | null>): Promise<CheckFindings> {
+export async function measureConnection(socket: Socket, getDiagnostics: () => Promise<ServerDiagnostics | null>, getIceServers?: () => Promise<RTCIceServer[] | null>): Promise<CheckFindings> {
   const diagnostics = await getDiagnostics().catch(() => null)
   const stunUrls = diagnostics?.stunUrls?.length ? diagnostics.stunUrls : DEFAULT_STUN
   const sfuOff = diagnostics?.sfu ? !(diagnostics.sfu.enabled && diagnostics.sfu.usable) : false
-  const [udp, tcp, stun] = await Promise.all([
+  const relays = getIceServers && diagnostics?.turnConfigured ? relayServers(await getIceServers().catch(() => null)) : []
+  const [udp, tcp, stun, relay] = await Promise.all([
     sfuOff ? Promise.resolve<ProbeOutcome>('sfu-off') : probeSfu(socket, 'udp'),
     sfuOff ? Promise.resolve<ProbeOutcome>('sfu-off') : probeSfu(socket, 'tcp'),
     stunReturnsPublicAddress(stunUrls),
+    relays.length ? relayHandsOutAddress(relays) : Promise.resolve<boolean | null>(null),
   ])
-  return { diagnostics, udp, tcp, stun }
+  return { diagnostics, udp, tcp, stun, relay }
 }
 
 function probeLine(id: 'udp' | 'tcp', outcome: ProbeOutcome): CheckLine {
@@ -99,8 +133,12 @@ export function describeConnection(found: CheckFindings): CheckReport {
     : { id: 'stun', label: 'Public address (STUN)', status: 'fail', text: 'No STUN server answered with a public address, so direct connections to people on other networks are unlikely to work from here.' })
 
   const turn = d ? !!d.turnConfigured : null
-  lines.push(turn
-    ? { id: 'turn', label: 'Relay server (TURN)', status: 'pass', text: 'A relay server is set up, so a direct connection that cannot be made any other way still has a route.' }
+  lines.push(turn && found.relay === true
+    ? { id: 'turn', label: 'Relay server (TURN)', status: 'pass', text: 'This browser reached the relay server and it accepted this account, so a direct connection that cannot be made any other way still has a route.' }
+    : turn && found.relay === false
+      ? { id: 'turn', label: 'Relay server (TURN)', status: 'fail', text: 'A relay server is set up, but this browser could not get a relayed address from it: this network, or the server\'s router, is not letting it through.' }
+    : turn
+      ? { id: 'turn', label: 'Relay server (TURN)', status: 'pass', text: 'A relay server is set up, so a direct connection that cannot be made any other way still has a route.' }
     : turn === false
       ? { id: 'turn', label: 'Relay server (TURN)', status: 'fail', text: 'No relay server is set up, so a direct link between two home networks can fail.' }
       : { id: 'turn', label: 'Relay server (TURN)', status: 'skip', text: 'Not known: the server did not say whether it has a relay.' })

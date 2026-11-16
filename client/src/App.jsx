@@ -4066,8 +4066,8 @@ export default function App() {
       if (!m || typeof m !== 'object') return
       notifyAppHostRef.current({ type: 'message', from: typeof m.from === 'string' ? m.from : '', data: m.data })
     })
-    // Fetch WebRTC ICE servers (STUN + any configured TURN) so calls connect across networks.
-    fetch(`${SERVER_URL}/webrtc/ice`).then((r) => r.json()).then((d) => { if (d && Array.isArray(d.iceServers) && d.iceServers.length) iceConfigRef.current = d.iceServers }).catch(() => {})
+    // Fetch WebRTC ICE servers (STUN + the TURN relay) so calls connect across networks.
+    refreshIceServers(true)
 
     // Collaborative image editing
     s.on('collab:invite', ({ sessionId, imageUrl, by }) => setCollabInvite({ sessionId, imageUrl, by }))
@@ -4414,6 +4414,24 @@ export default function App() {
     }
   }
 
+  // ICE servers for calls. The TURN relay credential in them is minted for this account and expires
+  // (the server says when, as `ttl`), so it is fetched with the session and asked for again before a
+  // call once it is past half its life. Without a session the server answers with STUN alone.
+  const iceFetchedRef = useRef({ at: 0, ttl: 0 })
+  const refreshIceServers = async (force = false) => {
+    const { at, ttl } = iceFetchedRef.current
+    if (!force && at && (!ttl || Date.now() - at < (ttl * 1000) / 2)) return
+    const t = token || localStorage.getItem('lanparty_token')
+    try {
+      const r = await fetch(`${SERVER_URL}/webrtc/ice`, { headers: t ? { Authorization: `Bearer ${t}` } : {} })
+      const d = await r.json()
+      if (d && Array.isArray(d.iceServers) && d.iceServers.length) {
+        iceConfigRef.current = d.iceServers
+        iceFetchedRef.current = { at: Date.now(), ttl: Number(d.ttl) || 0 }
+      }
+    } catch (_) { /* keep what we had; STUN still works */ }
+  }
+
   const authedFetch = (path, opts = {}) => {
     const t = token || localStorage.getItem('lanparty_token')
     return fetch(`${SERVER_URL}${path}`, { ...opts, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}`, ...(opts.headers || {}) } })
@@ -4421,6 +4439,7 @@ export default function App() {
 
   // What the server says about its own voice setup (GET /webrtc/diagnostics), for the connection
   // check. null when it cannot be had; the check then reports what it measured itself.
+  const fetchIceServers = async () => { await refreshIceServers(); return iceConfigRef.current }
   const fetchVoiceDiagnostics = () => authedFetch('/webrtc/diagnostics').then((r) => (r.ok ? r.json() : null)).catch(() => null)
 
   const renameServer = async (serverId, oldName) => {
@@ -4730,6 +4749,7 @@ export default function App() {
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: withVideo }) }
     catch (e) { alert('Microphone access is required to call.'); return }
     callLocalStreamRef.current = stream
+    await refreshIceServers()
     setCall({ status: 'outgoing', peer: peerUsername, peerSocket: null, video: withVideo })
     socketRef.current?.emit('call:invite', { to: peerUsername, video: withVideo })
   }
@@ -4738,6 +4758,7 @@ export default function App() {
     const c = callRef.current
     if (!c || c.status !== 'incoming') return
     if (!emailVerified) { setToast(VERIFY_FIRST); declineCall(); return }
+    await refreshIceServers()
     let stream
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(null), video: c.video }) }
     catch (e) { declineCall(); return }
@@ -5446,6 +5467,7 @@ export default function App() {
   const startVoice = async (channelId = 'voice1', opts = {}) => {
     if (typeof channelId !== 'string') channelId = 'voice1' // guard against being passed a click event
     if (!socket) return
+    await refreshIceServers()
     const muted = opts.muted != null ? opts.muted : micMuted
     if (!localStreamRef.current) {
       try {
@@ -9304,7 +9326,7 @@ export default function App() {
                     />
                   )}
                   {/* The other half of "will my call work": not the mic, the network. */}
-                  <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} variant="link" />
+                  <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} getIceServers={fetchIceServers} variant="link" />
                 </div>
                 {supportsSpeakerSelect && (
                   <div className="prejoin-group">
@@ -10316,7 +10338,7 @@ export default function App() {
             />
             {/* Whether this network can carry a call, and by which route — without joining one. */}
             <p className="profile-hint">Check that calls from this network can reach the voice server, and what they fall back to if not.</p>
-            <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} />
+            <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} getIceServers={fetchIceServers} />
 
             {/* Desktop notifications */}
             <h3 className="profile-settings-section-title">🔔 Notifications</h3>

@@ -25,6 +25,7 @@ const { createPush, mentionedUsernames, MAX_MENTION_TARGETS, MAX_LEVEL_TARGETS }
 const { createNotificationSettings } = require('./services/notificationSettings');
 const { createLinkPreviews, ownHostnames, IMAGE_DIR: LINK_PREVIEW_DIR } = require('./services/linkPreview');
 const { createInstanceOwners } = require('./services/instanceOwners');
+const { turnServerFor, turnConfigured } = require('./services/turnCredentials');
 const { createTwoFactor } = require('./services/twoFactor');
 const { createEmailVerification } = require('./services/emailVerification');
 const { registerSecurityRoutes } = require('./routes/security');
@@ -57,7 +58,9 @@ const PORT = process.env.PORT || 3000;
 //  DATA_DIR       persistent dir for the SQLite db + uploads/gifs/sounds (mount a volume here)
 //  CLIENT_DIST    path to the built client (client/dist) to serve; enables single-origin hosting
 //  CLIENT_ORIGIN  comma-separated allowed origins for CORS/Socket.IO ('*' = any, the default)
-//  STUN_URLS / TURN_URLS / TURN_USERNAME / TURN_CREDENTIAL  WebRTC ICE servers sent to clients
+//  STUN_URLS / TURN_URLS / TURN_SECRET / TURN_TTL_SECONDS  WebRTC ICE servers sent to clients; a TURN
+//                 credential is minted per signed-in person from TURN_SECRET (services/turnCredentials.js).
+//                 TURN_USERNAME / TURN_CREDENTIAL: the older fixed credential, used only without TURN_SECRET
 //  VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT  Web Push identity; see services/push.js
 //                 (unset = a keypair is generated once and kept in DATA_DIR/vapid.json)
 //  INSTANCE_OWNERS  comma-separated usernames who run this instance: they approve uploaded apps for
@@ -312,12 +315,27 @@ async function main() {
   // WebRTC ICE config (STUN + optional TURN from env) — served to clients so TURN creds aren't
   // baked into the public JS bundle and can be rotated without a rebuild.
   const stunUrls = () => (process.env.STUN_URLS || 'stun:stun.l.google.com:19302').split(',').map((s) => s.trim()).filter(Boolean);
-  app.get('/webrtc/ice', (_req, res) => {
+  // STUN for anyone; a TURN relay credential only for a signed-in person (services/turnCredentials.js).
+  // The session is checked by hand rather than with authMiddleware so that a client without one (an
+  // old build, the sign-in screen) still gets STUN and a 200, as before. `ttl` tells the client when to
+  // ask again.
+  app.get('/webrtc/ice', (req, res) => {
     const iceServers = [{ urls: stunUrls() }];
-    if (process.env.TURN_URLS) {
-      iceServers.push({ urls: process.env.TURN_URLS.split(',').map((s) => s.trim()), username: process.env.TURN_USERNAME || '', credential: process.env.TURN_CREDENTIAL || '' });
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    let ttl = null;
+    if (token) {
+      try {
+        const { username } = sessionClaims(token);
+        const turn = turnServerFor(username);
+        if (turn) {
+          iceServers.push({ urls: turn.urls, username: turn.username, credential: turn.credential });
+          if (turn.expiresAt) ttl = turn.expiresAt - Math.floor(Date.now() / 1000);
+        }
+      } catch (_) { /* no valid session: STUN only */ }
     }
-    res.json({ iceServers });
+    res.setHeader('Cache-Control', 'no-store'); // per person, and the credential expires
+    res.json(ttl ? { iceServers, ttl } : { iceServers });
   });
   // Everything people upload is served through userFileStatic (services/userFiles.js): nosniff, a
   // scriptless sandbox CSP, and anything that is not media or plain text sent as a download, so no
@@ -1625,7 +1643,7 @@ async function main() {
         ports: info.ports,
       },
       announcedAddressStale: sfuAddress.isStale(),
-      turnConfigured: !!process.env.TURN_URLS,
+      turnConfigured: turnConfigured(),
       stunUrls: stunUrls(),
     });
   });
