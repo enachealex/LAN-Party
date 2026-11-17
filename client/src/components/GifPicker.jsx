@@ -174,6 +174,11 @@ export default function GifPicker({
             </div>
           )}
           {loading && gifs.length > 0 && <div className="emoji-empty">Loading…</div>}
+          {/* The library includes Google's animated Noto Emoji, which are CC BY 4.0: they need a credit. */}
+          <div className="gif-credits">
+            Animated emoji: <a href="https://googlefonts.github.io/noto-emoji-animation/" target="_blank" rel="noopener noreferrer">Noto Emoji</a> by Google,{' '}
+            <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a>
+          </div>
         </div>
       </div>
 

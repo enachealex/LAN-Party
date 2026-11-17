@@ -335,6 +335,18 @@ The dry run lists what would be added. The import copies (the folder is left as 
 anything already in the library, refuses files that are not really images, and is safe while the
 server runs. Run it again after adding more files.
 
+**What the live library was seeded with (2026-11-17).** Three sets, each searchable by its tags:
+
+- an original starter pack drawn for LAN Party (GG, LOL, brb, nice, ty, oof, OMG, gn, afk, GL HF,
+  hi, F, YAY, LET'S GO, heart, approved), which is ours;
+- about 25 public-domain or CC0 animations from Wikimedia Commons (Muybridge's animals, early
+  cartoons, phenakistiscope discs, fireworks), tagged `classic`, `cartoons`, `celebrate` and others;
+  these need no credit;
+- 609 of Google's animated Noto Emoji (512px animated AVIF), tagged `noto` and `emoji` plus a
+  category. They are **CC BY 4.0**, so they need a credit: the GIF picker shows "Animated emoji:
+  Noto Emoji by Google, CC BY 4.0" under the grid. Keep that line as long as they are in the library.
+  Searching `noto` lists them all, for removal if wanted.
+
 ## Scale
 
 SQLite on local disk means one host, by design. High availability would mean Postgres plus object

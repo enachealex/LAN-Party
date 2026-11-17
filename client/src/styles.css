@@ -643,6 +643,8 @@ img.dc-server-icon.dc-tile-custom{display:block;padding:0;pointer-events:none}
 .gif-cell{position:relative;width:100%;aspect-ratio:1;border:1px solid rgba(255,255,255,.08);background:#000;border-radius:8px;overflow:hidden;cursor:pointer;padding:0}
 .gif-cell:hover{outline:2px solid var(--accent-end)}
 .gif-cell img{width:100%;height:100%;object-fit:cover;display:block}
+.gif-credits{padding:10px 4px 2px;color:var(--muted);font-size:11px;text-align:center}
+.gif-credits a{color:inherit;text-decoration:underline}
 .gif-custom-head{display:flex;align-items:center;gap:8px;margin:6px 0 8px}
 .gif-custom-head .gif-search{flex:1;width:auto;margin:0}
 .sb-name-count{font-weight:600;color:var(--muted);font-size:11px;margin-left:6px}
