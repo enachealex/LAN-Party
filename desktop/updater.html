@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self'">
+<title>LAN Party</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif; color: #e6edf5; user-select: none;
+    background: radial-gradient(circle at 50% 30%, #1b1f3a 0%, #0b0d10 70%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    padding: 28px 26px; text-align: center; -webkit-app-region: drag; overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, .08);
+  }
+  .logo { width: 104px; height: 104px; animation: bob 1.6s ease-in-out infinite; filter: drop-shadow(0 8px 22px rgba(124, 92, 255, .35)); }
+  @keyframes bob { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-6px) scale(1.04); } }
+  h1 { margin: 0; font-size: 20px; font-weight: 800; letter-spacing: .02em; }
+  #status { margin: 0; min-height: 40px; font-size: 13.5px; color: #aab6c4; line-height: 1.45; }
+  .bar { width: 100%; height: 6px; border-radius: 3px; background: rgba(255, 255, 255, .09); overflow: hidden; visibility: hidden; }
+  .bar > div { height: 100%; width: 0; border-radius: 3px; background: linear-gradient(90deg, #7c5cff, #ff6fae); transition: width .25s; }
+  .bar.indeterminate > div { width: 35%; animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-110%); } to { transform: translateX(300%); } }
+  .buttons { display: flex; gap: 10px; width: 100%; visibility: hidden; -webkit-app-region: no-drag; }
+  button { flex: 1; padding: 9px 10px; border: none; border-radius: 8px; font: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer; }
+  #primary { background: linear-gradient(135deg, #7c5cff, #ff6fae); color: #fff; }
+  #secondary { flex: 0 0 34%; background: rgba(255, 255, 255, .08); color: #e6edf5; }
+  button { white-space: nowrap; }
+  button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  #version { position: fixed; bottom: 8px; left: 0; right: 0; font-size: 11px; color: #5d6b7a; }
+</style>
+</head>
+<body>
+  <img class="logo" src="assets/tray.png" alt="">
+  <h1>LAN Party</h1>
+  <p id="status" role="status" aria-live="polite">Checking for updates…</p>
+  <div class="bar indeterminate" id="bar"><div></div></div>
+  <div class="buttons" id="buttons">
+    <button type="button" id="secondary">Later</button>
+    <button type="button" id="primary">Download &amp; install</button>
+  </div>
+  <div id="version"></div>
+  <script src="updater.js"></script>
+</body>
+</html>

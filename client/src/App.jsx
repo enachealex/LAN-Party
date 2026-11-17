@@ -30,7 +30,7 @@ import { findNewerBuild, alreadyReloadedFor, reloadForBuild } from './appUpdate'
 import { hostedAppFrame } from './appBridge'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
-import { detectInstallContext, findInstalledAndroidApp, androidAppIntentUrl } from './installContext'
+import { detectInstallContext, findInstalledAndroidApp, androidAppIntentUrl, stuckDesktopVersion } from './installContext'
 import MicTest from './components/MicTest'
 import ConnectionCheck from './components/ConnectionCheck'
 import VoiceConnectionPanel from './components/VoiceConnectionPanel'
@@ -1408,6 +1408,8 @@ export default function App() {
   const [toast, setToast] = useState(null) // brief bottom notice (invites, role changes)
   // A newer build has been deployed than the one on screen (its signature), or null. See appUpdate.ts.
   const [newBuild, setNewBuild] = useState(null)
+  // A Windows app too old to update itself (see stuckDesktopVersion): asked to reinstall, once per run.
+  const [stuckDesktop, setStuckDesktop] = useState(() => stuckDesktopVersion())
   const busyForReloadRef = useRef(false)
   const checkForUpdateRef = useRef(() => {})
   // External streaming (Twitch/YouTube/Kik): my announcement + the announce form + in-app viewer.
@@ -9200,6 +9202,16 @@ export default function App() {
       {/* Opened from an emailed verification link (works signed in or out). */}
       {verifyLink && <VerifyLinkDialog result={verifyLink} signedIn={isAuthenticated} onClose={() => setVerifyLink(null)} />}
       {/* Only shown when the update could not simply be applied: mid-call, mid-sentence, and so on. */}
+      {stuckDesktop && !newBuild && (
+        <div className="update-bar update-bar-stuck" role="status">
+          <span>
+            This Windows app ({/^\d/.test(stuckDesktop) ? `version ${stuckDesktop}` : stuckDesktop}) can't update itself.
+            Install the new version once and it will keep itself up to date, with a tray icon so it can run in the background.
+          </span>
+          <a className="update-bar-btn" href={`${SERVER_URL}/downloads/LAN-Party-Setup.exe`} download>Download</a>
+          <button type="button" className="update-bar-dismiss" aria-label="Dismiss" onClick={() => setStuckDesktop(null)}>✕</button>
+        </div>
+      )}
       {newBuild && (
         <div className="update-bar" role="status">
           <span>A new version of LAN Party is ready.</span>

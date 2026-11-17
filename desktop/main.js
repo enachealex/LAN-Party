@@ -102,6 +102,7 @@ function hideToTray() {
 // Bring the window back from ANY hidden state. Order matters: a hidden window can't be focused into
 // view, and a minimized one needs restore() first — so show() + restore() both run before focus().
 function showFromTray() {
+  if (startup.phase !== 'done') { focusUpdaterWindow(); return } // still in the startup updater
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (process.platform === 'win32') mainWindow.setSkipTaskbar(false)
   if (mainWindow.isMinimized()) mainWindow.restore()
@@ -168,6 +169,7 @@ function trayImage() {
 function trayMenuTemplate() {
   return [
     { label: 'Show LAN Party', click: showFromTray },
+    ...(pendingUpdate ? [{ label: `Restart to install ${pendingUpdate}`, click: installDownloadedUpdate }] : []),
     { type: 'separator' },
     {
       label: 'Run in background',
@@ -228,10 +230,11 @@ function createTray() {
   }
 }
 
-function createWindow() {
+function createWindow({ deferShow = false } = {}) {
   // A login-item launch starts in the tray: it exists to be already connected when you sit down, not
   // to throw a window at you. The renderer still loads and stays connected while hidden.
-  const hidden = startedHidden() && prefs.runInBackground
+  // deferShow: the startup updater window is up; the app loads behind it and is shown when it is done.
+  const hidden = (startedHidden() && prefs.runInBackground) || deferShow
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -254,6 +257,9 @@ function createWindow() {
   })
 
   mainWindow.loadURL(APP_URL)
+  // The page's own splash waits for an update status; a reload, or a page that loaded after the
+  // status was sent, gets the latest one again.
+  mainWindow.webContents.on('did-finish-load', () => { if (lastUpdateStatus) sendUpdateStatus(lastUpdateStatus) })
   if (NO_ACTIVATE && !hidden) mainWindow.once('ready-to-show', () => mainWindow && mainWindow.showInactive())
   mainWindow.on('closed', () => { mainWindow = null })
 
@@ -404,59 +410,194 @@ function pickShareSource() {
   })
 }
 
-// Check for a new shell version at startup (and periodically), download it in the background, and
-// install it. Because chats live on the server, updating the shell never touches conversation data
-// — the app just reloads the live web app after restarting and everything is already in sync.
-// Tell the renderer where the update check is up to, so the startup splash isn't guessing. Safe to
-// call before the window exists or after it's gone.
+// ---------------------------------------------------------------------------
+// Updates. Like Discord: a launch opens a small updater window first, which checks for a new version
+// of this shell. If there is one, it asks; "Download & install" downloads it with a progress bar,
+// installs it and restarts. No update (or "Later", or no answer from the feed) opens LAN Party.
+// A login-item launch (straight to the tray) skips the window and checks quietly, as do the checks
+// every few hours while the app runs: those download in the background and offer a restart.
+// Chats live on the server, so an update never touches conversation data.
+// ---------------------------------------------------------------------------
+const CHECK_TIMEOUT_MS = 15000
+const startup = { phase: 'done', window: null, timer: null, lastState: null } // phase: checking | prompt | downloading | error | installing | done
+let pendingUpdate = null // a version downloaded in the background, installed on restart or quit
+let lastUpdateStatus = null
+
+// Tell the renderer where the update check is up to, so the page's startup splash isn't guessing.
+// Safe to call before the window exists or after it's gone.
 function sendUpdateStatus(status) {
+  lastUpdateStatus = status
   try {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app:update-status', status)
   } catch (_) { /* window torn down mid-check */ }
 }
 
-function setupAutoUpdates() {
-  // Unpackaged dev runs have no feed, but the renderer still waits on a status — answer immediately
-  // instead of letting the splash sit on this step until its timeout.
-  if (!app.isPackaged) { sendUpdateStatus('none'); return }
+function updaterState(state) {
+  startup.lastState = state // re-sent when the window finishes loading, in case it was not listening yet
+  const w = startup.window
+  if (w && !w.isDestroyed()) w.webContents.send('updater:state', { current: app.getVersion(), ...state })
+}
 
-  autoUpdater.autoDownload = true
+function focusUpdaterWindow() {
+  const w = startup.window
+  if (!w || w.isDestroyed()) return
+  if (w.isMinimized()) w.restore()
+  if (NO_ACTIVATE) w.showInactive(); else { w.show(); w.focus() }
+}
+
+function createUpdaterWindow() {
+  const w = new BrowserWindow({
+    width: 320,
+    height: 380,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    frame: false,
+    show: false,
+    center: true,
+    title: 'LAN Party',
+    backgroundColor: '#0b0d10',
+    icon: trayImage() || undefined,
+    webPreferences: {
+      preload: path.join(__dirname, 'updater-preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  })
+  w.webContents.on('will-navigate', (event) => event.preventDefault())
+  w.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  w.webContents.on('did-finish-load', () => updaterState(startup.lastState || { kind: 'checking' }))
+  w.once('ready-to-show', () => (NO_ACTIVATE ? w.showInactive() : w.show()))
+  // Closing the updater before LAN Party opened (Alt+F4) means "never mind": quit, unless an update
+  // is being installed, which then finishes on its own.
+  w.on('closed', () => {
+    if (startup.window === w) startup.window = null
+    if (startup.phase !== 'done' && startup.phase !== 'installing') { isQuitting = true; app.quit() }
+  })
+  w.loadFile(path.join(__dirname, 'updater.html'))
+  startup.window = w
+  return w
+}
+
+// The updater window is done: show LAN Party (it has been loading behind it) and close the updater.
+function finishStartup() {
+  if (startup.phase === 'done') return
+  startup.phase = 'done'
+  clearTimeout(startup.timer)
+  if (lastUpdateStatus !== 'none') sendUpdateStatus('none') // the page's splash need not wait on the updater
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (process.platform === 'win32') mainWindow.setSkipTaskbar(false)
+    if (NO_ACTIVATE) mainWindow.showInactive(); else { mainWindow.show(); mainWindow.focus() }
+    mainWindow.webContents.send('app:visibility', true)
+  }
+  const w = startup.window
+  startup.window = null
+  if (w && !w.isDestroyed()) w.close()
+}
+
+function installDownloadedUpdate() {
+  isQuitting = true
+  // Silent install, then start the new version.
+  autoUpdater.quitAndInstall(true, true)
+}
+
+ipcMain.on('updater:choice', (e, choice) => {
+  if (!startup.window || e.sender !== startup.window.webContents) return
+  if (choice === 'install' && (startup.phase === 'prompt' || startup.phase === 'error')) {
+    startup.phase = 'downloading'
+    updaterState({ kind: 'downloading', percent: 0 })
+    autoUpdater.downloadUpdate().catch((err) => startupDownloadFailed(err))
+  } else if (choice === 'later' || choice === 'continue') {
+    updaterState({ kind: 'starting' })
+    finishStartup()
+  }
+})
+
+function startupDownloadFailed(err) {
+  if (startup.phase !== 'downloading') return
+  startup.phase = 'error'
+  console.error('update download failed:', err == null ? 'unknown' : (err.stack || err).toString())
+  updaterState({ kind: 'error', message: 'The update could not be downloaded. Check your connection, or open LAN Party and try again later.' })
+}
+
+function setupAutoUpdates({ withWindow }) {
+  // A test build can be pointed at another feed; nothing else changes it.
+  const feed = process.env.LANPARTY_UPDATE_FEED
+  if (!app.isPackaged && !feed) { sendUpdateStatus('none'); finishStartup(); return }
+  if (feed) {
+    autoUpdater.setFeedURL({ provider: 'generic', url: feed })
+    if (!app.isPackaged) autoUpdater.forceDevUpdateConfig = true
+  }
+
+  autoUpdater.autoDownload = false // the startup window asks first; background checks download explicitly
   autoUpdater.autoInstallOnAppQuit = true
 
   autoUpdater.on('checking-for-update', () => sendUpdateStatus('checking'))
-  autoUpdater.on('update-not-available', () => sendUpdateStatus('none'))
-  autoUpdater.on('download-progress', () => sendUpdateStatus('downloading'))
+
+  autoUpdater.on('update-not-available', () => {
+    sendUpdateStatus('none')
+    if (startup.phase === 'checking') { updaterState({ kind: 'starting' }); finishStartup() }
+  })
 
   autoUpdater.on('update-available', (info) => {
     sendUpdateStatus('available')
-    if (Notification.isSupported()) {
-      new Notification({ title: 'LAN Party', body: `Downloading update v${info.version}…` }).show()
+    if (startup.phase === 'checking') {
+      clearTimeout(startup.timer)
+      startup.phase = 'prompt'
+      updaterState({ kind: 'available', version: info.version })
+      focusUpdaterWindow()
+    } else if (startup.phase === 'done' && pendingUpdate !== info.version) {
+      // Found while LAN Party is open: fetch it quietly and offer a restart when it is ready.
+      autoUpdater.downloadUpdate().catch(() => {})
     }
+  })
+
+  autoUpdater.on('download-progress', (p) => {
+    sendUpdateStatus('downloading')
+    if (startup.phase === 'downloading') updaterState({ kind: 'downloading', percent: p.percent, transferred: p.transferred, total: p.total })
   })
 
   autoUpdater.on('update-downloaded', (info) => {
     sendUpdateStatus('downloaded')
-    const choice = dialog.showMessageBoxSync(mainWindow, {
-      type: 'info',
-      buttons: ['Restart now', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
-      title: 'Update ready',
-      message: `LAN Party ${info.version} is ready to install.`,
-      detail: 'Restart to apply it. Your conversations stay in sync — nothing is stored on this device, so no messages are lost.',
-    })
-    if (choice === 0) autoUpdater.quitAndInstall()
-    // If "Later": autoInstallOnAppQuit applies the update the next time the app closes.
+    if (startup.phase === 'downloading') {
+      startup.phase = 'installing'
+      updaterState({ kind: 'installing' })
+      setTimeout(installDownloadedUpdate, 900)
+      return
+    }
+    pendingUpdate = info.version
+    refreshTray()
+    // Installed when the app quits anyway; offer it now only where it can be seen.
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+      dialog.showMessageBox(mainWindow, {
+        type: 'info',
+        buttons: ['Restart now', 'Later'],
+        defaultId: 0,
+        cancelId: 1,
+        title: 'Update ready',
+        message: `LAN Party ${info.version} is ready to install.`,
+        detail: 'Restart to apply it, or it installs the next time LAN Party closes. Your conversations are on the server, so nothing is lost.',
+      }).then(({ response }) => { if (response === 0) installDownloadedUpdate() }).catch(() => {})
+    } else if (Notification.isSupported()) {
+      new Notification({ title: 'LAN Party update ready', body: `Version ${info.version} installs the next time LAN Party restarts. Right-click the tray icon to restart now.` }).show()
+    }
   })
 
   autoUpdater.on('error', (err) => {
     sendUpdateStatus('error')
     console.error('auto-update error:', err == null ? 'unknown' : (err.stack || err).toString())
+    if (startup.phase === 'checking') { updaterState({ kind: 'starting' }); finishStartup() } // offline etc.: just open
+    else if (startup.phase === 'downloading') startupDownloadFailed(err)
   })
 
-  autoUpdater.checkForUpdates().catch(() => {})
+  if (withWindow) {
+    // A feed that never answers must not hold LAN Party hostage.
+    startup.timer = setTimeout(() => { if (startup.phase === 'checking') finishStartup() }, CHECK_TIMEOUT_MS)
+  }
+  autoUpdater.checkForUpdates().catch(() => { if (startup.phase === 'checking') finishStartup() })
   // Re-check every 6 hours for long-running sessions.
-  setInterval(() => { autoUpdater.checkForUpdates().catch(() => {}) }, 6 * 60 * 60 * 1000)
+  setInterval(() => { if (startup.phase === 'done') autoUpdater.checkForUpdates().catch(() => {}) }, 6 * 60 * 60 * 1000)
 }
 
 // Single-instance: focus the existing window instead of opening a second copy.
@@ -474,11 +615,15 @@ if (!gotLock) {
     loadPrefs()
     applyOpenAtLogin() // re-assert on every start, in case the login item was removed elsewhere
     configureMedia()
-    createWindow()
+    // A normal launch opens the updater window first and loads LAN Party behind it; a login-item
+    // launch goes straight to the tray and checks quietly.
+    const withWindow = !(startedHidden() && prefs.runInBackground)
+    if (withWindow) { startup.phase = 'checking'; createUpdaterWindow() }
+    createWindow({ deferShow: withWindow })
     createTray()
-    setupAutoUpdates()
+    setupAutoUpdates({ withWindow })
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      if (!mainWindow) createWindow()
       else showFromTray()
     })
   })

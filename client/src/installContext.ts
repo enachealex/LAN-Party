@@ -81,6 +81,26 @@ function inDesktopApp(): boolean {
 }
 
 /**
+ * The installed Windows app's version when it is too old to update itself, else null.
+ *
+ * Builds before 1.4.0 were configured to check an Authenticode signature the unsigned installers
+ * never had, so their updater refuses every update and they stay on that version for good (1.0.0
+ * also has no tray icon at all). The only way off them is to install the current version by hand,
+ * so the client tells them. Electron's user agent carries "<package name>/<version>"; builds
+ * before 1.3.0 also lack the update-status bridge, which covers a user agent without it.
+ */
+export function stuckDesktopVersion(): string | null {
+  if (!inDesktopApp()) return null
+  const m = /lan-party-desktop\/(\d+)\.(\d+)\.(\d+)/.exec(typeof navigator === 'undefined' ? '' : navigator.userAgent || '')
+  if (m) {
+    const [major, minor] = [Number(m[1]), Number(m[2])]
+    return major < 1 || (major === 1 && minor < 4) ? `${m[1]}.${m[2]}.${m[3]}` : null
+  }
+  const bridge = (window as unknown as { desktop?: { onUpdateStatus?: unknown } }).desktop
+  return bridge && typeof bridge.onUpdateStatus !== 'function' ? 'an old version' : null
+}
+
+/**
  * Installed as a web app (Add to Home Screen / Install app), or any window the browser draws
  * without its own address bar. The display-mode media queries match the manifest's `display`
  * once the page runs installed; a TWA usually matches standalone too, but not on every Chrome
