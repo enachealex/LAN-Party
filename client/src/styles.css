@@ -728,12 +728,12 @@ a.create-app-btn{text-decoration:none;font-size:13.33px;line-height:normal;displ
 .install-option-title{font-weight:700;font-size:14px}
 .install-option-desc{font-size:12px;color:var(--muted)}
 .install-panel-note{margin:4px 2px 0;font-size:12px;color:var(--muted)}
-.auth-modal.profile-settings-modal{width:520px;max-height:min(88vh,720px);padding:0;overflow:hidden;display:flex;flex-direction:column;z-index:9150}
+.auth-modal.profile-settings-modal{width:520px;height:min(88vh,720px);max-height:min(88vh,720px);padding:0;overflow:hidden;display:flex;flex-direction:column;z-index:9150}
 .profile-settings-header .members-close{font-size:28px;line-height:1;width:40px;height:40px;display:flex;align-items:center;justify-content:center;border-radius:8px}
 .profile-settings-header .members-close:hover{background:rgba(255,255,255,.08);color:var(--text)}
 .profile-settings-header{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid rgba(255,255,255,0.06)}
 .profile-settings-header h2{margin:0;font-size:30px;font-weight:700;color:var(--text)}
-.profile-settings-body{overflow:auto;padding:16px 20px 20px}
+.profile-settings-body{flex:1;min-height:0;overflow:auto;padding:16px 20px 20px;scrollbar-gutter:stable}
 /* Floating unsaved-changes bar: a flex sibling below the scrollable body, so it stays in view
    without covering the form's last fields. */
 .profile-unsaved-bar{flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 16px 16px;padding:10px 12px 10px 16px;background:#0b141d;border:1px solid rgba(255,255,255,.16);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
@@ -807,8 +807,9 @@ a.create-app-btn{text-decoration:none;font-size:13.33px;line-height:normal;displ
 @keyframes name-flash{to{background-position:200% center}}
 
 /* Settings tabs */
-.profile-settings-tabs{display:flex;gap:4px;padding:10px 20px 0;border-bottom:1px solid rgba(255,255,255,.06)}
-.profile-settings-tab{border:none;background:transparent;color:var(--muted);font-size:17px;font-weight:700;padding:10px 14px;border-radius:8px 8px 0 0;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.profile-settings-tabs{display:flex;gap:2px;padding:10px 16px 0;border-bottom:1px solid rgba(255,255,255,.06);overflow-x:auto;scrollbar-width:none;flex-shrink:0}
+.profile-settings-tabs::-webkit-scrollbar{height:0}
+.profile-settings-tab{flex:1 0 auto;text-align:center;white-space:nowrap;border:none;background:transparent;color:var(--muted);font-size:15px;font-weight:700;padding:10px 10px;border-radius:8px 8px 0 0;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
 .profile-settings-tab:hover{color:var(--text);background:rgba(255,255,255,.05)}
 .profile-settings-tab.active{color:var(--text);border-bottom-color:var(--accent-end)}
 /* Color scheme cards */
@@ -2057,7 +2058,7 @@ button.app-card-try{border:none;background:transparent;cursor:pointer;padding:0;
   .auth-modal.app-directory-modal{
     width:auto;max-width:none;left:8px;right:8px;
     top:8px;bottom:calc(8px + env(safe-area-inset-bottom,0px));
-    max-height:none;
+    max-height:none;height:auto;
     transform:scale(.98);
   }
   /* Keep the open/close scale animation, just without the centring translate. */
