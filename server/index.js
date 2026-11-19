@@ -1953,7 +1953,10 @@ async function main() {
       if (typeof ack === 'function') ack({ ok: true });
     });
 
-    socket.on('join', async ({ serverId = 'demo', name = 'Anonymous' } = {}) => {
+    // `channelId` (optional): the channel this window was already on. A reconnect (a deploy
+    // restarting the server, a network blip) re-sends join, and without it the answer moved
+    // everyone to the first text channel, out of the call view they were looking at.
+    socket.on('join', async ({ serverId = 'demo', name = 'Anonymous', channelId: wantedChannel } = {}) => {
       const serverRow = await db.get('SELECT * FROM servers WHERE id = ?', serverId);
       if (!serverRow) return; // unknown server id (e.g. stale client state) — ignore
       // Membership gate: only the public commons is open to everyone; others require membership.
@@ -1970,8 +1973,17 @@ async function main() {
       const allChannels = await channelLists.listChannels(serverId);
       await broadcastServerState(serverId); // role-filtered state to everyone (incl. this newcomer)
 
-      // Enter the first text channel this user can actually see, and send its history.
-      const firstText = (await visibleChannelsFor(serverId, allChannels, socketUser, myRole)).find((c) => c.type === 'text');
+      // Back into the channel this window was on when it may still see it; otherwise the first text
+      // channel this user can actually see, with its history.
+      const visible = await visibleChannelsFor(serverId, allChannels, socketUser, myRole);
+      const wanted = typeof wantedChannel === 'string' ? visible.find((c) => c.id === wantedChannel) : null;
+      if (wanted && wanted.type !== 'text') {
+        socket.join(`channel:${serverId}:${wanted.id}`);
+        socket.emit('channel:joined', { serverId, channelId: wanted.id });
+        await markChannelRead(socketUser, serverId, wanted.id);
+        return;
+      }
+      const firstText = wanted || visible.find((c) => c.type === 'text');
       if (firstText) {
         socket.join(`channel:${serverId}:${firstText.id}`);
         socket.emit('channel:joined', { serverId, channelId: firstText.id });
@@ -1979,6 +1991,7 @@ async function main() {
         const page = await fetchPage(db, channelHistory(serverId, firstText.id), { mode: 'latest', id: 0, limit: PAGE_DEFAULT });
         const blocked = await blocks.blockedBy(socketUser); // their messages arrive marked, not missing
         socket.emit('messages:init', { serverId, channelId: firstText.id, messages: page.rows.map((m) => mapMessageRow(m, socketUser, blocked)), hasMore: page.hasMore });
+        if (wanted) socket.emit('pins:updated', { serverId, channelId: firstText.id, pins: await channelPins(serverId, firstText.id, socketUser) });
         await markChannelRead(socketUser, serverId, firstText.id); // history was just shown
       } else {
         socket.emit('messages:init', { serverId, channelId: null, messages: [], hasMore: false });

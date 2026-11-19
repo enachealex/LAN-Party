@@ -3602,7 +3602,9 @@ export default function App() {
       setName(nick)
       // Join the current server (restored view) or the default one.
       const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
-      s.emit('join', { serverId: sid, name: nick })
+      // Same channel as before the reconnect (a deploy, a network blip), not the server's first one:
+      // being moved to #general mid-call looked like the call had thrown you out.
+      s.emit('join', { serverId: sid, name: nick, channelId: activeChannelRef.current || undefined })
       setConnected(true)
       // A joined app frame belongs to the previous socket. (On the very first connect nothing is
       // listening for this.)
@@ -3877,7 +3879,7 @@ export default function App() {
       setToast("Couldn't send — resynced with the server. Please try again.")
       if (failedText) setText((cur) => cur || failedText)
       const sid = selectedServerIdRef.current !== 'home' ? selectedServerIdRef.current : 'demo'
-      s.emit('join', { serverId: sid, name: userName || name })
+      s.emit('join', { serverId: sid, name: userName || name, channelId: activeChannelRef.current || undefined })
     })
     // Pinned-message list for a channel changed (or arrived on join).
     s.on('pins:updated', ({ serverId, channelId, pins } = {}) => {
