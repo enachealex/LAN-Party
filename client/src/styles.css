@@ -3006,3 +3006,7 @@ a.install-gate-btn{display:flex;align-items:center;justify-content:center;box-si
   .composer-notice.unverified .feedback-btn{min-height:44px;width:100%}
 }
 .call-audio-layer{display:none}
+/* Drag handle over your camera inside your own screen share (CamPipHandle). */
+.cam-pip-handle{position:absolute;z-index:3;border-radius:8px;border:2px dashed rgba(255,255,255,.0);cursor:grab;touch-action:none;transition:border-color .15s}
+.video-tile:hover .cam-pip-handle{border-color:rgba(255,255,255,.7)}
+.cam-pip-handle:active{cursor:grabbing;border-color:var(--accent-end)}

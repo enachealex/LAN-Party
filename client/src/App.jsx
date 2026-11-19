@@ -27,6 +27,7 @@ import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
 import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
 import { findNewerBuild, alreadyReloadedFor, reloadForBuild } from './appUpdate'
+import { ScreenCompositor, compositingSupported, clampPip, pipRect, PIP_MARGIN, PIP_WIDTH } from './screenCompositor'
 import { hostedAppFrame } from './appBridge'
 import EntranceSoundRecorder from './components/EntranceSoundRecorder'
 import MobileInstallGate, { detectPlatform, installGateDismissed, rememberInstallGateDismissed } from './components/MobileInstallGate'
@@ -1002,10 +1003,73 @@ function CallAudio({ stream, muted, volume = 1, sinkId }) {
   return <audio ref={ref} autoPlay className="call-audio" />
 }
 
+// On your own tile while you share your screen with the camera drawn in: a frame over the camera
+// that you drag to move it. The video under it is what everyone else sees, so the frame only
+// shows where to grab; the camera itself moves in the video a moment later.
+function CamPipHandle({ videoRef, pip }) {
+  const [, setTick] = useState(0)
+  const dragRef = useRef(null)
+  // Re-place the frame when the tile or the shared screen changes size.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return undefined
+    const bump = () => setTick((n) => n + 1)
+    const ro = new ResizeObserver(bump)
+    ro.observe(v)
+    v.addEventListener('resize', bump)
+    return () => { ro.disconnect(); v.removeEventListener('resize', bump) }
+  }, [videoRef])
+  const v = videoRef.current
+  if (!v || !v.videoWidth || !v.videoHeight || !v.clientWidth || !v.clientHeight) return null
+  // Where the picture is inside the element (object-fit: contain), and its scale.
+  const scale = Math.min(v.clientWidth / v.videoWidth, v.clientHeight / v.videoHeight)
+  const offX = (v.clientWidth - v.videoWidth * scale) / 2
+  const offY = (v.clientHeight - v.videoHeight * scale) / 2
+  const r = pipRect(v.videoWidth, v.videoHeight, pip.aspect, pip.pos)
+  const toPos = (left, top) => {
+    const W = v.videoWidth, H = v.videoHeight
+    const m = Math.round(W * PIP_MARGIN)
+    const pw = Math.round(W * PIP_WIDTH), ph = Math.round(pw / (pip.aspect || 16 / 9))
+    return { x: (left - m) / Math.max(1, W - pw - 2 * m), y: (top - m) / Math.max(1, H - ph - 2 * m) }
+  }
+  const onPointerDown = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    e.currentTarget.setPointerCapture?.(e.pointerId)
+    dragRef.current = { x: e.clientX, y: e.clientY, left: r.x, top: r.y, pos: pip.pos }
+  }
+  const onPointerMove = (e) => {
+    const d = dragRef.current
+    if (!d) return
+    const pos = toPos(d.left + (e.clientX - d.x) / scale, d.top + (e.clientY - d.y) / scale)
+    d.pos = pos
+    pip.onMove(pos)
+  }
+  const onPointerUp = (e) => {
+    const d = dragRef.current
+    dragRef.current = null
+    try { e.currentTarget.releasePointerCapture?.(e.pointerId) } catch (_) { /* not captured */ }
+    if (d) pip.onMove(d.pos, { save: true })
+  }
+  return (
+    <div
+      className="cam-pip-handle"
+      style={{ left: offX + r.x * scale, top: offY + r.y * scale, width: r.w * scale, height: r.h * scale }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      title="Drag to move your camera. Everyone sees it where you put it."
+      aria-label="Your camera in your screen share. Drag to move it."
+      role="slider"
+    />
+  )
+}
+
 // A single participant tile: shows their camera video when a live video track is present,
 // otherwise an avatar initial. Picture only: the voice plays from CallAudio. The volume control
 // here sets that person's CallAudio volume.
-function VideoTile({ stream, label, isScreen, onExpand, volume = 1, onVolume }) {
+function VideoTile({ stream, label, isScreen, onExpand, volume = 1, onVolume, pip = null }) {
   const ref = useRef()
   const [hasVideo, setHasVideo] = useState(false)
   const [showVolume, setShowVolume] = useState(false)
@@ -1050,6 +1114,7 @@ function VideoTile({ stream, label, isScreen, onExpand, volume = 1, onVolume }) 
   return (
     <div className={`video-tile${hasVideo ? ' has-video' : ''}`}>
       <video ref={ref} autoPlay playsInline muted />
+      {pip && hasVideo && <CamPipHandle videoRef={ref} pip={pip} />}
       {!hasVideo && <div className="video-tile-avatar">{(label || '?').trim().slice(0, 1).toUpperCase()}</div>}
       <div className="video-tile-label">{label}</div>
       {/* Only on other people's tiles (onVolume is not passed for your own). One loud mic should not
@@ -1186,6 +1251,12 @@ export default function App() {
   const leaveVoiceRef = useRef(() => {})
   const [videoOn, setVideoOn] = useState(false) // is the local camera on
   const [screenSharing, setScreenSharing] = useState(false) // is the local screen being shared
+  // Screen share with the webcam drawn in (screenCompositor.ts): the compositor, the raw screen track
+  // it reads, and where the camera sits (0..1 across the free space; bottom-right by default).
+  const compositorRef = useRef(null)
+  const screenTrackRef = useRef(null)
+  // (readPref is declared further down, so localStorage is read directly here.)
+  const [camPip, setCamPip] = useState(() => { try { return clampPip(JSON.parse(localStorage.getItem('lanparty_cam_pip') || 'null')) } catch (_) { return clampPip(null) } })
   const [screenQuality, setScreenQuality] = useState('1080p30') // selected screen-share quality
   const [showQualityMenu, setShowQualityMenu] = useState(false)
   const [voiceChannelId, setVoiceChannelId] = useState(null) // which voice channel we're connected to
@@ -6075,7 +6146,8 @@ export default function App() {
 
   // Swap the local video track (camera or screen) across all peers. Pass null to stop video.
   // Add/remove of a track triggers renegotiation (onnegotiationneeded) on each connection.
-  const setLocalVideoTrack = (newTrack) => {
+  // keepOld: the old track goes on running (the camera, while it is drawn into a screen share).
+  const setLocalVideoTrack = (newTrack, { keepOld = false } = {}) => {
     const ls = localStreamRef.current
     if (!ls) return
     const old = ls.getVideoTracks()[0]
@@ -6089,7 +6161,7 @@ export default function App() {
         const sender = pc.getSenders().find((s) => s.track === old)
         if (sender) pc.removeTrack(sender)
       })
-      if (old !== newTrack) { old.stop(); ls.removeTrack(old) }
+      if (old !== newTrack) { if (!keepOld) old.stop(); ls.removeTrack(old) }
     }
     if (newTrack) {
       if (!ls.getVideoTracks().includes(newTrack)) ls.addTrack(newTrack)
@@ -6180,7 +6252,9 @@ export default function App() {
   // Full camera teardown (turning the camera off, or closing the preview): drop the outgoing track,
   // stop effects, release the raw device, clear the preview.
   const stopCamera = () => {
-    setLocalVideoTrack(null)
+    // Sharing the screen with the camera drawn in: take the camera out, keep the share going.
+    if (compositorRef.current) compositorRef.current.setCamera(null)
+    else setLocalVideoTrack(null)
     try { effectsRef.current?.stop() } catch (e) {}
     effectsRef.current = null
     const out = outputTrackRef.current
@@ -6189,7 +6263,7 @@ export default function App() {
     setPreviewStream(null)
     setShowEffectsMenu(false)
     setVideoOn(false)
-    if (inVoice) emitStreamState(false, false)
+    if (inVoice) emitStreamState(false, !!compositorRef.current)
   }
 
   // Tear down just the preview pipeline (no state toggles) — used when the popup closes without
@@ -6250,7 +6324,7 @@ export default function App() {
   // so the user can compare looks before turning the camera on.
   const chooseEffect = async (effectId, bgUrlOverride) => {
     setWebcamEffect(effectId)
-    if (videoOn) { if (!screenSharing) await applyLiveEffect(effectId, bgUrlOverride); return }
+    if (videoOn) { if (!screenSharing || compositorRef.current) await applyLiveEffect(effectId, bgUrlOverride); return }
     const out = await buildOutput(effectId, bgUrlOverride)
     setPreviewOutput(out)
   }
@@ -6267,7 +6341,11 @@ export default function App() {
         effectsRef.current.setCameraTrack(s.getVideoTracks()[0])
       } else {
         const out = await buildOutput(webcamEffect)
-        if (out) { outputTrackRef.current = out; setLocalVideoTrack(out) }
+        if (out) {
+          outputTrackRef.current = out
+          if (compositorRef.current) compositorRef.current.setCamera(out)
+          else setLocalVideoTrack(out)
+        }
       }
       if (oldRaw) oldRaw.getTracks().forEach((t) => t.stop())
     } catch (err) {
@@ -6294,6 +6372,15 @@ export default function App() {
     const out = outputTrackRef.current
     if (!out) return
     out.onended = () => stopCamera()
+    // Sharing the screen: the camera goes into the corner of the share instead of replacing it.
+    if (compositorRef.current) {
+      compositorRef.current.setCamera(out)
+      setVideoOn(true)
+      setShowEffectsMenu(false)
+      setPreviewStream(null)
+      emitStreamState(true, true)
+      return
+    }
     setLocalVideoTrack(out)
     setScreenSharing(false)
     setVideoOn(true)
@@ -6393,23 +6480,65 @@ export default function App() {
       const track = disp.getVideoTracks()[0]
       if (!track) return
       track.onended = () => stopScreenShare() // user hit the browser/OS "stop sharing"
-      setLocalVideoTrack(track)
+      screenTrackRef.current = track
+      // With the camera on, it stays on: drawn into the share (bottom-right unless moved) where
+      // the browser can do that, so everyone sees both. Elsewhere the screen replaces the camera.
+      const cam = videoOn && outputTrackRef.current && outputTrackRef.current.readyState === 'live' ? outputTrackRef.current : null
+      let send = track
+      if (compositingSupported()) {
+        try {
+          const comp = new ScreenCompositor(track)
+          comp.setPosition(camPip)
+          comp.setCamera(cam)
+          compositorRef.current = comp
+          send = comp.output
+        } catch (err) {
+          console.warn('screen compositing unavailable, sharing the screen alone', err)
+          compositorRef.current = null
+        }
+      }
+      // The camera's track is kept running when it is drawn into the share.
+      setLocalVideoTrack(send, { keepOld: !!(cam && compositorRef.current) })
       applyVideoBitrate(q.bitrate)
       setScreenQuality(qualityId)
-      setVideoOn(false)
+      if (!compositorRef.current) setVideoOn(false)
       setScreenSharing(true)
       socket?.emit('voice:screenshare-state', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', sharing: true })
-      emitStreamState(false, true)
+      emitStreamState(!!(cam && compositorRef.current), true)
     } catch (err) {
       // Picker cancelled or permission denied — no-op.
     }
   }
 
   const stopScreenShare = () => {
-    setLocalVideoTrack(null)
+    const comp = compositorRef.current
+    compositorRef.current = null
+    const screen = screenTrackRef.current
+    screenTrackRef.current = null
+    // The camera was drawn into the share and is still on: it goes back to being the video.
+    const cam = comp && videoOn && outputTrackRef.current && outputTrackRef.current.readyState === 'live' ? outputTrackRef.current : null
+    setLocalVideoTrack(cam)
+    if (comp) comp.stop()
+    if (screen) { screen.onended = null; try { screen.stop() } catch (_) { /* already stopped */ } }
+    if (cam) applyVideoBitrate(2_500_000)
     setScreenSharing(false)
     socket?.emit('voice:screenshare-state', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', sharing: false })
-    emitStreamState(false, false)
+    emitStreamState(!!cam, false)
+  }
+
+  // The camera's shape, for placing the drag handle over it.
+  const camAspect = () => {
+    const st = outputTrackRef.current?.getSettings?.() || {}
+    return st.width && st.height ? st.width / st.height : 16 / 9
+  }
+
+  // Move the camera inside your screen share (dragged on your own tile). Everyone sees it move,
+  // because it is drawn into the video itself.
+  const moveCamPip = (pos, { save = false } = {}) => {
+    const next = clampPip(pos)
+    setCamPip(next)
+    compositorRef.current?.setPosition(next)
+    if (save) writePref('lanparty_cam_pip', JSON.stringify(next))
   }
 
   // Mute/unmute the local mic (footer button + in-call control share this). Toggles the audio
@@ -6595,6 +6724,9 @@ export default function App() {
     setConnReport(null)
     setConnHealth('ok')
     setRemoteStreams({})
+    try { compositorRef.current?.stop() } catch (e) {}
+    compositorRef.current = null
+    if (screenTrackRef.current) { screenTrackRef.current.onended = null; try { screenTrackRef.current.stop() } catch (e) {} screenTrackRef.current = null }
     try { effectsRef.current?.stop() } catch (e) {}
     effectsRef.current = null
     if (rawCamStreamRef.current) { rawCamStreamRef.current.getTracks().forEach((t) => t.stop()); rawCamStreamRef.current = null }
@@ -8840,7 +8972,7 @@ export default function App() {
                 // connected yet — so all participants show, with an avatar until video arrives.
                 const participantIds = Array.from(new Set([...Object.keys(peerNames), ...Object.keys(remoteStreams)]))
                 const tiles = [
-                  { key: 'self', stream: localStream, label: `${name || 'You'} (you)`, muted: true, isScreen: screenSharing },
+                  { key: 'self', stream: localStream, label: `${name || 'You'} (you)`, muted: true, isScreen: screenSharing, pip: screenSharing && videoOn && compositorRef.current ? { pos: camPip, onMove: moveCamPip, aspect: camAspect() } : null },
                   ...participantIds.map((id) => ({ key: id, stream: remoteStreams[id] || null, label: peerNames[id] || 'Guest', muted: deafened, sinkId: selectedSpeakerId, isScreen: !!screenSharingPeers[id], volume: peerVolumes[peerNames[id]] ?? 1, onVolume: peerNames[id] ? (v) => setPeerVolume(peerNames[id], v) : undefined })),
                 ]
                 const start = voicePageClamped * VOICE_TILES_PER_PAGE
@@ -8854,7 +8986,7 @@ export default function App() {
                         <>
                           <div className="video-stage" ref={videoStageRef} style={{ gridTemplateColumns: `repeat(${voiceGrid.cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${voiceGrid.rows}, minmax(0, 1fr))` }}>
                             {pageTiles.map((t) => (
-                              <VideoTile key={t.key} stream={t.stream} label={t.label} isScreen={t.isScreen} volume={t.volume} onVolume={t.onVolume} onExpand={(s, l) => setFullscreenStream({ stream: s, label: l })} />
+                              <VideoTile key={t.key} stream={t.stream} label={t.label} isScreen={t.isScreen} volume={t.volume} onVolume={t.onVolume} pip={t.pip} onExpand={(s, l) => setFullscreenStream({ stream: s, label: l })} />
                             ))}
                           </div>
                           {voicePageCount > 1 && (
