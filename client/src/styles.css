@@ -3005,3 +3005,4 @@ a.install-gate-btn{display:flex;align-items:center;justify-content:center;box-si
   .composer-notice.unverified{flex-wrap:wrap}
   .composer-notice.unverified .feedback-btn{min-height:44px;width:100%}
 }
+.call-audio-layer{display:none}

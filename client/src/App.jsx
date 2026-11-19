@@ -982,42 +982,74 @@ function RemoteAudio({ stream }) {
   return <audio ref={ref} autoPlay playsInline />
 }
 
-// A single participant tile: shows their camera video when a live video track is present,
-// otherwise an avatar initial. The <video> element also plays the stream's audio.
-function VideoTile({ stream, label, muted, isScreen, onExpand, sinkId, volume = 1, onVolume }) {
+// One person's voice in the call. Always mounted while you are in the call, whatever is on screen
+// (an activity, a text channel, another page of tiles, the home view): the tiles below are picture
+// only. Voices used to play from the tiles themselves, so anything that took the tiles off screen
+// took the voices with it.
+function CallAudio({ stream, muted, volume = 1, sinkId }) {
   const ref = useRef()
-  const [hasVideo, setHasVideo] = useState(false)
-  const [showVolume, setShowVolume] = useState(false)
-  // Per-person volume. Set imperatively for the same reason as `muted` below, and re-applied when
-  // the stream changes because a fresh srcObject can reset the element.
-  useEffect(() => { if (ref.current) ref.current.volume = Math.max(0, Math.min(1, volume)) }, [volume, stream])
-  // React doesn't reliably update the <video> `muted` DOM property on re-render, so set it imperatively.
+  useEffect(() => {
+    if (ref.current) { ref.current.srcObject = stream || null; if (stream) ref.current.play().catch(() => {}) }
+  }, [stream])
+  // Set imperatively: React does not reliably update the `muted` DOM property on re-render, and a
+  // fresh srcObject can reset volume.
   useEffect(() => { if (ref.current) ref.current.muted = !!muted }, [muted])
-  // Route this tile's audio to the user's chosen output device (speaker selection).
+  useEffect(() => { if (ref.current) ref.current.volume = Math.max(0, Math.min(1, volume)) }, [volume, stream])
+  // Route the voice to the user's chosen output device (speaker selection).
   useEffect(() => {
     if (sinkId && ref.current && typeof ref.current.setSinkId === 'function') ref.current.setSinkId(sinkId).catch(() => {})
   }, [sinkId, stream])
+  return <audio ref={ref} autoPlay className="call-audio" />
+}
+
+// A single participant tile: shows their camera video when a live video track is present,
+// otherwise an avatar initial. Picture only: the voice plays from CallAudio. The volume control
+// here sets that person's CallAudio volume.
+function VideoTile({ stream, label, isScreen, onExpand, volume = 1, onVolume }) {
+  const ref = useRef()
+  const [hasVideo, setHasVideo] = useState(false)
+  const [showVolume, setShowVolume] = useState(false)
+  useEffect(() => { if (ref.current) ref.current.muted = true }, [stream])
   useEffect(() => {
     if (ref.current) { ref.current.srcObject = stream || null; if (stream) ref.current.play().catch(() => {}) }
     if (!stream) { setHasVideo(false); return }
-    const update = () => setHasVideo(stream.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted))
-    // A video track added later (e.g. a peer turns their camera on after connecting) arrives via
-    // 'addtrack' and is often initially muted until RTP flows — so we must (re)attach the mute/unmute
-    // listeners to whatever tracks currently exist, not just the ones present on first render.
-    const attach = () => stream.getVideoTracks().forEach((t) => { t.onmute = update; t.onunmute = update; t.onended = update })
-    const onTrackChange = () => { attach(); update() }
+    const video = ref.current
+    // Showing: a live video track, unmuted or already drawing frames.
+    const update = () => setHasVideo(stream.getVideoTracks().some((t) => t.readyState === 'live' && (!t.muted || (video && video.videoWidth > 0))))
+    // A video track added later (a peer turns their camera on, or starts sharing their screen) is
+    // often muted until frames flow, so mute/unmute listeners go on whatever tracks exist now.
+    // Tracks put into the stream by our own code (the SFU path does stream.addTrack) fire no
+    // 'addtrack' event at all, so the stream is also re-checked every second, and the <video>
+    // element's own events say when a picture starts or changes size. Without that, the other
+    // person's camera or screen arrived and played, but the tile went on showing their initial.
+    let known = ''
+    const attach = () => {
+      const tracks = stream.getVideoTracks()
+      const ids = tracks.map((t) => t.id).join(',')
+      if (ids === known) return
+      known = ids
+      tracks.forEach((t) => { t.onmute = update; t.onunmute = update; t.onended = update })
+      update()
+    }
+    const onTrackChange = () => { known = ''; attach() }
     attach()
     update()
     stream.addEventListener('addtrack', onTrackChange)
     stream.addEventListener('removetrack', onTrackChange)
+    video?.addEventListener('resize', update)
+    video?.addEventListener('loadeddata', update)
+    const poll = setInterval(() => { attach(); update() }, 1000)
     return () => {
+      clearInterval(poll)
       stream.removeEventListener('addtrack', onTrackChange)
       stream.removeEventListener('removetrack', onTrackChange)
+      video?.removeEventListener('resize', update)
+      video?.removeEventListener('loadeddata', update)
     }
   }, [stream])
   return (
     <div className={`video-tile${hasVideo ? ' has-video' : ''}`}>
-      <video ref={ref} autoPlay playsInline muted={muted} />
+      <video ref={ref} autoPlay playsInline muted />
       {!hasVideo && <div className="video-tile-avatar">{(label || '?').trim().slice(0, 1).toUpperCase()}</div>}
       <div className="video-tile-label">{label}</div>
       {/* Only on other people's tiles (onVolume is not passed for your own). One loud mic should not
@@ -1073,7 +1105,8 @@ function PreviewVideo({ stream }) {
 function FullscreenVideo({ stream }) {
   const ref = useRef()
   useEffect(() => { if (ref.current) ref.current.srcObject = stream || null }, [stream])
-  return <video ref={ref} autoPlay playsInline className="screen-fullscreen-video" />
+  // Picture only: the sound is already playing from CallAudio, and would otherwise play twice.
+  return <video ref={ref} autoPlay playsInline muted className="screen-fullscreen-video" />
 }
 
 function PaperclipIcon() {
@@ -8821,7 +8854,7 @@ export default function App() {
                         <>
                           <div className="video-stage" ref={videoStageRef} style={{ gridTemplateColumns: `repeat(${voiceGrid.cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${voiceGrid.rows}, minmax(0, 1fr))` }}>
                             {pageTiles.map((t) => (
-                              <VideoTile key={t.key} stream={t.stream} label={t.label} muted={t.muted} sinkId={t.sinkId} isScreen={t.isScreen} volume={t.volume} onVolume={t.onVolume} onExpand={(s, l) => setFullscreenStream({ stream: s, label: l })} />
+                              <VideoTile key={t.key} stream={t.stream} label={t.label} isScreen={t.isScreen} volume={t.volume} onVolume={t.onVolume} onExpand={(s, l) => setFullscreenStream({ stream: s, label: l })} />
                             ))}
                           </div>
                           {voicePageCount > 1 && (
@@ -9545,6 +9578,14 @@ export default function App() {
         </div>
       )}
       {/* Full-screen viewer for a shared screen */}
+      {/* Everyone's voice while you are in a call, whatever is on screen. See CallAudio. */}
+      {inVoice && (
+        <div className="call-audio-layer" aria-hidden="true">
+          {Object.entries(remoteStreams).map(([id, stream]) => (
+            <CallAudio key={id} stream={stream} muted={deafened} volume={peerVolumes[peerNames[id]] ?? 1} sinkId={selectedSpeakerId} />
+          ))}
+        </div>
+      )}
       {fullscreenStream && (
         <div className="screen-fullscreen" onClick={() => setFullscreenStream(null)}>
           <FullscreenVideo stream={fullscreenStream.stream} />
