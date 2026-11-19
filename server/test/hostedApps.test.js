@@ -400,6 +400,8 @@ describe('hosted apps (server)', () => {
     socket.updates = [];
     socket.lists = [];
     socket.notices = [];
+    socket.running = []; // every activity:list it was sent: what is running in its voice room
+    socket.on('activity:list', (l) => socket.running.push(l));
     socket.on('activity:update', (a) => { socket.updates.push(a); socket.act = a; });
     socket.on('activity:app-joined', (m) => socket.lists.push(m));
     for (const event of ['app:submitted', 'app:review-queue', 'app:reviewed']) socket.on(event, (payload) => socket.notices.push({ event, payload }));
@@ -421,6 +423,12 @@ describe('hosted apps (server)', () => {
     const started = once(socket, 'activity:update', (v) => isApp(v) && v.by === socket.userName && v.state.run !== last);
     socket.emit('activity:start', { serverId: 'demo', channelId, type: 'app', appId });
     return started;
+  };
+  // Open a running activity from the list (its Join button); for an app, this is the card view.
+  const joinAct = (socket, channelId, id) => {
+    const opened = once(socket, 'activity:update', (v) => v != null && v.id === id);
+    socket.emit('activity:join', { serverId: 'demo', channelId, id });
+    return opened;
   };
   // A start the server must ignore. The built-in started right after it is handled later on the
   // same socket, so once that arrives the refused start has been worked through.
@@ -670,11 +678,13 @@ describe('hosted apps (server)', () => {
       const room = `h-${status}`;
       const dev = await enter('dev', room);
       const ben = await enter('ben', room);
-      const card = once(ben, 'activity:update', isApp);
+      const listed = once(ben, 'activity:list', (l) => l.some((a) => a.type === 'app'));
       const started = await startApp(dev, room, app.id);
       assert.equal(started.state.approved, false, status);
       assert.equal(started.state.hosted, true);
-      const seen = await card;
+      const row = (await listed).find((a) => a.type === 'app');
+      assert.equal(row.approved, false, 'the list says it is not approved');
+      const seen = await joinAct(ben, room, row.id);
       assert.equal(seen.state.approved, false, 'the people asked to join are told it is not approved');
       assert.equal(seen.state.hosted, true);
       assert.equal(seen.state.url, HOSTED);
@@ -822,6 +832,7 @@ describe('hosted apps (server)', () => {
       const bystander = await enter('ben', `${room}-other`);
       const first = await startApp(starter, room, app.id);
       await startApp(bystander, `${room}-other`, other.id);
+      await joinAct(watcher, room, first.id); // looking at its card
 
       // Edits that are not about what it runs leave the room alone.
       for (const harmless of [{ name: `Renamed ${app.id}` }, { url: HOSTED }, { embed: true }, { description: 'words' }]) {
@@ -1025,13 +1036,12 @@ describe('hosted apps (server)', () => {
       const room = `rk-who-${kind}`;
       const starter = await enter('owner', room);
       const ben = await enter('ben', room);
-      const card = once(ben, 'activity:update', isApp);
       const started = await startApp(starter, room, app.id);
       const key = started.state.roomKey;
       assert.match(key, /^[0-9a-f]{32}$/, kind);
 
-      // In the voice room but not in the app: the join card, without the key.
-      const seen = await card;
+      // In the voice room, and looking at the activity, but not in the app: the join card, without the key.
+      const seen = await joinAct(ben, room, started.id);
       assert.equal(seen.state.roomKey, null, kind);
       assert.equal(seen.state.name, app.name);
       // State changes and messages among those who joined tell him nothing either.
@@ -1039,11 +1049,12 @@ describe('hosted apps (server)', () => {
       assert.equal((await appEvent(starter, room, { kind: 'emit', data: 'hi' })).ok, true);
       await sleep(150);
 
-      // Arriving in the voice room later: the card again.
+      // Arriving in the voice room later: a row in the list, and the card again when opened.
       const late = await enter('dev');
-      const lateCard = once(late, 'activity:update', isApp);
+      const lateList = once(late, 'activity:list', (l) => l.some((a) => a.id === started.id));
       late.emit('voice:join', { serverId: 'demo', channelId: room });
-      assert.equal((await lateCard).state.roomKey, null, kind);
+      await lateList;
+      assert.equal((await joinAct(late, room, started.id)).state.roomKey, null, kind);
 
       // Joining is what hands it over...
       assert.equal((await appEvent(ben, room, { kind: 'join' })).ok, true);
@@ -1061,7 +1072,8 @@ describe('hosted apps (server)', () => {
       // Nothing the late arrival was ever sent has it, in any event.
       await sleep(150);
       assert.ok(late.updates.filter(isApp).length >= 1);
-      assert.ok(!JSON.stringify([late.updates, late.lists]).includes(key), `${kind}: the key never reached someone who did not join`);
+      assert.ok(!JSON.stringify([late.updates, late.lists, late.running]).includes(key), `${kind}: the key never reached someone who did not join`);
+      assert.ok(!JSON.stringify([ben.running, starter.running]).includes(key), `${kind}: and the list of what is running never carries it`);
       // Nor is it anywhere in the app directory.
       for (const who of ['owner', 'ben']) assert.ok(!JSON.stringify(await listFor(who)).includes(key));
     }
@@ -1072,6 +1084,7 @@ describe('hosted apps (server)', () => {
     const dev = await enter('dev', 'rk-approve');
     const ben = await enter('ben', 'rk-approve');
     const started = await startApp(dev, 'rk-approve', app.id);
+    await joinAct(ben, 'rk-approve', started.id); // looking at its card
     const forDev = once(dev, 'activity:update', (v) => isApp(v) && v.state.approved === true);
     const forBen = once(ben, 'activity:update', (v) => isApp(v) && v.state.approved === true);
     assert.equal((await act('owner', app.id, 'approve', reviewed(app))).status, 200);

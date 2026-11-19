@@ -17,7 +17,9 @@ const NO_SIGNAL_AFTER_MS = 4000
  *
  * The mic is opened only while testing and released the moment the panel closes or unmounts.
  */
-export default function MicTest({ devices = [], selectedDeviceId = null, onSelectDevice }) {
+// `compact` (the pre-join screen): that screen already has the device picker, so it is left out
+// here, and the test starts as soon as the panel opens instead of behind a second button.
+export default function MicTest({ devices = [], selectedDeviceId = null, onSelectDevice, compact = false }) {
   const [testing, setTesting] = useState(false)
   const [error, setError] = useState(null)
   const [recording, setRecording] = useState(false)
@@ -43,6 +45,7 @@ export default function MicTest({ devices = [], selectedDeviceId = null, onSelec
   // Release everything on unmount — an open mic left behind shows an active-recording indicator in
   // the OS and is a privacy problem.
   useEffect(() => () => teardown(), [])
+  useEffect(() => { if (compact) startTest() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const teardown = () => {
     clearInterval(countdownRef.current)
@@ -158,7 +161,7 @@ export default function MicTest({ devices = [], selectedDeviceId = null, onSelec
 
   return (
     <div className="mictest">
-      {deviceList.length > 0 && (
+      {!compact && deviceList.length > 0 && (
         <div className="profile-edit-row">
           <label className="app-field-label" htmlFor="mictest-device">Input device</label>
           <select
@@ -199,15 +202,15 @@ export default function MicTest({ devices = [], selectedDeviceId = null, onSelec
                     : <span className="mictest-listening">Listening… speak normally</span>}
               </div>
               <div className="profile-edit-row">
-                <button type="button" className="connect-btn" onClick={record} disabled={recording}>
+                <button type="button" className={compact ? 'prejoin-tool-btn' : 'connect-btn'} onClick={record} disabled={recording}>
                   {recording ? 'Recording…' : `Record ${RECORD_SECONDS}s`}
                 </button>
                 {clipUrl && !recording && (
-                  <button type="button" className="profile-link-btn" onClick={playBack} disabled={playing}>
+                  <button type="button" className={compact ? 'prejoin-tool-btn' : 'profile-link-btn'} onClick={playBack} disabled={playing}>
                     {playing ? 'Playing…' : '▶ Play it back'}
                   </button>
                 )}
-                <button type="button" className="profile-link-btn" onClick={stopTest}>Stop test</button>
+                {!compact && <button type="button" className="profile-link-btn" onClick={stopTest}>Stop test</button>}
               </div>
             </>
           )}
@@ -221,9 +224,9 @@ export default function MicTest({ devices = [], selectedDeviceId = null, onSelec
         </div>
       )}
       {error && <div className="composer-error">{error}</div>}
-      <div className="profile-hint">
+      <div className={compact ? 'voice-effects-hint' : 'profile-hint'}>
         Recording plays back only to you — nothing is uploaded or shared. The mic is released when you
-        stop the test.
+        {compact ? ' hide' : ' stop'} the test.
       </div>
     </div>
   )

@@ -54,8 +54,10 @@ interface AppActivityProps {
   /** Sends an activity event for the current voice room; the ack is the server's verdict. `run`
    *  says which run of the app the event is for, so the server can drop it if the room has moved on. */
   onEvent: (event: ActivityEvent, ack?: EventAck, run?: string) => void
-  /** Ends the activity for everyone. */
+  /** Ends the activity for everyone in it. */
   onClose: () => void
+  /** Back to the call: out of this activity, which goes on for the others in it. */
+  onExit?: () => void
   /** Public identity (name, avatar) of a member, for the card and for the app. */
   describePerson: (username: string) => BridgePerson
   /** Makes a server-relative url absolute (the dev client runs on a different origin). Must be
@@ -95,7 +97,7 @@ function PersonChip({ person }: { person: BridgePerson }) {
   )
 }
 
-export default function AppActivity({ activity, me, onEvent, onClose, describePerson, resolveSrc, subscribe, autoJoin = false, description = '' }: AppActivityProps) {
+export default function AppActivity({ activity, me, onEvent, onClose, onExit, describePerson, resolveSrc, subscribe, autoJoin = false, description = '' }: AppActivityProps) {
   const { state, by } = activity
   const joinedNames = Array.isArray(state.joined) ? state.joined.filter((n): n is string => typeof n === 'string') : []
   const participants = joinedNames.map(describePerson)
@@ -292,8 +294,10 @@ export default function AppActivity({ activity, me, onEvent, onClose, describePe
           <span className="activity-by">· started by {by}</span>
         </span>
         <span className="app-activity-head-actions">
-          {phase === 'joined' && <button type="button" className="app-activity-leave" onClick={leave} title="Close the app for you. It keeps running for everyone else.">Leave</button>}
-          <button type="button" className="activity-close" onClick={onClose} title={`End ${name} for everyone`} aria-label="End for everyone">✕ End</button>
+          {onExit
+            ? <button type="button" className="app-activity-leave" onClick={() => { leave(); onExit() }} title="Back to the call. The app keeps running for the others in it.">Leave</button>
+            : phase === 'joined' && <button type="button" className="app-activity-leave" onClick={leave} title="Close the app for you. It keeps running for everyone else.">Leave</button>}
+          <button type="button" className="activity-close" onClick={onClose} title={`End ${name} for everyone in it`} aria-label="End for everyone in it">✕ End</button>
         </span>
       </div>
       <div className="activity-body">

@@ -233,12 +233,16 @@ describe('app room epochs (server)', () => {
     return socket;
   }
   const settled = async (condition) => { for (let i = 0; i < 60 && !condition(); i++) await sleep(50); };
+  /** run -> the id of the activity it is running in, so that others in the call can open it. */
+  const idOfRun = new Map();
   // Resolves with the starter's own view of the new run (they are joined from the first update).
-  const startApp = (socket) => {
+  const startApp = async (socket) => {
     const last = isApp(socket.act) ? socket.act.state.run : null;
     const started = once(socket, 'activity:update', (v) => isApp(v) && v.by === socket.userName && v.state.run !== last);
     socket.emit('activity:start', { ...socket.where, type: 'app', appId: app.id });
-    return started;
+    const act = await started;
+    idOfRun.set(act.state.run, act.id);
+    return act;
   };
   // A start the server must ignore: nobody in the room, the sender included, hears of a new run.
   const startRefused = async (socket, others = []) => {
@@ -254,9 +258,15 @@ describe('app room epochs (server)', () => {
     socket.emit('activity:event', { ...socket.where, app: run || socket.act.state.run, event }, resolve);
   });
   const endedFor = (socket) => once(socket, 'activity:update', (v) => v === null);
-  // Waits until this socket has been shown that run (its card, or the app itself).
+  // Opens that run's activity from the list (its Join button) unless this socket is already in it,
+  // and resolves with what it was shown: the card, or the app itself for someone who joined it.
   const sees = async (socket, run) => {
-    if (!(isApp(socket.act) && socket.act.state.run === run)) await once(socket, 'activity:update', (v) => isApp(v) && v.state.run === run);
+    if (!(isApp(socket.act) && socket.act.state.run === run)) {
+      const shown = once(socket, 'activity:update', (v) => isApp(v) && v.state.run === run);
+      socket.emit('activity:join', { ...socket.where, id: idOfRun.get(run) });
+      await shown;
+    }
+    return socket.act;
   };
   // Every room key this socket was ever sent, in any update.
   const keysSeen = (socket) => new Set(socket.updates.filter(isApp).map((v) => v.state.roomKey).filter(Boolean));
@@ -304,6 +314,7 @@ describe('app room epochs (server)', () => {
     const ann = await enter('ann', srv.id, srv.voice);
     const ben = await enter('ben', srv.id, srv.voice);
     const before = await startApp(ben);
+    await sees(ann, before.state.run);
     assert.equal((await appEvent(ann, { kind: 'join' })).ok, true);
     assert.equal(ann.act.state.roomKey, before.state.roomKey);
 
@@ -326,6 +337,8 @@ describe('app room epochs (server)', () => {
     await settled(() => ben.removed.length > 0);
     assert.deepEqual(ben.removed, [{ serverId: srv.id, channelId: srv.voice }]);
     await startRefused(ben, [ann]);
+    ben.emit('activity:join', { ...ben.where, id: idOfRun.get(after.state.run) });
+    await sleep(150);
     assert.equal((await appEvent(ben, { kind: 'join' }, after.state.run)).ok, false);
     assert.ok(!ben.updates.some((v) => isApp(v) && v.state.run === after.state.run), 'ben is never shown the new run');
     assert.equal(ann.act.state.run, after.state.run, 'still ann\'s run');
@@ -494,7 +507,7 @@ describe('app room epochs (server)', () => {
     const ben = await enter('ben', srv.id, srv.voice);
     const cara = await enter('cara', srv.id, second);
     const running = await startApp(ann);
-    const card = isApp(ben.act) ? ben.act : await once(ben, 'activity:update', isApp);
+    const card = await sees(ben, running.state.run);
     assert.equal(card.state.roomKey, null, 'ben is in the room but has not joined the app');
     const tttUp = once(cara, 'activity:update', (v) => v != null && v.type === 'ttt');
     cara.emit('activity:start', { ...cara.where, type: 'ttt' });

@@ -1,6 +1,6 @@
 {
   "name": "lan-party-desktop",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "private": true,
   "description": "Electron desktop wrapper for the LAN Party communication app",
   "author": "Jump Vault LLC",
@@ -25,6 +25,9 @@
       "updater.html",
       "updater.js",
       "updater-preload.js",
+      "notify.html",
+      "notify.js",
+      "notify-preload.js",
       "package.json",
       "assets/**"
     ],

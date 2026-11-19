@@ -275,6 +275,8 @@ describe('app activity (sockets)', () => {
   let server, call, base, tokens, bundleApp, secondApp, linkApp;
   /** channelId -> the run id of the app last started there; app events have to carry it. */
   const runs = {};
+  /** channelId -> the activity id of the app last started there; others open it by this id. */
+  const actIds = {};
   /** @type {any[]} */
   const open = [];
 
@@ -304,6 +306,8 @@ describe('app activity (sockets)', () => {
     socket.updates = [];
     socket.messages = [];
     socket.lists = [];
+    socket.running = null; // the last activity:list: what is running in its voice room
+    socket.on('activity:list', (list) => { socket.running = list; });
     socket.on('activity:update', (act) => { socket.updates.push(act); socket.act = act; });
     // The joined list travels on its own; fold it into the activity the way the client does.
     socket.on('activity:app-joined', (m) => {
@@ -337,7 +341,15 @@ describe('app activity (sockets)', () => {
     socket.emit('activity:start', { serverId: 'demo', channelId, type: 'app', appId });
     const act = await started;
     runs[channelId] = act.state.run;
+    actIds[channelId] = act.id;
     return act;
+  };
+  // Open a running activity (the Join button on its row in the list). For an app this is its card
+  // view; taking part in the app itself is still the app's own { kind: 'join' }.
+  const joinAct = async (socket, channelId, id = actIds[channelId]) => {
+    const opened = once(socket, 'activity:update', (v) => v != null && v.id === id);
+    socket.emit('activity:join', { serverId: 'demo', channelId, id });
+    return opened;
   };
   const listIs = (names) => (m) => JSON.stringify(m.joined) === JSON.stringify(names);
   const uploadBundle = async (name, token) => {
@@ -410,6 +422,7 @@ describe('app activity (sockets)', () => {
     const ann = await enter('ann', 'v-sync');
     const ben = await enter('ben', 'v-sync');
     await startApp(ann, 'v-sync');
+    await joinAct(ben, 'v-sync');
     assert.deepEqual(await send(ben, 'v-sync', { kind: 'join' }), { ok: true, rev: 0 });
 
     assert.deepEqual(await send(ann, 'v-sync', { kind: 'set', patch: { a: 1, b: { x: 1 } } }), { ok: true, rev: 1 });
@@ -439,13 +452,25 @@ describe('app activity (sockets)', () => {
   test('uploaded code reaches nobody who has not chosen to join', async () => {
     const ann = await enter('ann', 'v-optin');
     const ben = await enter('ben', 'v-optin');
-    const benSees = once(ben, 'activity:update', isApp);
+    const benSees = once(ben, 'activity:list', (l) => l.some((a) => a.type === 'app'));
     await startApp(ann, 'v-optin');
-    // Ben is in the room, so he is told it is running — which is all the Join card needs.
-    const card = await benSees;
+    // Ben is in the room, so he is told it is running: a row in the list, nothing of the app's own.
+    const row = (await benSees).find((a) => a.type === 'app');
+    assert.equal(row.name, 'Bridge App');
+    assert.equal(row.by, 'ann');
+    assert.deepEqual(row.people, ['ann']);
+    assert.ok(!('state' in row) && !JSON.stringify(row).includes('roomKey'), 'the list carries no state and no room key');
+    assert.ok(!ben.updates.some(isApp), 'starting it opened nothing for him');
+    // Not in it at all, he cannot drive it.
+    assert.deepEqual(await send(ben, 'v-optin', { kind: 'set', patch: { cheat: true } }), { ok: false, reason: 'ended' });
+
+    // Opening it shows him the Join card: who is playing, but no shared state and no room key.
+    const card = await joinAct(ben, 'v-optin');
     assert.equal(card.state.name, 'Bridge App');
     assert.equal(card.by, 'ann');
     assert.deepEqual(card.state.joined, ['ann']);
+    assert.deepEqual(card.state.shared, {});
+    assert.equal(card.state.roomKey, null);
 
     await send(ann, 'v-optin', { kind: 'set', patch: { round: 1 } });
     await send(ann, 'v-optin', { kind: 'emit', data: 'hello?' });
@@ -463,12 +488,17 @@ describe('app activity (sockets)', () => {
     assert.deepEqual(ben.act.state.shared, { round: 1 });
     assert.deepEqual(ben.act.state.joined, ['ann', 'ben']);
 
-    // Someone arriving in the voice room later gets the card, not the state.
+    // Someone arriving in the voice room later is opened nothing: a row in the list, and the card
+    // (not the state) if they open it.
     const cara = await enter('cara');
-    const late = once(cara, 'activity:update', isApp);
+    const late = once(cara, 'activity:update');
+    const lateList = once(cara, 'activity:list');
     cara.emit('voice:join', { serverId: 'demo', channelId: 'v-optin' });
-    const lateCard = await late;
+    assert.equal(await late, null);
+    assert.deepEqual((await lateList).find((a) => a.type === 'app').people, ['ann', 'ben']);
+    const lateCard = await joinAct(cara, 'v-optin');
     assert.deepEqual(lateCard.state.shared, {});
+    assert.equal(lateCard.state.roomKey, null);
     assert.deepEqual(lateCard.state.joined, ['ann', 'ben']);
   });
 
@@ -478,7 +508,9 @@ describe('app activity (sockets)', () => {
     const cara = await enter('cara', 'v-emit');     // in the room, has not joined the app
     const dana = await enter('dana', 'v-elsewhere'); // a member of the server, in another voice room
     await startApp(ann, 'v-emit');
+    await joinAct(ben, 'v-emit');
     await send(ben, 'v-emit', { kind: 'join' });
+    await joinAct(cara, 'v-emit'); // looking at its card, not joined to the app
 
     const got = once(ben, 'activity:app-message');
     assert.deepEqual(await send(ann, 'v-emit', { kind: 'emit', data: { buzz: 1 }, from: 'dana' }), { ok: true, rev: 0 });
@@ -486,7 +518,7 @@ describe('app activity (sockets)', () => {
     await sleep(250);
     assert.deepEqual(ben.messages, [{ from: 'ann', data: { buzz: 1 } }]);
     assert.deepEqual(ann.messages, [], 'the sender does not hear its own message');
-    assert.deepEqual(cara.messages, [], 'in the room but not in the app');
+    assert.deepEqual(cara.messages, [], 'in the room and the activity, but not in the app');
     assert.deepEqual(dana.messages, [], 'another room');
     assert.deepEqual(ann.act.state.shared, {}, 'nothing was stored');
     assert.equal(ann.act.state.rev, 0);
@@ -501,6 +533,7 @@ describe('app activity (sockets)', () => {
     const ann = await enter('ann', 'v-flood');
     const ben = await enter('ben', 'v-flood');
     await startApp(ann, 'v-flood');
+    await joinAct(ben, 'v-flood');
     await send(ben, 'v-flood', { kind: 'join' });
     const answers = await Promise.all(Array.from({ length: 300 }, (_, i) => send(ann, 'v-flood', i % 2 ? { kind: 'emit', data: i } : { kind: 'set', patch: { i } })));
     await sleep(300);
@@ -523,8 +556,10 @@ describe('app activity (sockets)', () => {
 
     await startApp(ann, 'v-gate');
     await send(ann, 'v-gate', { kind: 'set', patch: { score: 1 } });
+    // She cannot open it either, so there is no activity of hers for any event to land on.
+    cara.emit('activity:join', { serverId: 'demo', channelId: 'v-gate', id: actIds['v-gate'] });
     for (const event of [{ kind: 'join' }, { kind: 'set', patch: { score: 999 } }, { kind: 'replace', shared: {} }, { kind: 'emit', data: 'hi' }, { kind: 'leave' }]) {
-      assert.deepEqual(await send(cara, 'v-gate', event), { ok: false, reason: 'not-in-room' });
+      assert.deepEqual(await send(cara, 'v-gate', event), { ok: false, reason: 'ended' });
     }
     cara.emit('activity:stop', { serverId: 'demo', channelId: 'v-gate' });
     // Replacing it with a built-in would be stopping it by another name.
@@ -537,6 +572,8 @@ describe('app activity (sockets)', () => {
     assert.deepEqual(ann.act.state.joined, ['ann']);
     assert.ok(ann.updates.every((u) => u === null || u.type === 'app'), 'the room never saw it end or change');
     assert.deepEqual(cara.updates.filter(Boolean), [], 'and the outsider was told nothing about it');
+    assert.equal(cara.running, null, 'not even that it is running');
+    assert.deepEqual(ann.running.map((a) => a.type), ['app'], 'nothing else was started in the room');
 
     // Someone in the room can still end it, as with any activity.
     const ended = once(ann, 'activity:update', (v) => v === null);
@@ -552,6 +589,8 @@ describe('app activity (sockets)', () => {
     await send(ann, 'v-joined', { kind: 'set', patch: { big: 'x'.repeat(50_000) } });
     const annUpdates = ann.updates.length;
 
+    await joinAct(ben, 'v-joined');
+    await joinAct(cara, 'v-joined');
     let seen = once(ann, 'activity:app-joined', listIs(['ann', 'ben', 'cara']));
     await send(ben, 'v-joined', { kind: 'join' });
     await send(cara, 'v-joined', { kind: 'join' });
@@ -586,6 +625,7 @@ describe('app activity (sockets)', () => {
     assert.ok(ann.lists.every((m) => m.run === ann.act.state.run && !('shared' in m)));
     assert.deepEqual(ann.act.state.joined, ['ann']);
     const dana = await enter('dana', 'v-joined');
+    await joinAct(dana, 'v-joined');
     for (let i = 0; i < 10; i++) {
       await send(dana, 'v-joined', { kind: 'join' });
       await send(dana, 'v-joined', { kind: 'leave' });
@@ -598,6 +638,7 @@ describe('app activity (sockets)', () => {
     const ann = await enter('ann', 'v-bytes');
     const ben = await enter('ben', 'v-bytes');
     await startApp(ann, 'v-bytes');
+    await joinAct(ben, 'v-bytes');
     await send(ben, 'v-bytes', { kind: 'join' });
     assert.equal((await send(ann, 'v-bytes', { kind: 'set', patch: { big: 'x'.repeat(60_000) } })).ok, true);
     // Well inside the event rate (a burst of 30), so only the byte budget can be what stops these.
@@ -615,27 +656,31 @@ describe('app activity (sockets)', () => {
     const ann = await enter('ann', 'v-stale');
     const cara = await enter('cara', 'v-stale');
     const first = await startApp(ann, 'v-stale');
+    await joinAct(cara, 'v-stale');
     await send(cara, 'v-stale', { kind: 'join' });
 
-    // The same app started again: a set from the previous run's frame, still on the wire, is not
-    // written into the new run's state — even though the server has its sender down as joined.
+    // The same app started again (Ann moves to the new activity): a set from the previous run's
+    // frame, still on the wire, is not written into the new run's state — even though the server
+    // has its sender down as joined.
     const second = await startApp(ann, 'v-stale');
     assert.notEqual(second.state.run, first.state.run);
+    assert.notEqual(second.id, first.id);
     assert.deepEqual(await send(ann, 'v-stale', { kind: 'set', patch: { fromOldFrame: 1 } }, first.state.run), { ok: false, reason: 'ended' });
     assert.deepEqual(await send(ann, 'v-stale', { kind: 'emit', data: 'old' }, first.state.run), { ok: false, reason: 'ended' });
-    // A built-in's event (they carry no tag) that arrives after an app took over: its "join" does
-    // not put that person in the app.
+    // Cara moves over to it too. A built-in's event (they carry no tag) that arrives after she is
+    // in the app: its "join" does not put her in the app.
+    await joinAct(cara, 'v-stale', second.id);
     assert.deepEqual(await send(cara, 'v-stale', { kind: 'join' }, UNTAGGED), { ok: false, reason: 'ended' });
     assert.deepEqual(await send(ann, 'v-stale', { kind: 'set', patch: { real: 1 } }), { ok: true, rev: 1 });
     assert.deepEqual(ann.act.state.shared, { real: 1 });
     assert.deepEqual(ann.act.state.joined, ['ann']);
     assert.deepEqual(cara.messages, []);
 
-    // The other way round: the app's Join, landing after Tic-Tac-Toe replaced it, seats nobody —
-    // and is answered, so the card does not wait five seconds to say so.
+    // The other way round: the app's Join, landing after its sender moved to Tic-Tac-Toe, seats
+    // nobody — and is answered, so the card does not wait five seconds to say so.
     const ttt = once(ann, 'activity:update', (v) => v != null && v.type === 'ttt');
     ann.emit('activity:start', { serverId: 'demo', channelId: 'v-stale', type: 'ttt' });
-    await ttt;
+    await joinAct(cara, 'v-stale', (await ttt).id);
     assert.deepEqual(await send(cara, 'v-stale', { kind: 'join' }), { ok: false, reason: 'ended' });
     // An untagged join after it is the game's own, and shows the tagged one above changed nothing.
     const seated = once(ann, 'activity:update', (v) => v != null && v.type === 'ttt' && !!v.state.players.X);
@@ -675,6 +720,7 @@ describe('app activity (sockets)', () => {
     const other = await enter('cara', 'v-delete-other');
     await startApp(ann, 'v-delete', secondApp.id);
     await startApp(other, 'v-delete-other', bundleApp.id); // a different app, which must survive
+    await joinAct(ben, 'v-delete'); // looking at its card
     const endedForAnn = once(ann, 'activity:update', (v) => v === null);
     const endedForBen = once(ben, 'activity:update', (v) => v === null);
 
@@ -684,6 +730,8 @@ describe('app activity (sockets)', () => {
 
     assert.equal((await call('DELETE', `/apps/${secondApp.id}`, undefined, tokens.ann)).status, 200);
     await Promise.all([endedForAnn, endedForBen]);
+    await sleep(100);
+    assert.deepEqual(ben.running, [], 'and it is gone from the list of what is running');
     assert.equal((await send(other, 'v-delete-other', { kind: 'set', patch: { ok: 1 } })).ok, true, 'other apps keep running');
     // And it cannot be started again.
     ann.emit('activity:start', { serverId: 'demo', channelId: 'v-delete', type: 'app', appId: secondApp.id });
@@ -699,7 +747,8 @@ describe('app activity (sockets)', () => {
     const created = once(ann, 'activity:update', (v) => v != null && v.type === 'poll' && v.state.question === 'Pizza?');
     ann.emit('activity:event', { serverId: 'demo', channelId: 'v-builtin', event: { kind: 'create', question: 'Pizza?', options: ['yes', 'no'] } });
     await created;
-    // App-style events mean nothing to a built-in, and an app start over one is an ordinary swap.
+    // App-style events mean nothing to a built-in, and starting an app from one simply moves the
+    // starter into the new activity.
     ann.emit('activity:event', { serverId: 'demo', channelId: 'v-builtin', event: { kind: 'set', patch: { question: 'hacked' } } });
     const swapped = await startApp(ann, 'v-builtin');
     assert.equal(swapped.state.name, 'Bridge App');

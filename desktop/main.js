@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification, Tray, Menu, nativeImage, ipcMain } = require('electron')
+const { app, BrowserWindow, session, desktopCapturer, shell, dialog, Notification, Tray, Menu, nativeImage, ipcMain, screen } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const { autoUpdater } = require('electron-updater')
@@ -134,6 +134,117 @@ function createOverlayWindow() {
   overlayWindow.on('closed', () => { overlayWindow = null })
   return overlayWindow
 }
+
+// --- Message pop-ups, like Teams: a card above the taskbar clock when a message arrives and LAN Party
+// is not the window in front. Shown without taking the focus (showInactive), so it never interrupts
+// typing in a game or another app; it only takes the focus when Reply is clicked. The main renderer
+// decides what is worth a card (window.desktop.notify), notify.html shows it, and clicking or replying
+// goes back to the main renderer, which opens the conversation or sends the reply.
+const NOTIFY_WIDTH = 380
+const NOTIFY_MAX_HEIGHT = 640
+let notifyWindow = null
+let notifyReady = false
+let notifyPending = []
+let notifySeq = 0
+const notifyTargets = new Map() // card id -> where it leads, kept here so the pop-up never supplies one
+
+function notifyBounds(height) {
+  const area = screen.getPrimaryDisplay().workArea
+  const h = Math.max(1, Math.min(NOTIFY_MAX_HEIGHT, Math.round(height)))
+  return { x: area.x + area.width - NOTIFY_WIDTH - 8, y: area.y + area.height - h - 8, width: NOTIFY_WIDTH, height: h }
+}
+
+function createNotifyWindow() {
+  if (notifyWindow && !notifyWindow.isDestroyed()) return notifyWindow
+  notifyReady = false
+  notifyWindow = new BrowserWindow({
+    ...notifyBounds(1),
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: false,
+    show: false,
+    title: 'LAN Party notifications',
+    webPreferences: {
+      preload: path.join(__dirname, 'notify-preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  })
+  notifyWindow.setAlwaysOnTop(true, 'pop-up-menu')
+  notifyWindow.webContents.on('will-navigate', (event) => event.preventDefault())
+  notifyWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  notifyWindow.webContents.once('did-finish-load', () => {
+    notifyReady = true
+    for (const card of notifyPending) notifyWindow.webContents.send('notify:card', card)
+    notifyPending = []
+  })
+  notifyWindow.on('closed', () => { notifyWindow = null; notifyReady = false; notifyTargets.clear() })
+  notifyWindow.loadFile(path.join(__dirname, 'notify.html'))
+  return notifyWindow
+}
+
+const fromMain = (e) => mainWindow && !mainWindow.isDestroyed() && e.sender === mainWindow.webContents
+const fromNotify = (e) => notifyWindow && !notifyWindow.isDestroyed() && e.sender === notifyWindow.webContents
+const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '')
+
+ipcMain.on('notify:show', (e, info = {}) => {
+  if (!fromMain(e) || !info || typeof info !== 'object' || !info.target || typeof info.target !== 'object') return
+  const card = {
+    id: `n${++notifySeq}`,
+    key: str(info.key, 200),
+    kind: str(info.target.kind, 20),
+    author: str(info.author, 80) || 'Someone',
+    where: str(info.where, 120),
+    preview: str(info.preview, 300),
+    previewIsNote: !!info.previewIsNote,
+  }
+  notifyTargets.set(card.id, info.target)
+  // Only the newest few matter; a flood never grows this without bound.
+  if (notifyTargets.size > 50) notifyTargets.delete(notifyTargets.keys().next().value)
+  const w = createNotifyWindow()
+  if (notifyReady) w.webContents.send('notify:card', card)
+  else notifyPending.push(card)
+})
+ipcMain.on('notify:size', (e, height) => {
+  if (!fromNotify(e)) return
+  const h = Number(height) || 0
+  if (h <= 0) { notifyWindow.hide(); return }
+  notifyWindow.setBounds(notifyBounds(h))
+  if (!notifyWindow.isVisible()) notifyWindow.showInactive()
+})
+ipcMain.on('notify:dismiss', (e, id) => { if (fromNotify(e)) notifyTargets.delete(id) })
+// Reply was clicked, so the box needs the keyboard. (Test runs never take the focus.)
+ipcMain.on('notify:focus', (e) => { if (fromNotify(e) && !NO_ACTIVATE) notifyWindow.focus() })
+ipcMain.on('notify:open', (e, id) => {
+  if (!fromNotify(e)) return
+  const target = notifyTargets.get(id)
+  notifyTargets.delete(id)
+  if (!target || !mainWindow || mainWindow.isDestroyed()) return
+  showFromTray()
+  mainWindow.webContents.send('notify:open', target)
+})
+ipcMain.on('notify:reply', (e, { id, text } = {}) => {
+  if (!fromNotify(e)) return
+  const target = notifyTargets.get(id)
+  const body = str(text, 4000).trim()
+  if (!target || !body || !mainWindow || mainWindow.isDestroyed()) {
+    notifyWindow.webContents.send('notify:reply-result', { id, ok: false, error: 'LAN Party is not ready to send right now.' })
+    return
+  }
+  mainWindow.webContents.send('notify:reply', { id, target, text: body })
+})
+ipcMain.on('notify:reply-result', (e, { id, ok, error } = {}) => {
+  if (!fromMain(e) || !notifyWindow || notifyWindow.isDestroyed()) return
+  notifyWindow.webContents.send('notify:reply-result', { id, ok: !!ok, error: str(error, 300) })
+})
 
 // --- Overlay IPC: relay WebRTC signaling between the main renderer and the overlay renderer ---
 ipcMain.on('overlay:show', () => { createOverlayWindow().show() })
@@ -599,6 +710,10 @@ function setupAutoUpdates({ withWindow }) {
   // Re-check every 6 hours for long-running sessions.
   setInterval(() => { if (startup.phase === 'done') autoUpdater.checkForUpdates().catch(() => {}) }, 6 * 60 * 60 * 1000)
 }
+
+// Test runs can use their own profile (LANPARTY_USER_DATA), so they neither share the installed
+// copy's sign-in nor hand off to it through the single-instance lock, which is per profile.
+if (process.env.LANPARTY_USER_DATA) app.setPath('userData', process.env.LANPARTY_USER_DATA)
 
 // Single-instance: focus the existing window instead of opening a second copy.
 const gotLock = app.requestSingleInstanceLock()

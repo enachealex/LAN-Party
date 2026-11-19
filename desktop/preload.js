@@ -17,4 +17,10 @@ contextBridge.exposeInMainWorld('desktop', {
   // Relay WebRTC signaling to the overlay window, and receive answers/candidates back.
   overlaySend: (msg) => ipcRenderer.send('overlay:to-overlay', msg),
   onOverlaySignal: (cb) => ipcRenderer.on('overlay:signal', (_e, msg) => cb(msg)),
+  // Teams-style message pop-ups above the taskbar clock (notify.html). The renderer hands over a
+  // card; clicking it or replying in it comes back here.
+  notify: (card) => ipcRenderer.send('notify:show', card),
+  onNotifyOpen: (cb) => ipcRenderer.on('notify:open', (_e, target) => cb(target)),
+  onNotifyReply: (cb) => ipcRenderer.on('notify:reply', (_e, req) => cb(req)),
+  notifyReplyResult: (id, result) => ipcRenderer.send('notify:reply-result', { id, ...result }),
 })

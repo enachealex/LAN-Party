@@ -257,6 +257,8 @@ describe('app approval (server)', () => {
     await once(socket, 'connect');
     socket.updates = [];
     socket.notices = [];
+    socket.running = null; // the last activity:list: what is running in its voice room
+    socket.on('activity:list', (list) => { socket.running = list; });
     socket.on('activity:update', (a) => { socket.updates.push(a); socket.act = a; });
     for (const event of NOTICES) socket.on(event, (payload) => socket.notices.push({ event, payload }));
     const joined = once(socket, 'channel:joined');
@@ -273,6 +275,12 @@ describe('app approval (server)', () => {
     const started = once(socket, 'activity:update', isApp);
     socket.emit('activity:start', { serverId: 'demo', channelId, type: 'app', appId });
     return started;
+  };
+  // Open a running activity from the list (its Join button); for an app, this is the card view.
+  const joinAct = (socket, channelId, id) => {
+    const opened = once(socket, 'activity:update', (v) => v != null && v.id === id);
+    socket.emit('activity:join', { serverId: 'demo', channelId, id });
+    return opened;
   };
   // A start the server must ignore. The built-in started right after it is handled later on the
   // same socket, so once that arrives the refused start has been worked through.
@@ -741,13 +749,17 @@ describe('app approval (server)', () => {
       const room = `v-${status}`;
       const dev = await enter('dev', room);
       const ben = await enter('ben', room);
-      // Ben is in the room: he gets the join card, and it says the app is not approved.
-      const card = once(ben, 'activity:update', isApp);
+      // Ben is in the room: the list tells him it is running and that it is not approved.
+      const listed = once(ben, 'activity:list', (l) => l.some((a) => a.type === 'app'));
       const started = await startApp(dev, room, app.id);
       assert.equal(started.state.approved, false, status);
       assert.equal(started.state.createdBy, 'dev');
       assert.deepEqual(started.state.joined, ['dev']);
-      const seen = await card;
+      const row = (await listed).find((a) => a.type === 'app');
+      assert.equal(row.approved, false, 'the people in the call are told it is not approved');
+      assert.equal(row.name, app.name);
+      // Opening it gives him the join card, which says so too.
+      const seen = await joinAct(ben, room, row.id);
       assert.equal(seen.state.approved, false, 'the people asked to join are told');
       assert.equal(seen.state.name, app.name);
       assert.deepEqual(seen.state.shared, {}, 'and get nothing from it until they choose to join');
@@ -824,8 +836,9 @@ describe('app approval (server)', () => {
       const starterSocket = await enter(starter, room);
       const watcher = await enter(starter === 'ben' ? 'dev' : 'ben', room);
       const bystander = await enter('ben', `${room}-other`);
-      await startApp(starterSocket, room, app.id);
+      const started = await startApp(starterSocket, room, app.id);
       await startApp(bystander, `${room}-other`, other.id);
+      await joinAct(watcher, room, started.id); // looking at its card
       const ended = [once(starterSocket, 'activity:update', (v) => v === null), once(watcher, 'activity:update', (v) => v === null)];
       const res = await end(app);
       assert.equal(res.status, 200, `${label}: ${JSON.stringify(res.data)}`);
@@ -833,6 +846,7 @@ describe('app approval (server)', () => {
       assert.equal(starterSocket.act, null, label);
       assert.equal(watcher.act, null, label);
       await sleep(100);
+      assert.deepEqual(watcher.running, [], `${label}: it is gone from the list of what is running`);
       assert.equal(bystander.act.state.appId, other.id, `${label}: a room running a different app is left alone`);
     }
   });
@@ -858,11 +872,13 @@ describe('app approval (server)', () => {
     await sleep(150);
     assert.equal(dev.act.state.run, first.state.run, 'still the same run');
     assert.equal(dev.act.state.approved, false);
+    await joinAct(ben, 'v-flight', first.id); // looking at its card
 
     const approvedForDev = once(dev, 'activity:update', (v) => isApp(v) && v.state.approved === true);
     const approvedForBen = once(ben, 'activity:update', (v) => isApp(v) && v.state.approved === true);
+    const approvedInList = once(ben, 'activity:list', (l) => l.some((a) => a.id === first.id && a.approved === true));
     assert.equal((await act('owner', app.id, 'approve', { url: app.url })).status, 200);
-    const [d, b] = await Promise.all([approvedForDev, approvedForBen]);
+    const [d, b] = await Promise.all([approvedForDev, approvedForBen, approvedInList]);
     assert.equal(d.state.run, first.state.run, 'the run goes on');
     assert.deepEqual(d.state.joined, ['dev']);
     assert.deepEqual(b.state.shared, {}, 'someone who has not joined still gets only the card');

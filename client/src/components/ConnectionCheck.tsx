@@ -11,7 +11,7 @@ interface Props {
   getDiagnostics: () => Promise<ServerDiagnostics | null>
   /** The ICE servers a call would use (with this account's relay credential), for the relay test. */
   getIceServers?: () => Promise<RTCIceServer[] | null>
-  /** 'link' sits under the pre-join microphone test; 'button' is the Settings section. */
+  /** 'link' sits beside the pre-join microphone test; 'button' is the Settings section. */
   variant?: 'button' | 'link'
 }
 
@@ -45,8 +45,8 @@ export default function ConnectionCheck({ socket, getDiagnostics, getIceServers,
 
   return (
     <div className="conncheck">
-      <button type="button" className={variant === 'link' ? 'profile-link-btn' : 'connect-btn mictest-start'} onClick={run} disabled={running}>
-        {running ? 'Checking connection…' : report ? 'Check connection again' : 'Check connection'}
+      <button type="button" className={variant === 'link' ? 'prejoin-tool-btn' : 'connect-btn mictest-start'} onClick={run} disabled={running}>
+        {variant === 'link' ? '📶 ' : ''}{running ? 'Checking connection…' : report ? (variant === 'link' ? 'Check again' : 'Check connection again') : 'Check connection'}
       </button>
       {running && <div className="conncheck-hint">This takes a few seconds. Nothing is recorded or played.</div>}
       {error && <div className="composer-error">{error}</div>}

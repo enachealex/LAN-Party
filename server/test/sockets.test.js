@@ -77,7 +77,7 @@ describe('realtime', () => {
     assert.ok(msg.ts, 'delivered message should carry a timestamp');
   });
 
-  test('starting an activity broadcasts its initial state to the voice room', async () => {
+  test('starting an activity opens it for its starter only; the rest of the voice room sees it listed and can join', async () => {
     // Activities live in the voice room (`voice:<server>:<channel>`), joined via voice:join.
     for (const s of [sockA, sockB]) {
       const peers = once(s, 'voice:peers');
@@ -85,22 +85,45 @@ describe('realtime', () => {
       await peers;
     }
 
-    const update = once(sockB, 'activity:update', nonNull);
+    let bUpdate = null;
+    const onB = (v) => { if (v != null) bUpdate = v; };
+    sockB.on('activity:update', onB);
+    const mine = once(sockA, 'activity:update', nonNull);
+    const listed = once(sockB, 'activity:list', (l) => Array.isArray(l) && l.some((a) => a.type === 'ttt'));
     sockA.emit('activity:start', { serverId: 'demo', channelId: 'voice1', type: 'ttt' });
-    const act = await update;
-    assert.ok(act, 'expected an activity payload');
+    const act = await mine;
     assert.equal(act.type, 'ttt');
     assert.equal(act.state.board.length, 9, 'tic-tac-toe should start with an empty 9-cell board');
+    const list = await listed;
+    const row = list.find((a) => a.type === 'ttt');
+    assert.ok(row.id, 'the list names the activity so it can be joined');
+    assert.deepEqual(row.people, ['ann']);
+    assert.equal(row.state, undefined, 'the list never carries the activity state');
+    assert.equal(bUpdate, null, 'the rest of the room is not put in it');
+    sockB.off('activity:update', onB);
+
+    const joined = once(sockB, 'activity:update', nonNull);
+    sockB.emit('activity:join', { serverId: 'demo', channelId: 'voice1', id: row.id });
+    const view = await joined;
+    assert.equal(view.type, 'ttt');
+    assert.equal(view.state.board.length, 9);
   });
 
-  test('a late joiner is handed the activity already in progress', async () => {
+  test('a late joiner is told what is running, opens nothing by itself, and can join it', async () => {
     const annToken = await makeUser(call, 'cara');
     const late = await connect(server.base, annToken);
     try {
-      const update = once(late, 'activity:update', nonNull);
+      const update = once(late, 'activity:update');
+      const listed = once(late, 'activity:list');
       late.emit('voice:join', { serverId: 'demo', channelId: 'voice1' });
-      const act = await update;
-      assert.equal(act.type, 'ttt', 'should receive the in-progress tic-tac-toe game');
+      assert.equal(await update, null, 'nothing opens on joining the call');
+      const list = await listed;
+      const row = list.find((a) => a.type === 'ttt');
+      assert.ok(row, 'the in-progress tic-tac-toe game is listed');
+      const joined = once(late, 'activity:update', nonNull);
+      late.emit('activity:join', { serverId: 'demo', channelId: 'voice1', id: row.id });
+      const act = await joined;
+      assert.equal(act.type, 'ttt', 'joining hands over the in-progress game');
     } finally {
       late.close();
     }

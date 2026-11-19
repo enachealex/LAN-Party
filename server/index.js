@@ -543,8 +543,14 @@ async function main() {
   }
   function broadcastDiscover() { io.emit('discover:update', discoverList()); }
 
-  // --- Activities: one shared activity per voice room, synced to everyone in it ---
-  const activities = {}; // room -> { type, state, by }
+  // --- Activities: any number per voice room, each person in at most one ---
+  // Starting one puts only its starter in it; everyone else in the call sees it in the list of
+  // what is running (activity:list) and can join it, or start another. Each activity's updates go
+  // to the people in it (act.viewers). One ends when the last person in it leaves, or when someone
+  // in it ends it for everyone in it.
+  const activities = {}; // room -> Map(id -> { id, type, state, by, viewers: Set<socketId> })
+  const viewingOf = {}; // socketId -> { room, id }: the activity this socket is in
+  const MAX_ACTIVITIES_PER_ROOM = 12;
   // Activity state machine + per-socket views (services/activities.js).
   const {
     ACTIVITY_TYPES, activityInit, applyActivityEvent, activityViewFor, broadcastActivity,
@@ -554,6 +560,70 @@ async function main() {
   // from JWT_SECRET under its own label: no new secret to keep, and nothing learned from a room key
   // helps with a session token or the other way round.
   const appRoomKey = createAppRoomKeys(JWT_SECRET);
+
+  const roomActs = (room) => activities[room] || (activities[room] = new Map());
+  // The activity this socket is in, in that room, or null.
+  function actViewedBy(room, socketId) {
+    const v = viewingOf[socketId];
+    return v && v.room === room ? (activities[room]?.get(v.id) || null) : null;
+  }
+  const toViewers = (act, event, payload, exceptId = null) => {
+    for (const id of act.viewers) if (id !== exceptId) io.to(id).emit(event, payload);
+  };
+  // What everyone in the call is told about what is running: enough for a row with a Join button,
+  // never the activity's state (an app's room key, the sketch word, a whiteboard's strokes).
+  function activityList(room) {
+    const acts = activities[room];
+    if (!acts) return [];
+    return [...acts.values()].map((act) => ({
+      id: act.id,
+      type: act.type,
+      by: act.by,
+      name: act.type === APP_ACTIVITY ? act.state.name : null,
+      icon: act.type === APP_ACTIVITY ? (act.state.iconUrl || null) : null,
+      approved: act.type === APP_ACTIVITY ? act.state.approved !== false : true,
+      people: [...new Set([...act.viewers].map((id) => clients[id]?.name).filter(Boolean))],
+    }));
+  }
+  const sendActivityList = (room) => io.to(room).emit('activity:list', activityList(room));
+  function dropActivity(room, act) {
+    const acts = activities[room];
+    if (!acts) return;
+    acts.delete(act.id);
+    if (!acts.size) delete activities[room];
+  }
+  // Take a socket out of the activity it is in. The activity ends when nobody is left in it.
+  // Returns the room it was in, or null.
+  function leaveActivity(socketId, { notify = true } = {}) {
+    const v = viewingOf[socketId];
+    if (!v) return null;
+    delete viewingOf[socketId];
+    const act = activities[v.room]?.get(v.id);
+    if (act) {
+      act.viewers.delete(socketId);
+      if (!act.viewers.size) dropActivity(v.room, act);
+      // Leaving the activity leaves the app too: the people still playing must see them go.
+      else if (appLeave(act, socketId)) toViewers(act, 'activity:app-joined', { run: act.state.run, joined: act.state.joined });
+    }
+    if (notify) io.to(socketId).emit('activity:update', null);
+    return v.room;
+  }
+  // Put a socket in an activity (leaving the one it was in) and send it its view.
+  function enterActivity(sock, room, act) {
+    if (viewingOf[sock.id]?.id !== act.id) {
+      leaveActivity(sock.id, { notify: false });
+      act.viewers.add(sock.id);
+      viewingOf[sock.id] = { room, id: act.id };
+    }
+    sock.emit('activity:update', activityViewFor(act, sock.id));
+  }
+  // End an activity for everyone in it.
+  function endActivity(room, act) {
+    for (const id of act.viewers) { delete viewingOf[id]; io.to(id).emit('activity:update', null); }
+    act.viewers.clear();
+    dropActivity(room, act);
+  }
+  const newActivityId = () => crypto.randomBytes(6).toString('hex');
   // An app that is deleted while a room is running it: end it there. The bundle's files are about to
   // go, and a room left pointing at them would offer everyone a "Join" that opens a 404.
   // The same goes for one that is rejected or unpublished (the room would keep running an app that
@@ -573,20 +643,29 @@ async function main() {
   // had JOINED it are told why first (their app is about to vanish mid-use); the rest of the room
   // only ever saw a card, and for them it just goes away, as it does on any other ending.
   function endAppActivitiesWhere(matches, reason = null) {
-    for (const [room, act] of Object.entries(activities)) {
-      if (act.type !== APP_ACTIVITY || !matches(room, act)) continue;
-      if (reason) for (const id of appJoinedSockets(act)) io.to(id).emit('activity:app-ended', { run: act.state.run, reason });
-      delete activities[room];
-      io.to(room).emit('activity:update', null);
+    for (const [room, acts] of Object.entries(activities)) {
+      let changed = false;
+      for (const act of [...acts.values()]) {
+        if (act.type !== APP_ACTIVITY || !matches(room, act)) continue;
+        if (reason) for (const id of appJoinedSockets(act)) io.to(id).emit('activity:app-ended', { run: act.state.run, reason });
+        endActivity(room, act);
+        changed = true;
+      }
+      if (changed) sendActivityList(room);
     }
   }
   // An app that is published while its uploader has it running as a draft: the rooms' join cards
   // stop saying it is unapproved. Each person gets their own view again, as on any other update.
   function approveAppActivities(appId) {
-    for (const [room, act] of Object.entries(activities)) {
-      if (act.type !== APP_ACTIVITY || act.state.appId !== appId || act.state.approved) continue;
-      act.state.approved = true;
-      broadcastActivity(room, act);
+    for (const [room, acts] of Object.entries(activities)) {
+      let changed = false;
+      for (const act of acts.values()) {
+        if (act.type !== APP_ACTIVITY || act.state.appId !== appId || act.state.approved) continue;
+        act.state.approved = true;
+        broadcastActivity(room, act);
+        changed = true;
+      }
+      if (changed) sendActivityList(room);
     }
   }
   // The public commons: every account is a member of it, and nobody is ever removed from it.
@@ -1307,7 +1386,7 @@ async function main() {
   // Tell members a channel has a new message so their badges bump live. Private channels only
   // notify staff. The author is skipped (demo broadcasts include them; clients filter by author).
   // Carries channel/server names + @mentions so clients can raise desktop notifications.
-  async function emitUnreadBump(serverId, channelId, privacy, author, text) {
+  async function emitUnreadBump(serverId, channelId, privacy, author, text, attachment) {
     const srv = await db.get('SELECT name FROM servers WHERE id = ?', serverId);
     const ch = await db.get('SELECT name FROM channels WHERE id = ?', channelId);
     // One definition of "mentioned" for the badge, the in-page notification and the push: if they
@@ -1317,6 +1396,9 @@ async function main() {
       serverId, channelId, author,
       serverName: srv?.name, channelName: ch?.name,
       preview: String(text || '').slice(0, 120), mentions,
+      // The kind of file that came with it, so a notification for a message with no text can say
+      // "sent an image" or "sent a file". Only the type: the file stays in the channel.
+      attachmentType: attachment ? attachment.type : undefined,
     };
     // Nobody who has blocked the author is nudged: no badge, no mention count, no notification
     // (the client raises all three from this event). Their unread totals leave the author's
@@ -1693,10 +1775,8 @@ async function main() {
     sock.to(room).emit('voice:peer-left', { id: sock.id });
     sfu.removePeer(room, sock.id); // close their SFU transports + notify consumers
     if (liveStreams[sock.id]) { delete liveStreams[sock.id]; broadcastDiscover(); }
-    const act = activities[room];
-    if (act && (io.sockets.adapter.rooms.get(room) || new Set()).size === 0) delete activities[room];
-    // Leaving voice leaves the app too: the people still playing must see them go.
-    else if (appLeave(act, sock.id)) io.to(room).emit('activity:app-joined', { run: act.state.run, joined: act.state.joined });
+    // Leaving voice leaves its activity (and the app in it) too.
+    if (leaveActivity(sock.id) === room) sendActivityList(room);
   }
 
   // Can this account be in that voice room? Membership of the server, and — outside the commons,
@@ -1974,28 +2054,38 @@ async function main() {
       }
     });
 
-    socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment, quotes } = {}) => {
+    socket.on('message', async ({ serverId = 'demo', channelId = 'general', text, attachment, quotes } = {}, ack) => {
       // Refuse writes to channels the user can't see (belongs to server + private-access check).
       // Rejections are answered with message:error (echoing the text) instead of a silent drop,
       // so a client with a stale server/channel pairing can recover the message and resync.
+      // A sender that asks for an answer (the quick reply on a notification toast, which is not in
+      // the channel's room and so never sees its own message come back) gets the refusal, or the
+      // stored message, through that instead. The composer does not ask, and is answered as before.
+      const answer = typeof ack === 'function' ? ack : null;
+      const refuse = (refusal) => {
+        if (answer) answer({ ok: false, ...refusal });
+        else socket.emit('message:error', refusal);
+      };
       const ch = await db.get("SELECT id, COALESCE(privacy,'public') AS privacy FROM channels WHERE id = ? AND server_id = ?", channelId, serverId);
-      if (!ch) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'unknown-channel' }); return; }
+      if (!ch) { refuse({ serverId, channelId, text: (text || '').trim(), reason: 'unknown-channel' }); return; }
       const myRole = await roleOf(serverId, socketUser);
-      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'no-access' }); return; }
+      if (!(await canAccessChannel(serverId, channelId, socketUser, ch.privacy, myRole))) { refuse({ serverId, channelId, text: (text || '').trim(), reason: 'no-access' }); return; }
       // Timed out in this server: refused here, whatever the client let through. The text goes
       // back with the refusal like any other, so what they typed is not lost.
       const timeout = await timedOutIn(serverId);
-      if (timeout) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: 'timed-out', until: timeout.until }); return; }
+      if (timeout) { refuse({ serverId, channelId, text: (text || '').trim(), reason: 'timed-out', until: timeout.until }); return; }
       // The public commons is open to every account the moment it registers, so posting there
       // waits for a confirmed email. Other servers are joined by invitation and are not affected.
       if (serverId === DEMO_ID) {
         const refusal = await unverifiedRefusal();
-        if (refusal) { socket.emit('message:error', { serverId, channelId, text: (text || '').trim(), reason: refusal.code, error: refusal.error }); return; }
+        if (refusal) { refuse({ serverId, channelId, text: (text || '').trim(), reason: refusal.code, error: refusal.error }); return; }
       }
-      const author = clients[socket.id]?.name || 'Anon';
+      // The signed-in account, which is also what `join` records. Read from the socket itself
+      // because a quick reply can be sent to a server this socket has not joined.
+      const author = socketUser || clients[socket.id]?.name || 'Anon';
       const body = (text || '').trim();
       const fileAttachment = normalizeAttachment(attachment);
-      if (!body && !fileAttachment) return;
+      if (!body && !fileAttachment) { if (answer) answer({ ok: false, reason: 'empty' }); return; }
       const cleanQuotes = sanitizeQuotes(quotes);
       const ts = Date.now();
       const inserted = await db.run('INSERT INTO messages (server_id, channel_id, author, text, ts, attachment_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?)', serverId, channelId, author, body, ts, fileAttachment ? JSON.stringify(fileAttachment) : null, cleanQuotes ? JSON.stringify(cleanQuotes) : null);
@@ -2007,6 +2097,7 @@ async function main() {
       // their client shows it collapsed and stays quiet about it; everyone else gets the plain one.
       // Two sends rather than one because the mark is per reader, and must not reach the rest.
       const live = { ...mapMessageRow(msgRow), serverId, channelId };
+      if (answer) answer({ ok: true, message: live });
       const channelRoom = `channel:${serverId}:${channelId}`;
       const blockers = await blocks.blockersOf(author);
       if (blockers.size === 0) {
@@ -2028,7 +2119,7 @@ async function main() {
         table: 'messages', id: msgRow.id, user: socketUser, ownHosts: ownHostsFor(socket.handshake.headers),
         emit: (preview) => io.to(channelRoom).emit('message:preview', { id: msgRow.id, serverId, channelId, preview }),
       });
-      await emitUnreadBump(serverId, channelId, ch.privacy, author, body);
+      await emitUnreadBump(serverId, channelId, ch.privacy, author, body, fileAttachment);
     });
 
     // Delete a channel message — only the author may delete it. Broadcast removal to the channel.
@@ -2246,7 +2337,7 @@ async function main() {
     // that also covers replacing it with a built-in, which would otherwise be a way to end it from
     // outside. Built-in activities with no app involved keep the membership check they always had.
     const appName = () => socketUser || clients[socket.id]?.name || 'Anon';
-    const outsideAppRoom = (room) => activities[room]?.type === APP_ACTIVITY && !socket.rooms.has(room);
+    const inRoom = (room) => socket.rooms.has(room);
     // Whether this person may be given a channel's room key NOW, asked of the database each time an
     // app is started or joined. Being in the voice room is not enough for that: a socket stays in a
     // room it joined after its user is kicked from the server or taken off a private channel, and a
@@ -2269,8 +2360,8 @@ async function main() {
     // because it joined and now needs the state, or left and must drop it — gets its full view.
     const sendAppJoined = (room, act, self) => {
       const list = { run: act.state.run, joined: act.state.joined };
-      if (self) { self.to(room).emit('activity:app-joined', list); self.emit('activity:update', activityViewFor(act, self.id)); }
-      else io.to(room).emit('activity:app-joined', list);
+      if (self) { toViewers(act, 'activity:app-joined', list, self.id); self.emit('activity:update', activityViewFor(act, self.id)); }
+      else toViewers(act, 'activity:app-joined', list);
     };
     socket.on('activity:start', async ({ serverId = 'demo', channelId = 'voice1', type, appId } = {}) => {
       const room = `voice:${serverId}:${channelId}`;
@@ -2317,18 +2408,42 @@ async function main() {
         if (appRooms.generation(serverId) !== generation) return; // the keys were replaced meanwhile
         // Bound to the site the frame is on and to the server's epoch as well as to the channel
         // (services/hostedApps.js).
-        const act = { type: APP_ACTIVITY, state: appActivityInit(row, appRoomKey(row.id, frameOrigin, serverId, channelId, epoch)), by: appName() };
-        activities[room] = act;
+        if ((activities[room]?.size || 0) >= MAX_ACTIVITIES_PER_ROOM) return;
+        const act = { id: newActivityId(), type: APP_ACTIVITY, state: appActivityInit(row, appRoomKey(row.id, frameOrigin, serverId, channelId, epoch)), by: appName(), viewers: new Set() };
+        roomActs(room).set(act.id, act);
         // Whoever starts it has already chosen to run it, so they are joined from the first update.
+        // Nobody else is put in it: they see it in the list and may join.
+        leaveActivity(socket.id, { notify: false });
         applyAppEvent(act, { kind: 'join' }, appName(), socket.id);
-        broadcastActivity(room, act);
+        enterActivity(socket, room, act);
+        sendActivityList(room);
         return;
       }
       if (!ACTIVITY_TYPES.includes(type)) return;
+      if (!inRoom(room)) return; // an activity is for people in the call
       if (!(await mayActInVoice(serverId))) return;
-      if (outsideAppRoom(room)) return;
-      activities[room] = { type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon' };
-      broadcastActivity(room, activities[room]);
+      if (!inRoom(room)) return;
+      if ((activities[room]?.size || 0) >= MAX_ACTIVITIES_PER_ROOM) return;
+      const act = { id: newActivityId(), type, state: activityInit(type), by: clients[socket.id]?.name || 'Anon', viewers: new Set() };
+      roomActs(room).set(act.id, act);
+      enterActivity(socket, room, act);
+      sendActivityList(room);
+    });
+    // Join a running activity (and leave the one you were in). Seeing it is all this gives: an app
+    // still asks for its own Join (which hands over the room key, and is checked then).
+    socket.on('activity:join', async ({ serverId = 'demo', channelId = 'voice1', id } = {}) => {
+      const room = `voice:${serverId}:${channelId}`;
+      if (typeof id !== 'string' || !inRoom(room)) return;
+      if (!(await mayActInVoice(serverId))) return;
+      const act = activities[room]?.get(id);
+      if (!act || !inRoom(room)) { socket.emit('activity:list', activityList(room)); return; }
+      enterActivity(socket, room, act);
+      sendActivityList(room);
+    });
+    // Back to the call view; the activity goes on for the others in it.
+    socket.on('activity:leave', () => {
+      const room = leaveActivity(socket.id);
+      if (room) sendActivityList(room);
     });
     socket.on('activity:event', async ({ serverId = 'demo', channelId = 'voice1', event, app: appRun } = {}, ack) => {
       const room = `voice:${serverId}:${channelId}`;
@@ -2337,13 +2452,13 @@ async function main() {
       // wire when the room's activity was swapped landed on whatever replaced it — an app's "join"
       // seating someone in a game of Tic-Tac-Toe, a Tic-Tac-Toe "join" adding someone to an app
       // they never chose, one app's frame writing into the next app's state.
-      if (appRun !== undefined || activities[room]?.type === APP_ACTIVITY) {
+      if (appRun !== undefined || actViewedBy(room, socket.id)?.type === APP_ACTIVITY) {
         // Synchronous for everything an app itself sends, and the bucket comes first: only someone
         // who has joined can set or emit, so a flooding app costs no database query at all.
         // The ack tells the sender's SDK whether to keep or roll back its optimistic change; a
         // dropped event is otherwise silent — nobody else in the room hears about it.
         const reply = (r) => { if (typeof ack === 'function') ack(r); };
-        const act = activities[room];
+        const act = actViewedBy(room, socket.id);
         if (!act || act.type !== APP_ACTIVITY) return reply({ ok: false, reason: 'ended' });
         if (!socket.rooms.has(room)) return reply({ ok: false, reason: 'not-in-room' });
         if (!appEventAllowed(socket.id)) return reply({ ok: false, reason: 'rate-limited' });
@@ -2355,7 +2470,7 @@ async function main() {
         // does that), or they may have left the room, while the answer was on its way.
         if (event && typeof event === 'object' && event.kind === 'join') {
           if (!(await mayUseAppRoom(serverId, channelId))) return reply({ ok: false, reason: 'no-access' });
-          if (activities[room] !== act) return reply({ ok: false, reason: 'ended' });
+          if (actViewedBy(room, socket.id) !== act) return reply({ ok: false, reason: 'ended' });
           if (!socket.rooms.has(room)) return reply({ ok: false, reason: 'not-in-room' });
         }
         const result = applyAppEvent(act, event, appName(), socket.id);
@@ -2374,7 +2489,7 @@ async function main() {
         return reply({ ok: true, rev: act.state.rev });
       }
       if (!(await mayActInVoice(serverId))) return;
-      const act = activities[room];
+      const act = actViewedBy(room, socket.id);
       if (!act || !event || typeof event !== 'object') return;
       // An app may have become the activity while the membership query ran; its events never go
       // through the built-in reducer.
@@ -2385,9 +2500,11 @@ async function main() {
     socket.on('activity:stop', async ({ serverId = 'demo', channelId = 'voice1' } = {}) => {
       if (!(await mayActInVoice(serverId))) return;
       const room = `voice:${serverId}:${channelId}`;
-      if (outsideAppRoom(room)) return;
-      delete activities[room];
-      io.to(room).emit('activity:update', null);
+      // Ends the activity you are in, for everyone in it. Nobody else's is touched.
+      const act = actViewedBy(room, socket.id);
+      if (!act) return;
+      endActivity(room, act);
+      sendActivityList(room);
     });
 
     // --- Collaborative image editing (shared annotation canvas, session keyed by image url) ---
@@ -2510,7 +2627,9 @@ async function main() {
       const roomSet = io.sockets.adapter.rooms.get(room) || new Set();
       const peers = Array.from(roomSet).filter(id => id !== socket.id).map(id => ({ id, name: clients[id]?.name || 'Anon', mode: voiceModeOf(room, id) }));
       socket.emit('voice:peers', peers);
-      socket.emit('activity:update', activityViewFor(activities[room], socket.id) || null); // late-joiners get the current activity (word redacted)
+      // Nothing opens by itself on joining: the call view, and the list of what is running.
+      socket.emit('activity:update', null);
+      socket.emit('activity:list', activityList(room));
       // The joiner's entrance clip is read from the DB, never taken from the client — otherwise a
       // socket could make everyone else in the room fetch and play an arbitrary url.
       let entranceSound = '';
@@ -2624,10 +2743,8 @@ async function main() {
           setVoiceMode(room, socket.id, null);
           socket.to(room).emit('voice:peer-left', { id: socket.id });
           sfu.removePeer(room, socket.id);
-          // If this socket is the last one in the room, drop its activity.
-          if (activities[room] && (io.sockets.adapter.rooms.get(room) || new Set()).size <= 1) delete activities[room];
-          // Otherwise take them off the app's joined list, or a closed tab stays "playing" forever.
-          else if (appLeave(activities[room], socket.id)) socket.to(room).emit('activity:app-joined', { run: activities[room].state.run, joined: activities[room].state.joined });
+          // Out of their activity (and its app's joined list, or a closed tab stays "playing").
+          if (leaveActivity(socket.id, { notify: false }) === room) socket.to(room).emit('activity:list', activityList(room));
         }
       }
       if (liveStreams[socket.id] || externalStreams[socket.id]) {

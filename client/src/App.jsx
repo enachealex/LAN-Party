@@ -23,6 +23,8 @@ import CreateChannelModal from './components/CreateChannelModal'
 import ManageChannelAccessModal from './components/ManageChannelAccessModal'
 import { COLOR_SCHEMES, matchSchemeId } from './colorSchemes'
 import ProfileAvatar from './components/ProfileAvatar'
+import NotificationToasts, { useNotificationToasts, toastKey } from './components/NotificationToasts'
+import NotificationBell, { useNotificationHistory } from './components/NotificationCenter'
 import AppDirectoryModal from './components/AppDirectoryModal'
 import AppViewer from './components/AppViewer'
 import { playUiSound, playUiClip, setUiSoundPrefs, unlockUiSounds } from './uiSounds'
@@ -1211,6 +1213,10 @@ function formatDuration(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
+// The Windows app shows message cards above the taskbar clock itself (desktop/notify.html), in
+// installs new enough to have them; older ones and browsers use the system notification.
+const desktopPopups = () => typeof window !== 'undefined' && !!window.desktop?.isElectron && typeof window.desktop.notify === 'function'
+
 export default function App() {
   const [socket, setSocket] = useState(null)
   const [name, setName] = useState('')
@@ -1510,6 +1516,15 @@ export default function App() {
   // Public profile card shown when you click a member.
   const [profileCard, setProfileCard] = useState(null) // { loading?, username, profile, gamingProfile, status }
   const [toast, setToast] = useState(null) // brief bottom notice (invites, role changes)
+  // Message notifications shown in the app's top-right corner, with a quick reply
+  // (components/NotificationToasts.tsx). Raised from the same places as the desktop notification.
+  const notificationToasts = useNotificationToasts()
+  // Everything the bubbles announce, kept for the bell in the top bar (components/NotificationCenter.tsx).
+  const notificationHistory = useNotificationHistory(name)
+  const openNotificationTargetRef = useRef(null)
+  const sendToastReplyRef = useRef(null)
+  // Signing out takes them with it: they belong to the account that was signed in.
+  useEffect(() => { if (!isAuthenticated) notificationToasts.clear() }, [isAuthenticated])
   // A newer build has been deployed than the one on screen (its signature), or null. See appUpdate.ts.
   const [newBuild, setNewBuild] = useState(null)
   // A Windows app too old to update itself (see stuckDesktopVersion): asked to reinstall, once per run.
@@ -1526,7 +1541,10 @@ export default function App() {
   const [announceForm, setAnnounceForm] = useState({ platform: 'twitch', channel: '', title: '', game: '' })
   const [externalViewer, setExternalViewer] = useState(null) // stream entry being watched in-app
   // Activities: the shared activity for the current voice room (null when none), + the launcher.
-  const [activity, setActivity] = useState(null)
+  const [activity, setActivity] = useState(null) // the activity I am in (or null: the call view)
+  // Everything running in my call: [{ id, type, by, name, icon, approved, people }]. Several can run
+  // at once; each person is in at most one, and joins the others from this list.
+  const [roomActivities, setRoomActivities] = useState([])
   const [showActivityMenu, setShowActivityMenu] = useState(false)
   // Uploaded apps as activities. Whoever is hosting an app's frame (AppActivity) is handed what the
   // socket says as it arrives, beside the React state above rather than through it: transient app
@@ -3654,7 +3672,16 @@ export default function App() {
         markConversationRead(fromUsername, authToken)
       } else {
         loadMessagesData(authToken)
-        if (!muted) maybeNotify('dm', { author: fromUsername, preview: (message?.text || '').slice(0, 120) || 'New direct message' })
+        if (!muted) {
+          const toasted = Boolean(fromUsername) && fromUsername !== userName && !message?.blocked && showMessageToast({
+            author: fromUsername,
+            where: 'Direct message',
+            target: { kind: 'dm', userId: String(fromUserId), username: fromUsername },
+            text: message?.text,
+            attachmentType: message?.attachment?.type,
+          })
+          maybeNotify('dm', { author: fromUsername, preview: (message?.text || '').slice(0, 120) || 'New direct message', toasted })
+        }
       }
     })
     s.on('server:state', (data) => {
@@ -3914,7 +3941,18 @@ export default function App() {
         playUiSound('notify')
       }
       // "Nothing" means nothing: not even for a mention.
-      if (level !== 'none') maybeNotify('channel', { ...bump, level })
+      if (level !== 'none') {
+        // A toast for what makes a sound above: being named, or a channel set to "All messages".
+        // Ordinary chatter elsewhere only moves the badge.
+        const toasted = ((bump.mentions || []).includes(userName) || level === 'all') && showMessageToast({
+          author,
+          where: `${bump.serverName || 'Server'} · #${bump.channelName || 'channel'}`,
+          target: { kind: 'channel', serverId, channelId },
+          text: bump.preview,
+          attachmentType: bump.attachmentType,
+        })
+        maybeNotify('channel', { ...bump, level, toasted })
+      }
     })
     // Someone started typing in a conversation. Keyed the same way the composer works out which
     // conversation is on screen (see renderComposer), so the line shows only where it belongs.
@@ -4094,7 +4132,14 @@ export default function App() {
       setGroupUnread((prev) => ({ ...prev, [groupId]: (prev[groupId] || 0) + 1 }))
       if (muted) return
       const group = groupChatsRef.current.find((g) => String(g.id) === String(groupId))
-      maybeNotify('group', { author: message.author, groupId, groupName: group?.name, preview: (message.text || '').slice(0, 120) || 'Sent an attachment' })
+      const toasted = showMessageToast({
+        author: message.author,
+        where: group?.name || 'Group chat',
+        target: { kind: 'group', groupId: String(groupId) },
+        text: message.text,
+        attachmentType: message.attachment?.type,
+      })
+      maybeNotify('group', { author: message.author, groupId, groupName: group?.name, preview: (message.text || '').slice(0, 120) || 'Sent an attachment', toasted })
     })
     s.on('group:read', ({ groupId } = {}) => { if (groupId) clearGroupBadge(groupId) })
     s.on('group:message-edited', ({ groupId, id, text } = {}) => setHomeMessages((prev) => {
@@ -4195,6 +4240,8 @@ export default function App() {
       setActivity(next)
       if (next && next.type === 'app') notifyAppHostRef.current({ type: 'activity', activity: next })
     })
+    // What is running in my call, for the "Join" list.
+    s.on('activity:list', (list) => setRoomActivities(Array.isArray(list) ? list.filter((a) => a && typeof a.id === 'string') : []))
     // Someone joined or left the running app. Sent on its own, without the app's shared state, so
     // people coming and going do not cost everyone a copy of it.
     s.on('activity:app-joined', (m) => {
@@ -5213,6 +5260,10 @@ export default function App() {
   // you're elsewhere in the app). Gated on the Settings toggle + browser permission.
   const maybeNotify = (kind, info = {}) => {
     if (!notifyEnabledRef.current) return
+    // Already shown as a toast in a window that is in front of its user: a system notification
+    // as well would announce the same message twice.
+    // In the Windows app the card above the taskbar clock (desktopPopups) is that notification.
+    if (info.toasted && (windowFocused() || desktopPopups())) return
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
     const me = localStorage.getItem('lanparty_user')
     const mentioned = (info.mentions || []).includes(me)
@@ -5238,6 +5289,95 @@ export default function App() {
       const n = new Notification(title, { body, tag, silent: false })
       n.onclick = () => { window.focus(); n.close() }
     } catch (e) { /* some browsers throw for backgrounded pages — badge still updates */ }
+  }
+
+  // In-app toast for a message I should hear about (components/NotificationToasts.tsx). The callers
+  // have already decided it is worth announcing: not mine, not from someone I blocked, not muted,
+  // not the conversation on screen. This only adds that the app must be on screen: with the window
+  // hidden there is no one to see it, and the desktop notification (maybeNotify) is what tells them.
+  // Returns whether a toast was shown. Never makes a sound: the caller has already played one.
+  const showMessageToast = ({ author, where, target, text, attachmentType }) => {
+    if (!author || !target) return false
+    const body = String(text || '').trim()
+    const preview = body
+      ? body.slice(0, 160)
+      : attachmentType
+        ? (String(attachmentType).startsWith('image/') ? 'sent an image' : 'sent a file')
+        : 'sent a message'
+    // The bell keeps it either way; only the bubble needs someone looking.
+    notificationHistory.add({ author, where, target, preview, previewIsNote: !body })
+    // The Windows app, not in front (another app has the focus, or it is in the tray): a Teams-style
+    // card above the taskbar clock instead of a bubble inside a window nobody is looking at.
+    if (desktopPopups() && !windowFocused()) {
+      try {
+        window.desktop.notify({ key: toastKey(target), author, where, target, preview, previewIsNote: !body })
+        return true
+      } catch (e) { /* fall through to the usual handling */ }
+    }
+    if (typeof document !== 'undefined' && document.hidden) return false
+    notificationToasts.push({ author, where, target, preview, previewIsNote: !body })
+    return true
+  }
+
+  // A reply typed into a notification toast. Sent the same way the message box sends to that kind
+  // of conversation, so the server applies the same checks (access, timeouts, blocks, verification).
+  // Rejects with a reason a person can read; the toast shows it and keeps the text.
+  const sendToastReply = async (target, body) => {
+    if (target.kind === 'channel') {
+      const s = socketRef.current
+      if (!s || !s.connected) throw new Error('Not connected right now. Try again in a moment.')
+      // The socket send the message box uses, asking for an answer: this window is not in that
+      // channel's room, so its own message never comes back to say it arrived.
+      const res = await new Promise((resolve) => {
+        const giveUp = setTimeout(() => resolve({ ok: false, reason: 'no-answer' }), 10000)
+        s.emit('message', { serverId: target.serverId, channelId: target.channelId, text: body }, (answer) => {
+          clearTimeout(giveUp)
+          resolve(answer || { ok: true })
+        })
+      })
+      if (res.ok) return
+      if (res.reason === EMAIL_UNVERIFIED) { setEmailVerified(false); throw new Error(VERIFY_FIRST) }
+      if (res.reason === 'timed-out') {
+        if (typeof res.until === 'number') {
+          setMyTimeouts((prev) => (prev[target.serverId] ? prev : { ...prev, [target.serverId]: { until: res.until, reason: null, by: null } }))
+        }
+        throw new Error(`You are timed out there${typeof res.until === 'number' ? ` until ${formatMoment(res.until)}` : ''}.`)
+      }
+      if (res.reason === 'no-access') throw new Error('You can no longer post in that channel.')
+      if (res.reason === 'unknown-channel') throw new Error('That channel no longer exists.')
+      if (res.reason === 'no-answer') throw new Error('No answer from the server. Check the channel before sending again.')
+      throw new Error(res.error || 'Could not send.')
+    }
+    if (target.kind === 'dm') {
+      const t = token || localStorage.getItem('lanparty_token')
+      const res = await fetch(`${SERVER_URL}/messages/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}` },
+        body: JSON.stringify({ toUsername: target.username, text: body }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || 'Could not send.')
+      appendHomeMessage(target.userId, data.message)
+      updateDmConversationPreview(target.userId, target.username, data.message)
+      loadMessagesData()
+      return
+    }
+    if (target.kind === 'group') {
+      const data = await groupRequest('POST', `/groups/${encodeURIComponent(target.groupId)}/messages`, { text: body })
+      // group:message brings the same message here too; appendHomeMessage de-dupes by id.
+      appendHomeMessage(target.groupId, data.message)
+      updateGroupConversationPreview(target.groupId, data.message)
+    }
+  }
+
+  // The sender's picture for a toast, from whichever list already has their profile.
+  const toastAvatar = (username) => {
+    const p = username === name
+      ? profile
+      : (friends.find((f) => f.name === username)?.profile
+        || dmConversations.find((c) => (c.peerUsername || c.name) === username)?.profile
+        || (serverState?.members || []).find((m) => m.username === username)?.profile)
+    return <ProfileAvatar name={username} profile={p || {}} size={36} resolveSrc={emojiSrc} />
   }
 
   // Settings toggle: turning ON asks the browser for permission first.
@@ -5296,7 +5436,26 @@ export default function App() {
   }, [socket])
 
   // Go to the conversation a clicked notification was about, the same way a click in the UI would.
+  // Clicks and replies from the desktop app's message cards (desktop/notify.html). Registered once;
+  // the refs always reach this render's functions.
+  openNotificationTargetRef.current = (t) => openNotificationTarget(t)
+  sendToastReplyRef.current = (t, b) => sendToastReply(t, b)
+  useEffect(() => {
+    const d = typeof window !== 'undefined' ? window.desktop : null
+    if (!d || typeof d.onNotifyOpen !== 'function' || typeof d.onNotifyReply !== 'function') return
+    d.onNotifyOpen((target) => { if (target && typeof target === 'object') openNotificationTargetRef.current?.(target) })
+    d.onNotifyReply(async ({ id, target, text } = {}) => {
+      try {
+        await sendToastReplyRef.current(target, text)
+        d.notifyReplyResult(id, { ok: true })
+      } catch (err) {
+        d.notifyReplyResult(id, { ok: false, error: (err && err.message) || 'Could not send.' })
+      }
+    })
+  }, [])
+
   const openNotificationTarget = async (target) => {
+    if (target.kind === 'channel' || target.kind === 'dm' || target.kind === 'group') notificationHistory.markSeen(target)
     if (target.kind === 'requests') {
       setSelectedServerId('home')
       setLeftNav('friends')
@@ -5799,6 +5958,13 @@ export default function App() {
     if (serverId && serverId !== currentServerId()) handleSelectServer(serverId)
     if (inVoice && voiceChannelId === channelId && voiceServerIdRef.current === (serverId || currentServerId())) { joinChannel(channelId); return }
     joinChannel(channelId) // navigate so the call view is behind the pre-join dialog
+    // Already in a call: just move over, like Discord. Same mute state; the camera and any screen
+    // share stop, as they would on hanging up.
+    if (inVoice) {
+      leaveVoice({ quiet: true })
+      startVoice(channelId, { muted: micMuted, serverId: serverId || currentServerId() })
+      return
+    }
     openPreJoin(channelId, serverId)
   }
 
@@ -6116,6 +6282,10 @@ export default function App() {
   // starting it would only put a card in the room that nobody can open.
   const launchableApps = publicApps.filter((a) => (a.hosted ? hostedAppFrame(a.url, [emojiSrc('/')]).ok : a.embeddable) && appLaunchNote(a) !== null)
   const closeActivity = () => { socketRef.current?.emit('activity:stop', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1' }) }
+  // Join something another person in the call is running (leaving the one I am in, if any).
+  const joinActivity = (id) => { socketRef.current?.emit('activity:join', { serverId: voiceServerIdRef.current, channelId: voiceChannelId || 'voice1', id }) }
+  // Back to the call view; the activity goes on for the others in it.
+  const exitActivity = () => { socketRef.current?.emit('activity:leave'); setActivity(null) }
 
   // Keyboard shortcuts on the pre-join dialog: Esc cancels, Enter joins.
   useEffect(() => {
@@ -6702,8 +6872,8 @@ export default function App() {
   // Switch the speaker/output — applied to every remote tile's <video> via the sinkId prop.
   const changeSpeaker = (deviceId) => setSelectedSpeakerId(deviceId)
 
-  const leaveVoice = () => {
-    playUiSound('leaveVoice')
+  const leaveVoice = ({ quiet = false } = {}) => {
+    if (!quiet) playUiSound('leaveVoice')
     // Never let a bad emit block the local teardown — always tear the call down.
     const chId = typeof voiceChannelId === 'string' ? voiceChannelId : 'voice1'
     try { socket?.emit('voice:leave', { serverId: voiceServerIdRef.current, channelId: chId }) } catch (err) { console.warn('voice:leave emit failed', err) }
@@ -6741,6 +6911,7 @@ export default function App() {
     setShowAudioMenu(false)
     setShowActivityMenu(false)
     setActivity(null)
+    setRoomActivities([])
     setVoicePage(0)
     setPeerNames({})
     setScreenSharingPeers({})
@@ -8764,6 +8935,7 @@ export default function App() {
                         <path d="M15.5 15.5 21 21" />
                       </svg>
                     </button>
+                    <NotificationBell history={notificationHistory} onOpen={openNotificationTarget} renderAvatar={toastAvatar} />
                     {/* Phone browser with the Android app on it: open that, don't download it again. */}
                     {androidAppOnDevice && detectPlatform().isAndroid && (
                       <a className="create-app-btn" href={androidAppIntentUrl()}>Open in the app</a>
@@ -8979,9 +9151,35 @@ export default function App() {
                 const pageTiles = tiles.slice(start, start + VOICE_TILES_PER_PAGE)
                 return (
                   <>
+                    {/* What others in the call are running: join any of them. */}
+                    {(() => {
+                      const others = roomActivities.filter((a) => a.id !== activity?.id)
+                      if (!others.length) return null
+                      return (
+                        <div className="activity-running" role="list" aria-label="Activities running in this call">
+                          {others.map((a) => {
+                            const meta = ACTIVITY_TYPES.find((t) => t.id === a.type)
+                            const label = a.type === 'app' ? (a.name || 'App') : (meta?.label || a.type)
+                            const people = Array.isArray(a.people) && a.people.length ? a.people.join(', ') : a.by
+                            return (
+                              <div role="listitem" className="activity-running-item" key={a.id}>
+                                <span className="activity-running-icon" aria-hidden="true">
+                                  {a.type === 'app' ? (a.icon ? <img src={emojiSrc(a.icon)} alt="" /> : '🧩') : meta?.icon}
+                                </span>
+                                <span className="activity-running-text">
+                                  <span className="activity-running-name">{label}{a.type === 'app' && !a.approved ? ' · not approved' : ''}</span>
+                                  <span className="activity-running-people">{people}</span>
+                                </span>
+                                <button type="button" className="activity-running-join" onClick={() => joinActivity(a.id)} aria-label={`Join ${label}`}>Join</button>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )
+                    })()}
                     <div className="video-stage-wrap">
                       {activity ? (
-                        <ActivityPanel activity={activity} me={name} onEvent={sendActivityEvent} onClose={closeActivity} askPrompt={askPrompt} appHost={appHost} />
+                        <ActivityPanel activity={activity} me={name} onEvent={sendActivityEvent} onClose={closeActivity} onExit={exitActivity} askPrompt={askPrompt} appHost={appHost} />
                       ) : (
                         <>
                           <div className="video-stage" ref={videoStageRef} style={{ gridTemplateColumns: `repeat(${voiceGrid.cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${voiceGrid.rows}, minmax(0, 1fr))` }}>
@@ -9360,6 +9558,16 @@ export default function App() {
         />
       )}
       {toast && <div className="app-toast" role="status">{toast}</div>}
+      {isAuthenticated && (
+        <NotificationToasts
+          toasts={notificationToasts.toasts}
+          onDismiss={notificationToasts.dismiss}
+          setEngaged={notificationToasts.setEngaged}
+          onOpen={openNotificationTarget}
+          onReply={sendToastReply}
+          renderAvatar={toastAvatar}
+        />
+      )}
       {/* An account that has not opened its verification link yet. Dismissed for this session only. */}
       {isAuthenticated && !emailVerified && !verifyBannerDismissed && (
         <VerifyEmailBanner email={userEmail} onResend={resendVerificationEmail} onFixAddress={() => { openSettings(); setSettingsTab('security') }} onDismiss={() => setVerifyBannerDismissed(true)} />
@@ -9621,7 +9829,7 @@ export default function App() {
         <div className="prejoin-overlay">
           <div className="prejoin-modal" role="dialog" aria-label="Choose your audio and video settings">
             <div className="prejoin-title">Choose your audio and video settings</div>
-            <div className="prejoin-subtitle">You're about to join <strong>{preJoinChannelId === 'voice1' ? 'Voice 1' : preJoinChannelId}</strong></div>
+            <div className="prejoin-subtitle">You're about to join <strong>{serverChannels.find((c) => c.id === preJoinChannelId)?.name || (preJoinChannelId === 'voice1' ? 'Voice 1' : 'the voice channel')}</strong></div>
             <div className="prejoin-body">
               <div className="prejoin-preview">
                 {preJoinCamOn ? (
@@ -9674,18 +9882,21 @@ export default function App() {
                     </select>
                   ) : <div className="voice-effects-hint">Detecting microphones…</div>}
                   <div className="prejoin-meter" title="Live microphone level" aria-hidden="true"><div className="prejoin-meter-mask" ref={micMeterRef} /></div>
-                  <button type="button" className="profile-link-btn" onClick={() => setShowMicTest((v) => !v)} aria-expanded={showMicTest}>
-                    {showMicTest ? 'Hide microphone test' : 'Test microphone'}
-                  </button>
+                  <div className="prejoin-tools">
+                    <button type="button" className="prejoin-tool-btn" onClick={() => setShowMicTest((v) => !v)} aria-expanded={showMicTest}>
+                      🎤 {showMicTest ? 'Hide mic test' : 'Test mic'}
+                    </button>
+                    {/* The other half of "will my call work": not the mic, the network. */}
+                    <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} getIceServers={fetchIceServers} variant="link" />
+                  </div>
                   {showMicTest && (
                     <MicTest
+                      compact
                       devices={audioInputs}
                       selectedDeviceId={selectedMicId}
                       onSelectDevice={preJoinSelectMic}
                     />
                   )}
-                  {/* The other half of "will my call work": not the mic, the network. */}
-                  <ConnectionCheck socket={socket} getDiagnostics={fetchVoiceDiagnostics} getIceServers={fetchIceServers} variant="link" />
                 </div>
                 {supportsSpeakerSelect && (
                   <div className="prejoin-group">
@@ -10128,7 +10339,7 @@ export default function App() {
                 <h2 id="onb-title" className="onboarding-title">Hey {name}! 🎉</h2>
                 <p className="onboarding-lede">
                   This is your place for game nights — text &amp; voice channels, camera and screen
-                  share, party activities like synced music and Sketch &amp; Guess, and watching
+                  share, party activities like Sketch &amp; Guess and Watch Together, and watching
                   Twitch, YouTube &amp; Kik streams together. Create a server or hop into a friend's to
                   get going.
                 </p>

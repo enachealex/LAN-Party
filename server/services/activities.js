@@ -1,8 +1,8 @@
-// In-call activities: watch party, whiteboard, poll, tic-tac-toe, Sketch & Guess and the shared
-// music queue. Reducer-style — applyActivityEvent takes the current state plus an event and
+// In-call activities: watch party, whiteboard, poll, tic-tac-toe, Sketch & Guess and Movie Night.
+// Reducer-style — applyActivityEvent takes the current state plus an event and
 // returns the next state, which keeps the socket layer a thin transport.
 //
-// A factory because the sketch/music rules need to know who is in the room (io) and which display
+// A factory because the sketch rules need to know who is in the room (io) and which display
 // name a socket belongs to (clients).
 
 const crypto = require('crypto');
@@ -10,7 +10,7 @@ const { isHostedApp } = require('./hostedApps');
 
 /** @param {{ io: any, clients: Record<string, any> }} deps */
 function createActivities({ io, clients }) {
-  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'music', 'movie'];
+  const ACTIVITY_TYPES = ['watch', 'whiteboard', 'poll', 'ttt', 'sketch', 'movie'];
   const SKETCH_WORDS = ['pizza', 'dragon', 'controller', 'headset', 'wizard', 'castle', 'laptop', 'zombie', 'racecar', 'treasure', 'ninja', 'robot', 'campfire', 'spaceship', 'sword', 'shield', 'potion', 'dungeon', 'goblin', 'keyboard', 'trophy', 'boss fight', 'power up', 'game over', 'rage quit', 'speedrun', 'loot box', 'health bar', 'respawn', 'lan party', 'energy drink', 'mechanical keyboard', 'graphics card', 'blue screen', 'lag spike', 'victory royale', 'minecart', 'creeper', 'portal', 'joystick', 'arcade', 'pixel', 'avatar', 'guild', 'quest', 'checkpoint', 'combo', 'headshot', 'stealth', 'sniper', 'race track', 'finish line', 'monster truck', 'alien', 'meteor', 'volcano', 'pirate ship', 'skeleton', 'campaign', 'final boss'];
   function activityInit(type) {
     if (type === 'watch') return { videoId: null, playing: false, time: 0, ts: Date.now() };
@@ -18,9 +18,6 @@ function createActivities({ io, clients }) {
     if (type === 'poll') return { question: '', options: [], closed: false };
     if (type === 'ttt') return { board: Array(9).fill(''), turn: 'X', players: {}, winner: null, scores: {}, draws: 0, round: 1 };
     if (type === 'sketch') return { phase: 'lobby', players: [], turnIdx: 0, totalTurns: 0, word: null, wordMask: '', strokes: [], guesses: [], solvedBy: [], lastResult: null };
-    // music: shared queue + synced playback (pos anchored to server time ts, like 'watch').
-    // dj: null = everyone controls; a claimed DJ is the only one who can drive playback.
-    if (type === 'music') return { queue: [], index: -1, playing: false, pos: 0, ts: Date.now(), history: [], dj: null };
     // movie: a Vault Movies watch-party room shared with the call. The film plays in the
     // desktop app (vaultmovies:// launch); this just carries the room so everyone can join.
     if (type === 'movie') return { code: null, server: null, title: '' };
@@ -322,75 +319,6 @@ function createActivities({ io, clients }) {
         s.turnIdx = 0;
         s.word = null; s.wordMask = ''; s.strokes = []; s.guesses = []; s.solvedBy = []; s.lastResult = null;
       }
-    } else if (act.type === 'music') {
-      const now = Date.now();
-      const validTrack = musicTrackValid;
-      const cleanTrack = (t) => ({ ...musicTrackClean(t), addedBy: user });
-      // With a DJ on deck, only they drive playback — including 'next' (auto-advance), so a
-      // non-DJ can't force-skip by emitting it. The DJ's own client still fires next on track end.
-      // Adding song requests stays open to everyone.
-      const DJ_ONLY = ['play', 'pause', 'seek', 'skip', 'jump', 'remove', 'clear', 'shuffle', 'playNow', 'loadList', 'next'];
-      if (s.dj && user !== s.dj && DJ_ONLY.includes(ev.kind)) return;
-      if (ev.kind === 'djClaim') {
-        // Free seat, or the current DJ left the voice room — take over.
-        const room = ctx && ctx.room;
-        const djStillHere = s.dj && room && [...(io.sockets.adapter.rooms.get(room) || [])].some((id) => clients[id]?.name === s.dj);
-        if (!s.dj || !djStillHere) s.dj = user;
-        return;
-      }
-      if (ev.kind === 'djRelease') { if (s.dj === user) s.dj = null; return; }
-      const pushHistory = (t) => { if (!t) return; s.history.unshift({ id: t.id, title: t.title, artist: t.artist, thumbnail: t.thumbnail, playedAt: now }); if (s.history.length > 100) s.history.length = 100; };
-      const startAt = (i) => {
-        if (i >= 0 && i < s.queue.length) { s.index = i; s.pos = 0; s.ts = now; s.playing = true; }
-        else { s.index = -1; s.pos = 0; s.ts = now; s.playing = false; }
-      };
-      if (ev.kind === 'add' && validTrack(ev.track) && s.queue.length < 200) {
-        s.queue.push(cleanTrack(ev.track));
-        if (s.index === -1) startAt(s.queue.length - 1); // nothing playing → start what was just added
-      } else if (ev.kind === 'loadList' && Array.isArray(ev.tracks)) {
-        const before = s.queue.length;
-        for (const t of ev.tracks.slice(0, 200)) {
-          if (s.queue.length >= 200) break;
-          if (validTrack(t)) s.queue.push(cleanTrack(t));
-        }
-        if (s.index === -1 && s.queue.length > before) startAt(before); // idle → start the loaded list
-      } else if (ev.kind === 'playNow' && validTrack(ev.track)) {
-        pushHistory(s.queue[s.index]);
-        s.queue.splice(s.index + 1, 0, cleanTrack(ev.track));
-        startAt(s.index + 1);
-      } else if (ev.kind === 'jump' && Number.isInteger(ev.i) && ev.i >= 0 && ev.i < s.queue.length) {
-        pushHistory(s.queue[s.index]);
-        startAt(ev.i);
-      } else if (ev.kind === 'remove' && Number.isInteger(ev.i) && ev.i >= 0 && ev.i < s.queue.length) {
-        const removingCurrent = ev.i === s.index;
-        s.queue.splice(ev.i, 1);
-        if (ev.i < s.index) s.index -= 1;
-        else if (removingCurrent) startAt(s.index < s.queue.length ? s.index : -1);
-      } else if (ev.kind === 'clear') {
-        // Clear upcoming + played; keep only what's on right now.
-        const current = s.queue[s.index];
-        s.queue = current ? [current] : [];
-        s.index = current ? 0 : -1;
-        if (!current) { s.playing = false; s.pos = 0; s.ts = now; }
-      } else if (ev.kind === 'shuffle' && s.queue.length > s.index + 2) {
-        // Shuffle only the not-yet-played tail so history/current stay put.
-        const tail = s.queue.splice(s.index + 1);
-        for (let i = tail.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [tail[i], tail[j]] = [tail[j], tail[i]]; }
-        s.queue.push(...tail);
-      } else if (ev.kind === 'skip' || ev.kind === 'next') {
-        // 'next' comes from every client's audio 'ended' event — the fromId guard makes sure
-        // only the first one advances the queue (the rest see a changed track and no-op).
-        if (ev.kind === 'next' && (!s.queue[s.index] || s.queue[s.index].id !== ev.fromId)) return;
-        pushHistory(s.queue[s.index]);
-        startAt(s.index + 1 < s.queue.length ? s.index + 1 : -1);
-      } else if (ev.kind === 'play') {
-        if (s.index !== -1) { s.playing = true; s.pos = Number(ev.pos) || 0; s.ts = now; }
-      } else if (ev.kind === 'pause') {
-        s.playing = false; s.pos = Number(ev.pos) || 0; s.ts = now;
-      } else if (ev.kind === 'seek') {
-        s.pos = Math.max(0, Number(ev.pos) || 0); s.ts = now;
-      }
-      warmMusicQueue(s.queue, s.index); // pre-resolve upcoming audio so skips start instantly
     } else if (act.type === 'movie') {
       if (ev.kind === 'set') {
         const code = String(ev.code || '').trim().toUpperCase();
@@ -413,7 +341,14 @@ function createActivities({ io, clients }) {
   // the app, so there is no reason for up to 64 KB of some uploader's data to land in their client.
   // The room key is withheld the same way, and for a better reason: it opens the channel's room on
   // the app's own server, and someone who has not joined has not chosen to be in it.
-  function activityViewFor(act, socketId) {
+  // Who is in it (act.viewers, socket ids) is the server's own bookkeeping, and is never sent.
+  function activityViewFor(full, socketId) {
+    const view = viewFor(full, socketId);
+    if (!view || !view.viewers) return view;
+    const { viewers, ...rest } = view;
+    return rest;
+  }
+  function viewFor(act, socketId) {
     if (act && act.type === APP_ACTIVITY) {
       if (appJoinedMap(act).has(socketId)) return act;
       return { ...act, state: { ...act.state, shared: {}, roomKey: null } };
@@ -427,9 +362,11 @@ function createActivities({ io, clients }) {
   // joinedOnly: an app's state change is of no interest to people who have not joined it (their
   // view has no `shared`), so they are skipped rather than sent an update for every move of a game
   // they are not playing.
+  // Sent to the people IN the activity (act.viewers): a call can have several running, and the
+  // others in the call only see it in the list of what is running.
   function broadcastActivity(room, act, { joinedOnly = false } = {}) {
-    if (!act) { io.to(room).emit('activity:update', null); return; }
-    const ids = io.sockets.adapter.rooms.get(room) || new Set();
+    if (!act) return;
+    const ids = act.viewers || io.sockets.adapter.rooms.get(room) || new Set();
     const only = joinedOnly && act.type === APP_ACTIVITY ? appJoinedMap(act) : null;
     for (const id of ids) {
       if (only && !only.has(id)) continue;
